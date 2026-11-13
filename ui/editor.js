@@ -454,6 +454,12 @@ const Ed = {
      An unresolved target is R29.4's banner in both engines. */
   IMG_EXTS: ["png", "jpg", "jpeg", "gif", "webp"],
   IMG_SCHEME: "opensidian-img",
+  // How the page ADDRESSES that scheme. WebKit takes "opensidian-img://localhost/";
+  // WebView2 (Windows) has no custom scheme for subresources and serves it as
+  // "http://opensidian-img.localhost/". The page's own host tells which engine
+  // this is: "tauri.localhost" exists only there (main.rs IMG_BASE is the Rust twin).
+  IMG_BASE: (typeof location !== "undefined" && location.hostname === "tauri.localhost")
+    ? "http://opensidian-img.localhost/" : "opensidian-img://localhost/",
   isImg(t) {                                   // is this target an IMAGE embed, not a note embed?
     const i = t.lastIndexOf(".");
     return i >= 0 && Ed.IMG_EXTS.includes(t.slice(i + 1).toLowerCase());
@@ -495,7 +501,7 @@ const Ed = {
   },
   imgSrc(target) {
     const rel = Ed.imgRel(target);
-    return rel === null ? null : Ed.IMG_SCHEME + "://localhost/" + Ed.pctEnc(rel);
+    return rel === null ? null : Ed.IMG_BASE + Ed.pctEnc(rel);
   },
   // the ONE widget both syntaxes paint. Carries no TEXT node in either branch:
   // the row's textContent must stay === its source line (the token map walks
@@ -651,7 +657,7 @@ const Ed = {
             s.classList.add("is-loaded");
             if (typeof xiAgain === "function") xiAgain();
           };
-          im.setAttribute("src", Ed.IMG_SCHEME + "://localhost/" + s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px);
+          im.setAttribute("src", Ed.IMG_BASE + s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px);
         }
       }, { root: box, rootMargin: "100% 0px" });
       for (let i = 0; i < n; i++) {

@@ -252,6 +252,15 @@ const IMG_TYPES: [(&str, &str); 5] = [
 
 /// the scheme our images are served on; the CSP names it exactly (R29 / S1)
 const IMG_SCHEME: &str = "opensidian-img";
+/// The prefix the page uses to ADDRESS that scheme. WebKit (Linux, macOS) takes
+/// a custom scheme as it is. WebView2 has no such thing for subresources: wry
+/// serves a registered scheme as `http://<scheme>.localhost/` there and hands
+/// the handler the same request either way, so only the URL text differs — here,
+/// in ui/ (editor.js IMG_BASE) and in the Windows CSP (tauri.windows.conf.json).
+#[cfg(not(windows))]
+const IMG_BASE: &str = "opensidian-img://localhost/";
+#[cfg(windows)]
+const IMG_BASE: &str = "http://opensidian-img.localhost/";
 
 /// R29.10: the label the R29.4 banner carries in place of a REMOTE target.
 /// Both engines paint the same sentence (ui/editor.js `imgEl` sets it as
@@ -584,7 +593,7 @@ fn image_html(imgs: &[String], target: &str, alt: &str) -> String {
     let dec = pct_decode(target).unwrap_or_else(|| target.to_string());
     match index::resolve(imgs, &dec).map(|i| &imgs[i]) {
         Some(rel) => format!(
-            "<img class=\"vimg\" src=\"{IMG_SCHEME}://localhost/{}\" alt=\"{}\">",
+            "<img class=\"vimg\" src=\"{IMG_BASE}{}\" alt=\"{}\">",
             pct_encode(rel),
             esc(alt)
         ),
@@ -5738,6 +5747,19 @@ fn drag_path(is_x11: bool, moveresize_advertised: bool, position_honoured: Optio
     }
 }
 
+/// The path for THIS session. Linux: `drag_path` over the probe. Windows: always
+/// "wm" — handing the press to the system (start_dragging) is what gives the
+/// user Aero Snap, Snap Layouts and drag-to-top-maximises; moving the window
+/// ourselves works but offers none of them. Nothing is measured there: a
+/// top-level window is always moved by the system's own loop.
+fn session_path(proto: &DragProto) -> &'static str {
+    if cfg!(windows) {
+        return "wm";
+    }
+    let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
+    drag_path(proto.x11, proto.moveresize, honoured)
+}
+
 /// What this session lets us do, probed once at setup + refined by measurement.
 struct DragProto {
     /// is the live GdkDisplay an X11 one (a real X server OR XWayland)?
@@ -5799,8 +5821,7 @@ fn probe_drag_proto() -> DragProto {
 /// re-read after each drag because the empirical half can flip it mid-session.
 #[tauri::command]
 fn win_move_proto(proto: tauri::State<'_, DragProto>) -> String {
-    let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
-    drag_path(proto.x11, proto.moveresize, honoured).to_string()
+    session_path(&proto).to_string()
 }
 
 /// R33.6b: hand the press to the WM/compositor when this session will not let the
@@ -5830,8 +5851,7 @@ fn win_drag_start(win: tauri::Window, proto: tauri::State<'_, DragProto>) -> Res
     span_timed!(
         "win_drag_start",
         {
-            let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
-            let p = drag_path(proto.x11, proto.moveresize, honoured);
+            let p = session_path(&proto);
             taken = p;
             // Written by the process that actually asks, for the same reason
             // win_gesture logs: a title census that stops updating looks exactly
@@ -6148,8 +6168,17 @@ fn set_zoom_cfg(level: f64) {
 /// (any local server answering that name), and matching on the scheme alone
 /// admitted tauri://<any host>. The image scheme is a subresource (<img src>),
 /// never a navigation target, so it is not listed.
+#[cfg(not(windows))]
 fn nav_allowed(u: &tauri::Url) -> bool {
     u.scheme() == "tauri" && u.host_str() == Some("localhost") && u.port().is_none()
+}
+
+/// Windows: WebView2 serves frontendDist as `http://tauri.localhost` (Tauri v2
+/// default, useHttpsScheme off). Same rule, same strictness: exact scheme, exact
+/// host, no port — `http://tauri.localhost:8080` is some local server, not us.
+#[cfg(windows)]
+fn nav_allowed(u: &tauri::Url) -> bool {
+    u.scheme() == "http" && u.host_str() == Some("tauri.localhost") && u.port().is_none()
 }
 
 fn main() {
@@ -6539,6 +6568,7 @@ mod tests {
         assert!(ui.contains("savesInFlight.add("));
     }
 
+    #[cfg(not(windows))] // asserts the WebKit origin tauri://localhost
     #[test]
     fn appguard_nav_app_origin_allowed() {
         assert!(nav("tauri://localhost"));
@@ -6546,6 +6576,7 @@ mod tests {
         assert!(nav("tauri://localhost/#/note"));
     }
 
+    #[cfg(not(windows))] // asserts the WebKit origin tauri://localhost
     #[test]
     fn appguard_nav_lookalikes_refused() {
         for u in [
@@ -7437,7 +7468,7 @@ mod tests {
             let h = render_with(md, &[], ix.images(), true);
             let i = h.find("src=\"").unwrap_or_else(|| panic!("no img for {md}: {h}")) + 5;
             let url = h[i..].split('"').next().unwrap();
-            let target = url.strip_prefix(&format!("{IMG_SCHEME}://localhost/")).expect(url);
+            let target = url.strip_prefix(&format!("{IMG_BASE}")).expect(url);
             // exactly the path the protocol handler passes to serve_image
             let (mime, bytes) = serve_image(&root, target).unwrap_or_else(|| panic!("{md} -> {url} served nothing"));
             assert_eq!(bytes, png, "{md}");
@@ -7462,12 +7493,12 @@ mod tests {
         let rmd = |c: &str| render_with(c, &[], &imgs, false);
         // R29.2 relative path, alt preserved and escaped
         let h = rmd("![a pic](pic.png)");
-        assert_eq!(src(&h), format!("{IMG_SCHEME}://localhost/pic.png"), "{h}");
+        assert_eq!(src(&h), format!("{IMG_BASE}pic.png"), "{h}");
         assert!(h.contains(r#"alt="a pic""#), "{h}");
         // subfolder: full path AND bare basename resolve to the same file
         let full = rmd("![](sub/nested.png)");
         let bare = rmd("![](nested.png)");
-        assert_eq!(src(&full), format!("{IMG_SCHEME}://localhost/sub/nested.png"), "{full}");
+        assert_eq!(src(&full), format!("{IMG_BASE}sub/nested.png"), "{full}");
         assert_eq!(src(&bare), src(&full), "basename must resolve like the path");
         // R29.1: the wikilink embed form agrees with the markdown form, exactly
         assert_eq!(src(&rmd("![[pic.png]]")), src(&rmd("![](pic.png)")));
@@ -7475,7 +7506,7 @@ mod tests {
         assert!(!rmd("![[pic.png]]").contains('!'), "bang leaked as text");
         // R29.3: %20 resolves and comes back percent-ENCODED in the url
         let h = rmd("![](my%20pic.png)");
-        assert_eq!(src(&h), format!("{IMG_SCHEME}://localhost/my%20pic.png"), "{h}");
+        assert_eq!(src(&h), format!("{IMG_BASE}my%20pic.png"), "{h}");
         // R29.3 second half: a RAW space is not an image at all (pulldown), text
         let h = rmd("![](my pic.png)");
         assert!(!h.contains("<img") && h.contains("![](my pic.png)"), "{h}");
@@ -11005,7 +11036,7 @@ mod tests {
         assert_eq!(ix.images(), ["abe.png", "zed.png"], "sorted, deduped");
         assert_eq!(ix.images(), Index::build(&root).images(), "== a fresh walk");
         // and the resolver the renderers use finds it
-        assert!(image_html(ix.images(), "zed.png", "").contains("opensidian-img://localhost/zed.png"));
+        assert!(image_html(ix.images(), "zed.png", "").contains(&format!("{IMG_BASE}zed.png")));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&srcd);
     }
