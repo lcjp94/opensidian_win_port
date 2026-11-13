@@ -97,10 +97,29 @@ fn not_found(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound
 }
 
-/// `name:stream` would address an alternate data stream of `name`
+/// A name Windows itself would not take as it is written. The walk uses the
+/// verbatim path form, which switches the Win32 name rules OFF — so without
+/// this check we could create files that Explorer, a sync client or `git`
+/// cannot open, rename or delete:
+///   `name:stream`   addresses an alternate data stream of `name`;
+///   `< > " | ? *`   and control characters are not valid in a name;
+///   a trailing dot or space is silently dropped by every Win32 program;
+///   CON, PRN, AUX, NUL, COM1-9, LPT1-9 (with any extension) are devices.
 fn name_ok(rel: &Path, c: &OsStr) -> io::Result<()> {
-    if c.as_encoded_bytes().contains(&b':') {
+    let s = c.to_string_lossy();
+    if s.contains(':') {
         return Err(refused(rel, "':' in a name (alternate data stream form)"));
+    }
+    if s.chars().any(|ch| ch.is_control() || matches!(ch, '<' | '>' | '"' | '|' | '?' | '*')) {
+        return Err(refused(rel, "a character Windows does not allow in a name"));
+    }
+    if s.ends_with('.') || s.ends_with(' ') {
+        return Err(refused(rel, "a name ending in a dot or a space"));
+    }
+    let stem = s.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let numbered = |p: &str| stem.strip_prefix(p).is_some_and(|d| d.len() == 1 && d != "0" && d.chars().all(|x| x.is_ascii_digit()));
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT") {
+        return Err(refused(rel, "a reserved Windows device name"));
     }
     Ok(())
 }
@@ -144,6 +163,17 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
     Err(last.unwrap_or_else(|| io::Error::other("rename: retries exhausted")))
 }
 
+/// two different spellings that differ in case only
+fn case_only(a: &Path, b: &Path) -> bool {
+    a != b && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+/// does `p`'s directory list an entry with EXACTLY this name (case included)?
+fn has_exact_entry(p: &Path) -> bool {
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return false };
+    fs::read_dir(dir).is_ok_and(|rd| rd.flatten().any(|e| e.file_name() == name))
+}
+
 fn ms(t: io::Result<SystemTime>) -> i64 {
     t.ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64)
 }
@@ -178,9 +208,13 @@ impl Vault {
     /// walk `comps` from the root: each one is opened pinned and checked on its
     /// handle. The previous pin is released only after the next one is held.
     fn walk(&self, rel: &Path, comps: &[&OsStr], create: bool) -> io::Result<Dir> {
-        let mut cur = self.root_dir()?;
+        // every name is checked BEFORE anything is created: a refused path must
+        // not leave its first directories behind
         for c in comps {
             name_ok(rel, c)?;
+        }
+        let mut cur = self.root_dir()?;
+        for c in comps {
             let p = cur.path.join(c);
             let h = match open_dir(&p) {
                 Ok(h) => h,
@@ -277,6 +311,14 @@ impl Vault {
             return Err(refused(from, "source is not a regular file"));
         }
         let (_dt, pt) = self.parent(to, true)?;
+        // A rename that changes only the CASE of the name (Note -> note). On a
+        // case-insensitive volume the new name already "exists" — it is the
+        // source itself — so the claim below would refuse it. It is that case
+        // only if the directory holds no entry spelled exactly like the target
+        // (a case-SENSITIVE directory can hold both, and then it is a collision).
+        if case_only(&pf, &pt) {
+            return if has_exact_entry(&pt) { Err(io::Error::from(io::ErrorKind::AlreadyExists)) } else { replace(&pf, &pt) };
+        }
         drop(new_file(&pt, false)?);
         hook("move_file:claimed");
         if let Err(e) = replace(&pf, &pt) {
@@ -700,6 +742,22 @@ mod tests {
     }
 
     #[test]
+    fn vaultfs_win_names_windows_cannot_handle_are_refused() {
+        let (root, _) = fresh("names");
+        let v = Vault::open(&root).unwrap();
+        for p in ["CON.md", "nul", "sub/Aux.txt", "COM1.md", "lpt9", "a?.md", "a*.md", "a|b.md", "a<b>.md", "q\"uote.md", "dot./x.md", "end.", "end ", "tab	x.md"] {
+            let e = v.write_atomic(Path::new(p), b"x", false).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{p:?}: {e}");
+            assert!(v.mkdir_p(Path::new(p)).is_err(), "mkdir {p:?}");
+        }
+        assert!(names(&root).is_empty(), "{:?}", names(&root));
+        // look-alikes that are ordinary names
+        for p in ["CONSOLE.md", "COM10.md", "COM0.md", "nullable.md", "a.b.c.md", ".hidden", "é ü ñ.md", "LPT.md"] {
+            v.write_atomic(Path::new(p), b"x", false).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        }
+    }
+
+    #[test]
     fn vaultfs_win_a_held_dir_cannot_be_swapped() {
         let (root, out) = fresh("pin");
         fs::create_dir(root.join("a")).unwrap();
@@ -733,6 +791,20 @@ mod tests {
         assert_eq!(v.trash(Path::new("B.md"), Path::new(".trash"), "B", "md").unwrap(), Path::new(".trash").join("B.1.md"));
         assert_eq!(fs::read(root.join(".trash/B.md")).unwrap(), b"b");
         assert_eq!(fs::read(root.join(".trash/B.1.md")).unwrap(), b"b2");
+    }
+
+    #[test]
+    fn vaultfs_win_case_only_rename_is_a_rename_not_a_collision() {
+        let (root, _) = fresh("case");
+        let v = Vault::open(&root).unwrap();
+        v.write_atomic(Path::new("Note.md"), b"n", false).unwrap();
+        v.move_file(Path::new("Note.md"), Path::new("note.md")).unwrap();
+        assert_eq!(names(&root), ["note.md"], "the entry was renamed in place");
+        assert_eq!(fs::read(root.join("note.md")).unwrap(), b"n");
+        // a real collision is still refused
+        v.write_atomic(Path::new("Other.md"), b"o", false).unwrap();
+        assert_eq!(v.move_file(Path::new("note.md"), Path::new("OTHER.md")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(root.join("Other.md")).unwrap(), b"o");
     }
 
     #[test]
