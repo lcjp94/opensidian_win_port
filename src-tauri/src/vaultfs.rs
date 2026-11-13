@@ -24,12 +24,26 @@
    canonicalized once (so `~/Notes -> /data/notes` keeps working) and the
    canonical path is opened O_NOFOLLOW. Everything below it is untrusted. */
 
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+
+// The fd walk above is POSIX. Windows has no openat in std: vaultfs_win.rs gives
+// `Vault` the same surface with pinned directory handles instead.
+#[cfg(windows)]
+#[path = "vaultfs_win.rs"]
+mod win;
+#[cfg(windows)]
+pub use win::{Dir, Vault};
 
 // test seam: a named point between resolving a parent and using it, so a
 // test can swap a directory for a symlink deterministically. Production: a
@@ -80,6 +94,7 @@ pub fn set_fault(at: Option<&'static str>) {
 pub fn set_force_copy(on: bool) {
     FORCE_COPY.with(|f| f.set(on));
 }
+#[cfg_attr(not(unix), allow(dead_code))] // Windows always copies (vaultfs_win.rs)
 fn force_copy() -> bool {
     #[cfg(any(test, debug_assertions))]
     return FORCE_COPY.with(|f| f.get());
@@ -114,10 +129,12 @@ pub struct Imported {
     pub how: &'static str, // "link" (same filesystem) | "copy" (crossed one)
 }
 
+#[cfg(unix)]
 fn fs_lstat(p: &CString) -> io::Result<libc::stat> {
     stat_at(libc::AT_FDCWD, p)
 }
 
+#[cfg(unix)]
 /// pdfdrop: does the OPEN file start with `magic`? pread at offset 0, so the fd's
 /// cursor is untouched for the copy that follows; a short file is a mismatch.
 fn starts_with_at0(f: &File, magic: &[u8]) -> io::Result<bool> {
@@ -171,14 +188,17 @@ fn refused(rel: &Path, why: &str) -> io::Error {
     e
 }
 
+#[cfg(unix)]
 fn cstr(s: &OsStr) -> io::Result<CString> {
     CString::new(s.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
 }
 
+#[cfg(unix)]
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
     if r < 0 { Err(io::Error::last_os_error()) } else { Ok(r) }
 }
 
+#[cfg(unix)]
 fn stat_at(dfd: RawFd, name: &CString) -> io::Result<libc::stat> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: valid fd, NUL-terminated name, st is written by the kernel on success
@@ -186,6 +206,7 @@ fn stat_at(dfd: RawFd, name: &CString) -> io::Result<libc::stat> {
     Ok(unsafe { st.assume_init() })
 }
 
+#[cfg(unix)]
 fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: valid fd; st is written by the kernel on success
@@ -193,10 +214,12 @@ fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     Ok(unsafe { st.assume_init() })
 }
 
+#[cfg(unix)]
 fn is_reg(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFREG
 }
 
+#[cfg(unix)]
 fn open_dir_at(dfd: RawFd, name: &CString) -> io::Result<OwnedFd> {
     // SAFETY: valid fd + NUL-terminated name; the returned fd is owned below
     let fd = cvt(unsafe {
@@ -205,6 +228,7 @@ fn open_dir_at(dfd: RawFd, name: &CString) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+#[cfg(unix)]
 /// the process umask, read without changing it (umask(2) would set it, racing
 /// every other thread that creates a file meanwhile)
 fn umask() -> u32 {
@@ -218,6 +242,7 @@ fn umask() -> u32 {
     })
 }
 
+#[cfg(unix)]
 /// a temp name nobody can predict: 16 hex chars from the kernel's CSPRNG.
 /// Dot-prefixed and `~`-suffixed, so no index/watcher (dot-skipping, .md/.json
 /// matching) ever picks it up even if a crash leaves it behind.
@@ -247,17 +272,20 @@ fn parts(rel: &Path) -> io::Result<Vec<&OsStr>> {
     Ok(v)
 }
 
+#[cfg(unix)]
 /// a directory INSIDE the vault, held open: the thing every leaf op is
 /// relative to
 pub struct Dir {
     fd: OwnedFd,
 }
 
+#[cfg(unix)]
 /// the vault root, opened once
 pub struct Vault {
     root: Dir,
 }
 
+#[cfg(unix)]
 impl Vault {
     pub fn open(root: &Path) -> io::Result<Vault> {
         let croot = root.canonicalize()?;
@@ -728,6 +756,7 @@ pub struct PStat {
     pub ctime_ms: i64,
 }
 
+#[cfg(unix)]
 fn pstat_of(rel: &Path, st: &libc::stat) -> io::Result<PStat> {
     let kind = match st.st_mode & libc::S_IFMT {
         libc::S_IFREG => "file",
@@ -744,6 +773,7 @@ fn pstat_of(rel: &Path, st: &libc::stat) -> io::Result<PStat> {
     })
 }
 
+#[cfg(unix)]
 impl Vault {
     /// the leaf's lstat relative to its held parent; "" = the root itself
     fn p_lstat(&self, rel: &Path) -> io::Result<libc::stat> {
@@ -950,14 +980,10 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// an io::Error -> "CODE: message" for the JS facade (err.code = CODE). A
-/// refusal (PermissionDenied with no errno) is the stable vault-escape error.
-pub fn plugin_err(op: &str, path: &str, e: &io::Error) -> String {
-    let p = path.replace('\0', "\\0");
-    if e.kind() == io::ErrorKind::PermissionDenied && e.raw_os_error().is_none() {
-        return format!("EPERM: vault-escape refused, {op} '{p}' ({e})");
-    }
-    let code = match e.raw_os_error() {
+/// the Node-style error code of an OS error. Unix: the errno itself.
+#[cfg(unix)]
+fn errno_name(e: &io::Error) -> &'static str {
+    match e.raw_os_error() {
         Some(libc::ENOENT) => "ENOENT",
         Some(libc::EEXIST) => "EEXIST",
         Some(libc::ENOTDIR) => "ENOTDIR",
@@ -971,7 +997,47 @@ pub fn plugin_err(op: &str, path: &str, e: &io::Error) -> String {
         _ if e.kind() == io::ErrorKind::NotFound => "ENOENT",
         _ if e.kind() == io::ErrorKind::AlreadyExists => "EEXIST",
         _ => "EIO",
-    };
+    }
+}
+
+/// Windows: raw_os_error() is a Win32 code, whose numbers collide with errno
+/// values of another meaning (5 is ERROR_ACCESS_DENIED and EIO), so the code is
+/// derived from the portable ErrorKind std already mapped it to.
+#[cfg(not(unix))]
+fn errno_name(e: &io::Error) -> &'static str {
+    use io::ErrorKind as K;
+    match e.kind() {
+        K::NotFound => "ENOENT",
+        K::AlreadyExists => "EEXIST",
+        K::NotADirectory => "ENOTDIR",
+        K::IsADirectory => "EISDIR",
+        K::DirectoryNotEmpty => "ENOTEMPTY",
+        K::InvalidInput => "EINVAL",
+        K::PermissionDenied => "EACCES",
+        K::InvalidFilename => "ENAMETOOLONG",
+        K::Unsupported => "ENOSYS",
+        _ => "EIO",
+    }
+}
+
+/// "nothing is there": a missing leaf, or a missing / non-directory parent
+#[cfg(unix)]
+fn absent(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR))
+}
+#[cfg(not(unix))]
+fn absent(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+}
+
+/// an io::Error -> "CODE: message" for the JS facade (err.code = CODE). A
+/// refusal (PermissionDenied with no errno) is the stable vault-escape error.
+pub fn plugin_err(op: &str, path: &str, e: &io::Error) -> String {
+    let p = path.replace('\0', "\\0");
+    if e.kind() == io::ErrorKind::PermissionDenied && e.raw_os_error().is_none() {
+        return format!("EPERM: vault-escape refused, {op} '{p}' ({e})");
+    }
+    let code = errno_name(e);
     format!("{code}: {e}, {op} '{p}'")
 }
 
@@ -1026,7 +1092,7 @@ pub fn plugin_op(root: &Path, op: &str, path: &str, to: Option<&str>, data: Opti
         "stat" => vfs.p_stat(&rel).map(|s| json!({"type": s.kind, "size": s.size, "mtime": s.mtime_ms, "ctime": s.ctime_ms})).map_err(e),
         "exists" => match vfs.p_stat(&rel) {
             Ok(_) => Ok(json!(true)),
-            Err(x) if x.kind() == io::ErrorKind::NotFound || matches!(x.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR)) => Ok(json!(false)),
+            Err(x) if absent(&x) => Ok(json!(false)),
             Err(x) => Err(e(x)),
         },
         "read" => { need(&rel)?; vfs.p_read(&rel, PLUGIN_READ_CAP).map(|b| json!(b64_encode(&b))).map_err(e) }
@@ -1071,6 +1137,18 @@ pub fn mkdir_p(root: &Path, rel: &Path) -> io::Result<()> {
     Vault::open(root)?.mkdir_p(rel)
 }
 
+/// A vault-relative path as TEXT: the form note keys, wikilinks, bookmarks and
+/// the UI use, which is '/'-separated on every OS (a vault is the same vault on
+/// Linux and on Windows). Going the other way needs nothing: Windows accepts
+/// '/' in a relative path, so `root.join("a/b.md")` is right as it is.
+pub fn rel_str(rel: &Path) -> String {
+    let s = rel.to_string_lossy();
+    #[cfg(windows)]
+    return s.replace('\\', "/");
+    #[cfg(not(windows))]
+    return s.into_owned();
+}
+
 /// tree walk that never descends a symlinked directory (audit #9) — the same
 /// boundary the note index draws with symlink_metadata. `out` gets every
 /// non-hidden real directory's vault-relative path, depth first. Real dirs
@@ -1088,7 +1166,7 @@ fn walk_real_dirs_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usiz
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
-        if e.file_name().as_bytes().first() == Some(&b'.') {
+        if e.file_name().as_encoded_bytes().first() == Some(&b'.') {
             continue;
         }
         // DirEntry::file_type does NOT follow symlinks: a symlinked dir is
@@ -1098,13 +1176,13 @@ fn walk_real_dirs_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usiz
         }
         let p = e.path();
         if let Ok(rel) = p.strip_prefix(base) {
-            out.push(rel.display().to_string());
+            out.push(rel_str(rel));
         }
         walk_real_dirs_at(&p, base, out, depth + 1);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

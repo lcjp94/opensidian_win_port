@@ -389,6 +389,7 @@ mod tests {
 
     /// no Secret Service reachable: every op is an `unsupported:` error that
     /// names the cause, and nothing is stored anywhere (no fallback exists).
+    #[cfg(target_os = "linux")] // talks to a D-Bus address
     #[test]
     fn no_service_is_unsupported_not_a_fake_success() {
         let dir = std::env::temp_dir().join(format!("ossec-nobus-{}", std::process::id()));

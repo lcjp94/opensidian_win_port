@@ -40,7 +40,6 @@ regex = "=1.13.1"
 # renderer-crates.txt, all >= 6 weeks old, resolved with --precise pins (never
 # "latest"). Design: harness docs/recon-pdfembed/README.md "security design".
 hayro = "=0.7.1"
-landlock = "=0.4.7"
 # vaultfs: openat/renameat/mkdirat/unlinkat with O_NOFOLLOW so vault writes never
 # follow a symlink. ALREADY in Cargo.lock (transitive via tauri/landlock); `=`
 # pins it to that exact version, so the lock gains no package.
@@ -77,6 +76,9 @@ gdkx11 = "=0.18.2"
 # already links (TLS = glib-networking, system CA store). soup3 0.5.0 (2023-08-01,
 # MIT) is webkit2gtk's own binding, ALREADY in Cargo.lock: no new crate, no new C lib.
 soup3 = "=0.5.0"
+# sandbox.rs: Landlock is a Linux kernel LSM; the crate does not build elsewhere
+# (it reads Linux-only prctl constants), so it is a Linux-only dependency.
+landlock = "=0.4.7"
 # ---- cp-secrets (begin) ----
 # app.secretStorage over the freedesktop Secret Service (src/secrets.rs). dbus
 # 0.9.12 is ALREADY in Cargo.lock (tauri -> tao's own dependency, libdbus via

@@ -759,6 +759,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn uninstall_refuses_a_symlinked_plugin_dir() {
         let root = vault("unsym");
