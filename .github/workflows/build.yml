@@ -1,0 +1,88 @@
+# Build and test on Linux and Windows.
+# Linux is the upstream target: this job is the non-regression check for every
+# change made for the Windows port. No Node, no npm: the frontend is served as-is.
+name: Build
+
+on:
+  workflow_dispatch: {}
+  pull_request: {}
+  push:
+    branches:
+      - main
+      - port/windows
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.0"
+
+jobs:
+  linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v6
+      # README "Build from source", plus libdbus (secrets.rs) which the desktop
+      # images carry and a bare runner does not
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libssl-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config
+      - name: Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --locked
+
+  windows:
+    name: Windows (x86_64 MSVC)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup default $env:RUST_TOOLCHAIN
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --locked
+      # an unsigned, unpackaged binary: enough to try a build, not a release
+      - name: Checksums
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/opensidian.exe dist/
+          $h = (Get-FileHash dist/opensidian.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  opensidian.exe" | Out-File -Encoding ascii -NoNewline dist/SHA256SUMS
+          Get-Content dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opensidian-windows-x86_64-unsigned
+          path: |
+            src-tauri/dist/opensidian.exe
+            src-tauri/dist/SHA256SUMS
+          if-no-files-found: error
