@@ -62,9 +62,9 @@ macro_rules! compat_app_version {
 pub const COMPAT_APP_VERSION: &str = compat_app_version!();
 /// what install writes next to the plugin: where each file came from + its sha256
 pub const SIDECAR: &str = "opensidian-install.json";
-const MAX_REDIRECTS: usize = 5;
-const IO_TIMEOUT_S: u32 = 20;
-const DEADLINE: Duration = Duration::from_secs(180);
+pub(crate) const MAX_REDIRECTS: usize = 5;
+pub(crate) const IO_TIMEOUT_S: u32 = 20;
+pub(crate) const DEADLINE: Duration = Duration::from_secs(180);
 const MAX_LIST: u64 = 32 * 1024 * 1024;
 const MAX_API_JSON: u64 = 2 * 1024 * 1024;
 const MAX_README: u64 = 1024 * 1024;
@@ -96,7 +96,7 @@ pub fn check_url(u: &str) -> Result<url::Url, String> {
 }
 
 /// the loopback fixture mirror, if the env names a valid one
-fn mirror_base() -> Option<url::Url> {
+pub(crate) fn mirror_base() -> Option<url::Url> {
     let raw = std::env::var(BASE_ENV).ok().filter(|s| !s.is_empty())?;
     match parse_mirror(&raw) {
         Some(u) => Some(u),
@@ -205,7 +205,13 @@ pub fn http_get(logical: &str, cap: u64, what: &str) -> Result<Vec<u8>, String> 
     Err(format!("{what}: more than {MAX_REDIRECTS} redirects"))
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: the same rules over WinHTTP, the client the platform ships (http_win.rs)
+#[cfg(windows)]
+pub fn http_get(logical: &str, cap: u64, what: &str) -> Result<Vec<u8>, String> {
+    crate::http_win::get(logical, cap, what)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn http_get(logical: &str, _cap: u64, what: &str) -> Result<Vec<u8>, String> {
     check_url(logical)?;
     Err(format!("{what}: the plugin browser has no network client on this platform"))

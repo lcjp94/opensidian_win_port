@@ -37,6 +37,10 @@ mod perf;
 mod sandbox;
 // cp-secrets: app.secretStorage over the OS keyring (Secret Service)
 mod secrets;
+#[cfg(windows)]
+mod secrets_win; // app.secretStorage in the Windows Credential Manager
+#[cfg(windows)]
+mod http_win; // the plugin store's HTTPS client over WinHTTP
 mod settings;
 mod spawn;
 mod spawner;

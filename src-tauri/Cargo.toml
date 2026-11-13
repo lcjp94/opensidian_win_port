@@ -87,6 +87,19 @@ landlock = "=0.4.7"
 dbus = "=0.9.12"
 # ---- cp-secrets (end) ----
 
+# Windows port — the two things Linux gets from libraries webkit already links
+# (libsoup for HTTPS, libdbus for the Secret Service) come from Windows itself:
+# WinHTTP (http_win.rs: TLS = Schannel, system trust store and proxy) and the
+# Credential Manager (secrets_win.rs). windows-sys is Microsoft's raw binding to
+# them: declarations only, no code of its own. NO NEW CRATE: windows-sys 0.61.2
+# (2025-10-06, MIT OR Apache-2.0, sha256 ae137229…f3fc) is ALREADY in Cargo.lock
+# as a dependency of the tauri tree on Windows; `=` pins that locked version and
+# the two features add no package (the lock gains one line: this crate now names
+# it). Not hand-declared like the four calls in plat.rs: this is ~20 functions
+# and a struct whose layout must be exact.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials"] }
+
 # listtoggle A2 — the unit table runs ui/editor.js in JavaScriptCore, the engine
 # the webview runs it in. javascriptcore-rs 1.1.2 is ALREADY in Cargo.lock as
 # webkit2gtk's own dependency; `=` pins it to that locked version, so this

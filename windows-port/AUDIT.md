@@ -237,3 +237,34 @@ L'arborescence du coffre et la note ouverte s'affichent.
 - Le glisser, le Snap et le redimensionnement par les bords : demandent une souris, pas testés.
 - Un vrai plugin communautaire dans un coffre de confiance (CSP `unsafe-eval`, `blob:`).
 - Les pages PDF et les cartes média du canvas (même schéma que les images, pas exercés).
+
+## 9. Suite de la Phase 4 (2026-11-13)
+
+CI : les deux jobs (Linux, Windows) sont verts depuis `f2f54c4`. Le seul échec Linux initial, `listtoggle_table`, venait de l'amont (variable `CENSUS_ON` non définie dans le banc JavaScriptCore) et est corrigé dans un commit séparé.
+
+Vérifié à la souris par l'utilisateur : glisser de la barre de titre, Snap, agrandissement par double-clic, redimensionnement par les bords.
+
+### Fait
+
+| Point | Changement | Vérification |
+|---|---|---|
+| X | Renommage ne changeant que la casse | test `r9_8` réactivé, test dédié |
+| W | Noms réservés (`CON`, `NUL`, `COM1`…), `< > " \| ? *`, point ou espace final refusés | test dédié |
+| I | Sélecteur de coffre : `..` remonte jusqu'à la liste des lecteurs, dossiers cachés/système non proposés | piloté dans l'app : `C:\Users\jp` → `C:\Users` → `C:\` → lecteurs → `C:\` |
+| L | Coffre passé en argument (donc « ouvrir dans une nouvelle fenêtre » et « changer de coffre ») : le chemin canonique n'a plus le préfixe `\?\` que le sélecteur refusait | lancé avec `…\Mon coffre été` : ouvert, enregistré tel quel dans la config |
+| R | Client HTTPS sur WinHTTP (`http_win.rs`) : mêmes règles que libsoup — `check_url` avant chaque requête, redirections suivies à la main et revérifiées, ni cookies ni authentification, délais, plafond de taille | test sur serveur local ; dans l'app : mise à jour 0.9.3 détectée et signature validée, magasin = 10 349 plugins, fiche détaillée |
+| S | Secrets des plugins dans le Gestionnaire d'identification (`secrets_win.rs`) | test aller-retour sur le vrai magasin, nettoyé ; coffre non approuvé refusé dans l'app |
+
+Dépendance : `windows-sys =0.61.2` déclarée sous `cfg(windows)` (déjà dans `Cargo.lock`, qui gagne une ligne). Entrée dans `THIRD-PARTY.md`.
+
+### Limites nouvelles
+
+- Un secret de plugin est limité à 2560 octets sous Windows (limite du Gestionnaire d'identification) ; au-delà, refus explicite.
+- « Ouvrir dans une nouvelle fenêtre » et « changer de coffre » : la cause du blocage est corrigée et l'ouverture par argument est vérifiée, mais l'enchaînement complet entre deux fenêtres n'a pas été exercé.
+
+### Reste en Phase 4
+
+- Processus de plugins : Job Object, lanceurs `.cmd`/`.bat`, `plugin_unroot` pour les chemins Windows (point N).
+- Un vrai plugin communautaire dans un coffre approuvé ; pages PDF ; cartes média du canvas.
+- Collage d'image (point AA).
+- Dispositions Snap au survol du bouton « agrandir ».
