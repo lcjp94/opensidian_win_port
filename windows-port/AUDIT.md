@@ -1,0 +1,209 @@
+# Audit de portage — Windows 11 puis macOS
+
+Base : `jpzk/opensidian` v0.9.2, commit `5ff9d7b`, branche `port/windows`.
+Date : 2026-11-13. Phases 0 et 1 de `CLAUDE.md` : **aucun fichier source modifié**.
+
+Légende : **Adaptable** = équivalent fonctionnel possible ; **Dégradé** = fonctionne avec une garantie plus faible ; **Perdu** = fonctionnalité absente sur la plateforme.
+
+## 1. Baseline de compilation Windows (mesurée)
+
+Commande : `cargo +1.99.1 check --locked --target x86_64-pc-windows-msvc`, avec `CARGO_TARGET_DIR=C:\cargo-target\opensidian` (hors OneDrive).
+
+> Écart : la toolchain épinglée **1.98.0 n'est pas installée** sur ce poste (présentes : `stable`, `nightly`, `1.99.1`). La baseline a été prise en 1.99.1. Le dépôt n'a pas de `rust-toolchain.toml` (seul `fuzz/` en a un).
+
+La compilation s'arrête sur trois murs successifs. Les murs 2 et 3 ont été mesurés sur une **copie hors dépôt** (`git archive` dans le dossier temporaire) où `landlock` était déplacé sous la cible Linux et une `icon.ico` factice ajoutée.
+
+| Mur | Erreur | Cause |
+|---|---|---|
+| 1 | `could not compile landlock` (10 erreurs, `PR_GET_NO_NEW_PRIVS`…) | `landlock = "=0.4.7"` est une dépendance inconditionnelle (`Cargo.toml:43`) |
+| 2 | `icons/icon.ico not found` (tauri-build) | `src-tauri/icons/` ne contient que `icon.png` |
+| 3 | 92 erreurs dans `src/vaultfs.rs` (lib) | `std::os::unix`, `std::os::fd`, `libc::openat/renameat/mkdirat/unlinkat/fstatat/linkat/renameat2/fdopendir`, `O_NOFOLLOW`, `O_PATH`, `mode_t` |
+
+Le binaire (`main.rs` et les modules hors lib) n'est pas atteint tant que la lib ne compile pas ; ses points bloquants sont recensés par lecture au §2 (non mesurés par le compilateur).
+
+Hypothèses de `CLAUDE.md` §4 :
+- `landlock`, `libc`, `std::os::unix` : **confirmées**.
+- `gdk/gdkx11/soup3/dbus` utilisés sans `cfg` : **infirmée**. L'amont les a déjà isolés sous `cfg(target_os = "linux")` avec un repli non-Linux (`appid.rs:86`, `plugin_store.rs:208`, `secrets.rs:310`, `main.rs:5483`, `main.rs:5737`).
+- `[patch.crates-io] glib` : aucun effet bloquant observé sous Windows.
+- `.gitattributes` protège déjà les thèmes (`src-tauri/themes/** -text`). Le clone local a `core.autocrlf=true` : les fixtures de tests (`tests/fixtures/**`, `listtoggle.tsv`) ne sont **pas** protégées.
+
+## 2. Inventaire des spécificités Linux
+
+### 2.1 Bloquant la compilation (code hors tests)
+
+| # | Fichier:ligne | Spécificité | Windows | macOS |
+|---|---|---|---|---|
+| A | `Cargo.toml:43`, `sandbox.rs:24` (718 l.), appels `main.rs:1818, 1881, 2021, 6157` | Sandbox Landlock | **Perdu** (v1). Module réduit à un stub « indisponible » | **Perdu**. Landlock n'existe pas ; App Sandbox/Seatbelt est un autre modèle, hors périmètre |
+| B | `vaultfs.rs:27-32, 117-920` | E/S sans suivi de lien (`openat` + `O_NOFOLLOW` à chaque composant, `renameat`, `linkat`, `renameat2(RENAME_NOREPLACE)`) | **Adaptable, garantie différente** — voir §3.1 | **Adaptable** : tout est POSIX sauf `renameat2` → `renameatx_np(RENAME_EXCL)` |
+| C | `vaultfs.rs:910-919` | `p_chmod` plugins via `O_PATH` + `/proc/self/fd` | **Perdu** (pas de modes POSIX ; seul l'attribut lecture seule existe) → renvoyer « non supporté » | **Adaptable** : `open(O_NOFOLLOW)` + `fchmod` sur le descripteur |
+| D | `vaultfs.rs:210, 373, 577` | `umask`, `fchmod` (conservation du mode) | Sans objet (ACL héritées) | Identique à Linux |
+| E | `main.rs:431-457` | Lecture média par marche `openat` | Comme B | Identique |
+| F | `main.rs:5869-5872, 5938-5975` | Arrêt propre sur `SIGTERM` (`sigaction`, `pipe2`, self-pipe) | **Adaptable partiel** : la fermeture de fenêtre (`WM_CLOSE`, `taskkill` sans `/F`) passe déjà par `quit_request`. Pas d'équivalent pour un kill forcé | **Adaptable** : `pipe2` absent → `pipe` + `fcntl(FD_CLOEXEC)` |
+| G | `main.rs:2422, 3901` | `xdg-open` (liens externes, ouverture de fichiers par les plugins) | **Adaptable** : `ShellExecuteW` (ou `rundll32 url.dll,FileProtocolHandler`), sans shell | **Adaptable** : `/usr/bin/open` |
+| H | `main.rs:1614, 2307, 2407, 6134`, `vaultlock.rs:109`, `migrate.rs` | `$HOME` avec repli `/` | **Adaptable** : `%USERPROFILE%` | Identique |
+| I | `main.rs:2293-2311` (`picker_allows`), test `main.rs:9787` | Liste noire `/proc /sys /etc…`, racine `/`, `/workspace` | **Adaptable** : liste des lecteurs comme racine ; refuser `%SystemRoot%`, `Program Files`, `ProgramData` ; chemins UNC à décider | **Adaptable** : ajouter `/System`, `/Library`, `/private` ; `/Volumes` ouvert |
+| J | `spawner.rs:36, 113, 191, 210` | Assistant non confiné sur `UnixStream::pair()` hérité en fd 0 | **Sans objet** : il n'existe que pour contourner Landlock. Sans sandbox, appels directs (le trait `Handler` le permet) | Idem (`UnixStream` compilerait, mais inutile) |
+| K | `spawn.rs:162` | `alive(pid)` lit `/proc/<pid>/stat` | **Adaptable** : `OpenProcess` + `GetExitCodeProcess` | **Adaptable** : `kill(pid, 0)` (pas d'état zombie lisible aussi finement) |
+| L | `spawn.rs:194-203, 217-221`, `vaultlock.rs:99-111` | Lanceurs Flatpak/AppImage, `process_group(0)`, `/.flatpak-info`, `XDG_RUNTIME_DIR` | **Adaptable** : seul `Launcher::Plain(current_exe)` ; `CREATE_NEW_PROCESS_GROUP` ; dossier de verrous `%LOCALAPPDATA%\dev.koto.opensidian\locks` | **Adaptable** : `Plain` ; verrous sous `~/Library/Application Support/dev.koto.opensidian/locks` |
+| M | `vaultlock.rs:44, 127`, `cfgstore.rs:37` | `OsStrExt::as_bytes` (clé FNV du chemin) | **Adaptable** : hacher le chemin canonique en minuscules, sans préfixe `\\?\` (`dunce 1.0.5` est déjà dans `Cargo.lock`) | Identique à Linux ; attention casse et NFD (§4) |
+| N | `desk_proc.rs:29, 136-178, 239-245` | Processus des plugins : signaux nommés, `kill(-pgid)`, `prctl(PR_SET_PDEATHSIG)`, `close_range` | **Dégradé** : Job Object (`KILL_ON_JOB_CLOSE`) remplace groupe + PDEATHSIG ; tous les signaux deviennent « terminer » ; pas de code « tué par signal » | **Dégradé** : signaux OK ; pas de `PDEATHSIG` ni `close_range` (boucle `FD_CLOEXEC`, surveillance du parent à écrire) |
+| O | `migrate.rs:103, 144-148` | `symlink()`, `O_NOFOLLOW \| O_NONBLOCK` | **Adaptable** : migration depuis l'ancien nom du produit, probablement sans objet sous Windows (aucune installation antérieure) → ne rien migrer | Identique à Linux |
+| P | `canvasfs.rs:122`, `pasteimg.rs:179` | `libc::ENOENT`, `libc::ELOOP` | **Adaptable** : `io::ErrorKind` + refus explicite des points d'analyse | Identique |
+| Q | `icons/` | Pas d'`icon.ico` | **À créer** à partir de `packaging/linux/opensidian.svg` (asset du projet, pas d'Obsidian) | `icon.icns` à créer pour le bundle |
+
+### 2.2 Déjà isolé par l'amont, fonctionnalité absente hors Linux
+
+| # | Fichier:ligne | Fonction | Windows | macOS |
+|---|---|---|---|---|
+| R | `plugin_store.rs:142-212`, utilisé par `updates.rs:453` | Client HTTPS (libsoup) : magasin de plugins **et** vérification des mises à jour | **Adaptable** : WinHTTP — voir §3.3. Sans cela : pas de magasin, pas de détection de mise à jour | **Adaptable** : `NSURLSession` via `objc2-foundation 0.3.2` (déjà verrouillé ; features non vérifiées) |
+| S | `secrets.rs:101-314` | `app.secretStorage` des plugins (Secret Service / D-Bus) | **Adaptable** : Gestionnaire d'identification Windows — voir §3.2. Limite : 2560 octets par secret | **Adaptable** : Trousseau (`Security.framework` ; `core-foundation 0.10.1` déjà verrouillé) |
+| T | `appid.rs:36-89` | Nom/classe de programme GTK | Sans objet. AppUserModelID à poser pour regrouper les fenêtres dans la barre des tâches | Sans objet (identité = bundle) |
+| U | `main.rs:5464-5483, 5712-5740` | Étendue du cadre GDK, choix X11/Wayland du glisser (`win_move_proto`) | **Adaptable** : `start_dragging` / `start_resize_dragging` (déjà le chemin générique). Reste à faire : Snap Layouts, bords de redimensionnement, ombre | **Adaptable** : préférer `titleBarStyle: "Overlay"` (feux tricolores natifs) à `decorations: false` |
+
+### 2.3 Comportements à adapter (compilent, mais faux hors Linux)
+
+| # | Fichier:ligne | Problème | Windows | macOS |
+|---|---|---|---|---|
+| V | `main.rs:576`, `plugins.rs:12, 115`, `tauri.conf.json` (CSP), `main.rs:6090` (`nav_allowed`), tests `main.rs:9730-9740` | URL `opensidian-img://localhost/…`, `opensidian-plugin://localhost/…`, origine `tauri://localhost` | **À adapter, priorité 1** : WebView2 sert `http://<schéma>.localhost/` et l'app sur `http://tauri.localhost`. Ajouter `tauri.windows.conf.json` (fusionné automatiquement par Tauri v2, aucun impact Linux) pour la CSP, et dériver préfixe d'URL + `nav_allowed` par `cfg` | Aucun changement : WKWebView garde la forme `schéma://localhost/` |
+| W | `index.rs`, `watcher.rs`, `vaultfs.rs:236` (`parts`) | Chemins relatifs du coffre | Normaliser `\` → `/` dans l'index/les liens ; noms réservés (`CON`, `NUL`, `COM1`…), `<>:"\|?*`, point/espace final, MAX_PATH | Noms de fichiers en NFD : les wikilinks accentués doivent être comparés après normalisation |
+| X | `index.rs` | Système de fichiers insensible à la casse | `Note.md` et `note.md` ne peuvent coexister ; un lien `[[note]]` résout physiquement `Note.md` | Idem (APFS par défaut) |
+| Y | `cfgstore.rs` | Écriture atomique (temp + rename) partagée entre process | Retries bornés sur `ERROR_SHARING_VIOLATION` / `ACCESS_DENIED` (antivirus, OneDrive) | Identique à Linux |
+| Z | `ui/main.js` (~15 sites `ctrlKey \|\| metaKey`, raccourcis) | Touche modificatrice | Rien à faire | Auditer : `Cmd` au lieu de `Ctrl`, libellés des raccourcis |
+| AA | `pasteimg.rs:14` | Collage PNG documenté pour le presse-papiers X | À vérifier manuellement sous WebView2 (non vérifié) | À vérifier sous WKWebView (non vérifié) |
+| AB | `updates.rs` | Choix de l'actif de release | Aucun actif Windows en amont : la vérification signale une version mais ne peut pointer que vers la page de release | Idem |
+
+### 2.4 Tests
+
+Environ 60 tests créent des liens symboliques (`std::os::unix::fs::symlink`) ou des FIFO (`mkfifo`) : `main.rs:6715-11297`, `vaultfs.rs:1111-1504`, `canvasfs.rs:414-639`, `plugins.rs:339-463` (déjà `cfg(unix)`), `migrate.rs:260-281`, `watcher.rs:362, 560, 580`, `pasteimg.rs:279-294`, `cfgstore.rs:200-268`, `plugin_store.rs:763`, `desk_proc.rs:398-452`, `devui.rs:268`.
+
+- Windows : les passer sous `cfg(unix)` et écrire des équivalents avec des **jonctions** (créables sans droits admin ni mode développeur) ; FIFO sans objet. `desk_proc` : `/bin/sh`, `/bin/sleep` → `cmd /c`, `powershell Start-Sleep`. `spawn.rs:360` (`/bin/true`, `/proc`) → `cfg(target_os = "linux")`.
+- `tests/listtoggle.rs` est déjà `cfg(target_os = "linux")` (JavaScriptCore GTK). **Couverture perdue** sous Windows et macOS : la logique de bascule de listes de `ui/editor.js` n'est testée que sur Linux.
+- `perf.rs:1084-1160` (test du puits OTel sous Landlock) → `cfg(target_os = "linux")`.
+- `fuzz/` : libFuzzer, à laisser Linux uniquement ; la lib doit seulement rester compilable.
+
+## 3. Décisions à valider
+
+### 3.1 `vaultfs` sous Windows (modèle de sécurité)
+
+Linux garantit qu'aucune écriture ne traverse un lien symbolique, même si un composant est remplacé pendant l'opération. Windows n'a pas d'`openat` dans `std`.
+
+- **Option 1 (recommandée) — « ouvrir puis vérifier le handle »** : ouvrir chaque fichier/dossier avec `FILE_FLAG_OPEN_REPARSE_POINT`, puis contrôler *sur le handle* qu'il n'est pas un point d'analyse et que `GetFinalPathNameByHandleW` reste sous la racine canonique du coffre ; renommer par handle (`SetFileInformationByHandle`). La course résiduelle se limite au renommage d'un dossier parent pendant l'opération. Coût : API Win32 via `windows-sys`/`windows` (déjà dans `Cargo.lock`), ~600 lignes.
+- **Option 2 — vérification préalable simple** : `symlink_metadata` sur chaque composant puis `std::fs`. ~250 lignes, mais fenêtre TOCTOU complète entre contrôle et action.
+
+Dans les deux cas : liens symboliques, jonctions et fichiers OneDrive « à la demande » (ce sont aussi des points d'analyse) doivent être traités explicitement — **refuser les jonctions/symlinks, accepter les espaces réservés cloud**.
+
+### 3.2 Secrets des plugins (Windows)
+
+Gestionnaire d'identification (`CredWriteW/CredReadW/CredDeleteW/CredEnumerateW`). Aucun nouveau paquet dans `Cargo.lock` : `windows-sys 0.61.2` et `windows 0.61.3` y sont déjà (dépendances de tauri/wry). Il faut néanmoins les déclarer en dépendance directe épinglée sous `[target.'cfg(windows)'.dependencies]` et l'inscrire dans `THIRD-PARTY.md`. Le choix exact (`windows-sys` ou `windows`) et les features sont à vérifier en Phase 2 (non vérifié).
+Alternative : garder le stub « non supporté » en v1 (les plugins qui stockent des jetons ne fonctionnent pas).
+
+### 3.3 Client HTTPS (Windows)
+
+- **Option 1 (recommandée)** : WinHTTP via la même crate Windows que §3.2 — TLS et magasin de certificats du système, redirections désactivées et suivies à la main comme sous libsoup, mêmes garde-fous (`check_url`, liste d'hôtes, plafond de taille, sha256).
+- **Option 2** : `reqwest 0.13.4` est présent dans `Cargo.lock`, mais sa pile TLS et ses features activées n'ont pas été vérifiées, et l'activer côté application tirerait probablement de nouveaux paquets.
+- **Option 3** : stub en v1 — pas de magasin de plugins (installation manuelle dans `.obsidian/plugins/`), pas de vérification de mise à jour.
+
+### 3.4 Emplacement de la configuration (Windows)
+
+`%USERPROFILE%\.opensidian.json` (recommandé : même nom que Linux, code inchangé hormis `HOME` → `USERPROFILE`) ou `%APPDATA%\dev.koto.opensidian\config.json` (plus conforme à Windows, mais divergence avec l'amont).
+
+### 3.5 Environnement
+
+- Installer Rust **1.98.0** (`rustup toolchain install 1.98.0 --profile minimal -c clippy,rustfmt`) ? Ajouter un `rust-toolchain.toml` est un changement visible par l'amont.
+- Le dépôt est sous OneDrive : continuer avec `CARGO_TARGET_DIR=C:\cargo-target\opensidian`, ou cloner hors OneDrive.
+- Non-régression Linux : aucun WSL/CI Linux vérifié à ce stade. Il faut un job `ubuntu` (Phase 5 avancée en Phase 2) ou une distribution WSL avec les paquets WebKitGTK.
+
+### 3.6 Packaging Windows
+
+NSIS via `tauri-cli` (recommandé, `downloadBootstrapper` pour WebView2) ou zip portable.
+
+## 4. Fonctionnalités perdues ou dégradées
+
+| Fonctionnalité | Windows v1 | macOS |
+|---|---|---|
+| Sandbox Landlock (`OPENSIDIAN_LANDLOCK=1`) : confinement du process au coffre | **Perdue** | **Perdue** |
+| Garantie « jamais à travers un lien » contre un attaquant concurrent | **Dégradée** (§3.1) | Conservée |
+| `chmod` par les plugins, conservation des modes de fichier | **Perdue** | Conservée |
+| Signaux nommés vers les processus de plugins | **Dégradée** (terminer uniquement) | Conservée |
+| Mort automatique des processus de plugins si l'app meurt | Conservée (Job Object) | **Dégradée** (à réécrire) |
+| Arrêt propre sur kill externe | **Dégradée** (fermeture normale uniquement) | Conservée |
+| Secrets des plugins | Conservée si §3.2 accepté, sinon perdue | Conservée (Trousseau) |
+| Magasin de plugins et vérification de mise à jour | Conservée si §3.3 accepté, sinon perdue | Conservée (à écrire) |
+| Mise à jour : lien vers un binaire de la plateforme | **Perdue** tant que l'amont ne publie pas d'actif | Idem |
+| Tests listtoggle (JavaScriptCore) | **Couverture perdue** | **Couverture perdue** |
+| Flatpak / AppImage / deb / rpm / Nix | Sans objet | Sans objet |
+| Coexistence de `Note.md` et `note.md` | **Impossible** (NTFS) | **Impossible** (APFS par défaut) |
+| Compatibilité des plugins communautaires | Non vérifiée | Non vérifiée |
+
+## 5. Plan
+
+Principe d'isolation, appliqué dès Windows pour ne pas refaire le travail pour macOS : trois niveaux de `cfg` — `cfg(unix)` (commun Linux + macOS : `openat`, signaux, liens), `cfg(target_os = "linux")` (Landlock, GDK, libsoup, D-Bus, `/proc`, Flatpak, `renameat2`, `O_PATH`, `prctl`, `close_range`, `pipe2`), `cfg(windows)`. Les points d'entrée dépendants de l'OS sont regroupés derrière une petite façade (dossier personnel, ouverture externe, processus vivant, dossier de verrous, HTTP, secrets) pour garder `main.rs` lisible.
+
+### Étape A — Windows 11
+
+| Phase | Contenu | Effort estimé |
+|---|---|---|
+| 2. Compilation | `landlock` sous cible Linux ; stub `sandbox` ; `icon.ico` ; `vaultfs` Windows ; `cfg` des points A–Q ; tests Unix sous `cfg(unix)` ; `-text` sur les fixtures | 4–6 j (dont `vaultfs` 2–3 j) |
+| 3. Cœur | config (H, Y) → verrou (M, L) → lancement (K, L, J) → `vaultfs` durci + tests jonctions → chemins/casse (W, X) → thèmes | 4–5 j |
+| 4. Interface | CSP et schémas (V) **en premier** ; fenêtre (U) ; ouverture externe (G) ; processus de plugins (N) ; sélecteur de dossier (I) ; secrets (S) ; HTTPS (R) ; presse-papiers (AA) | 5–7 j |
+| 5. Packaging + CI | `packaging/windows/`, NSIS, workflow `windows-latest` + job `ubuntu` de non-régression, `SHA256SUMS` | 2 j |
+| 6. Documentation | `windows-port/README.md`, section README, PR atomiques vers l'amont | 1 j |
+
+### Étape B — macOS (après la v1 Windows)
+
+Nécessite un Mac ou un runner `macos-latest` : pas de compilation croisée fiable.
+
+1. Compilation : remplacer les cinq appels Linux-only de `vaultfs`/`desk_proc`/`main.rs` (`renameat2`, `O_PATH` + `/proc/self/fd`, `close_range`, `prctl`, `pipe2`) ; `alive()` ; dossier de verrous ; `open`. Le reste du code `cfg(unix)` est réutilisé tel quel. ~2–3 j.
+2. Plateforme : Trousseau, `NSURLSession`, `titleBarStyle: Overlay`, raccourcis `Cmd`, normalisation NFC/NFD, liste noire du sélecteur. ~4–5 j.
+3. Modèle « un process par coffre » : chaque process aura sa propre icône dans le Dock ; à évaluer (non vérifié).
+4. Packaging : `.app`/`.dmg` (`icon.icns`), binaire universel `aarch64` + `x86_64`, signature Developer ID et notarisation (compte développeur Apple payant ; sans cela Gatekeeper bloque l'ouverture par défaut).
+
+## 6. Risques, par ordre décroissant
+
+1. `vaultfs` Windows : touche au modèle de sécurité, 1500 lignes et ~40 tests à doubler.
+2. CSP et schémas personnalisés sous WebView2 : si mal réglés, ni images ni plugins.
+3. Absence de vérification Linux locale : chaque phase peut casser l'amont sans qu'on le voie.
+4. `main.rs` fait 11 479 lignes : les `cfg` y seront nombreux, conflits de fusion probables avec l'amont.
+5. OneDrive/Defender : verrous sur le coffre et sur `.opensidian.json`.
+
+## 7. État après la Phase 2 (2026-11-13)
+
+Mesuré sous Windows 11, Rust 1.98.0 MSVC, `CARGO_TARGET_DIR=C:\cargo-target\opensidian` :
+
+| Commande (dans `src-tauri/`) | Résultat |
+|---|---|
+| `cargo check --locked` | OK |
+| `cargo build --release --locked` | OK, `opensidian.exe` 23,7 Mo |
+| `cargo test --locked` | 387 réussis, 0 échec, 1 ignoré |
+| Lancement du binaire debug sur une copie de `vault/` (`VAULT_DIR`) | démarre, prend le verrou, sème les thèmes, reste en vie 20 s |
+
+**Non vérifié : Linux.** Aucun `cargo check` Linux n'a été lancé (pas de WSL avec WebKitGTK, pas de CI). Tout le code Linux est resté en place derrière des `cfg`, mais seule une compilation le prouvera.
+
+Aucune dépendance ajoutée, `Cargo.lock` inchangé (`landlock` est seulement passé sous la cible Linux), donc rien à inscrire dans `THIRD-PARTY.md`.
+
+### Ce qui a été fait
+
+- `Cargo.toml` : `landlock` sous `[target.'cfg(target_os = "linux")'.dependencies]`.
+- `icons/icon.ico` : provisoire, une seule taille (128 px) tirée de `icons/icon.png`. À refaire en multi-tailles en Phase 5.
+- `vaultfs.rs` : code POSIX inchangé sous `cfg(unix)` ; `vaultfs_win.rs` (nouveau) donne la même API avec `std` seul — chaque dossier du chemin est ouvert **sans `FILE_SHARE_DELETE`** (il ne peut être ni renommé ni supprimé tant qu'on le tient) et **avec `FILE_FLAG_OPEN_REPARSE_POINT`** (une jonction est ouverte elle-même et refusée). C'est l'option 1 du §3.1, obtenue sans crate Windows. Limites écrites en tête du fichier.
+- `plat.rs` (nouveau) : dossier personnel, ouverture par défaut (`ShellExecuteW`), processus vivant, arrêt d'un arbre de processus. Quatre fonctions Win32 déclarées à la main.
+- `sandbox.rs`, `spawner.rs` : Landlock et son assistant ne se compilent que sous Linux ; ailleurs `landlock_enabled()` est toujours faux.
+- `vaultlock.rs` : verrous sous `%LOCALAPPDATA%\dev.koto.opensidian\locks`. Le marqueur `ready <token>` va dans un fichier voisin `.ready` : un verrou Windows est obligatoire, le fichier verrouillé est illisible pour les autres processus.
+- `cfgstore.rs`, `spawn.rs`, `migrate.rs`, `desk_proc.rs`, `main.rs` : variantes `cfg` (points F, G, H, I, K, L, M, N, O du §2).
+- `vaultfs::rel_str` : les chemins relatifs du coffre sont toujours écrits avec `/` (clés d'index, liens, favoris, corbeille).
+- `.gitattributes` : sources en LF sur tous les OS, fixtures et données épinglées jamais converties. Sans cela, sous `autocrlf`, la signature de `data/updates/SHA256SUMS` ne se vérifiait plus.
+- Tests : une soixantaine de tests propres à Unix (liens symboliques, FIFO, modes, `sh`, `/proc`) passés sous `cfg(unix)`, ainsi que les modules de tests entiers de `vaultfs.rs` et `sandbox.rs` ; 13 tests Windows ajoutés (`vaultfs_win`, `plat`).
+
+### Écarts connus à l'issue de la Phase 2
+
+| Sujet | État |
+|---|---|
+| Renommage ne changeant que la casse (`Note` → `note`) | refusé « target exists » ; test `r9_8_case_only_rename_is_followed` ignoré sous Windows (point X) |
+| Glisser la fenêtre | le journal affiche `[win_drag] ... path none` : à traiter en Phase 4 (point U) |
+| Images et plugins | schémas `opensidian-img:` / `opensidian-plugin:` non adaptés à WebView2 (point V) : non testé, très probablement cassé |
+| Sélecteur de coffre | `picker_allows` accepte `X:\...`, mais la liste des lecteurs et les séparateurs côté `ui/` ne sont pas faits (point I) |
+| Magasin de plugins, mises à jour, secrets | toujours « non supporté » (points R, S) ; d'où ~20 avertissements `dead_code` sous Windows |
+| Processus de plugins | tués par `taskkill /T /F` ; pas de Job Object, un enfant peut survivre à l'app (point N) |
+| Noms réservés (`CON`, `NUL`…), point ou espace final | non filtrés (point W) |
+| Test de lien symbolique de fichier | sauté sur ce poste (mode développeur désactivé) ; les jonctions sont testées |
+| Antivirus | McAfee verrouille par moments les `.exe` fraîchement liés (`LNK1104`) : relancer, ou exclure `C:\cargo-target` |
