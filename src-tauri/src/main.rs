@@ -6368,7 +6368,7 @@ fn main() {
                     "[win_drag] session: x11={} _NET_WM_MOVERESIZE={} -> path {}",
                     proto.x11,
                     proto.moveresize,
-                    drag_path(proto.x11, proto.moveresize, None)
+                    session_path(&proto)
                 );
                 let wayland = !proto.x11;
                 app.manage(proto);
@@ -8042,7 +8042,6 @@ mod tests {
     }
 
     /// R9.8: a case-only rename is a rename like any other.
-    #[cfg_attr(windows, ignore = "case-only rename on a case-insensitive filesystem is refused as 'target exists' (windows-port/AUDIT.md, point X)")]
     #[test]
     fn r9_8_case_only_rename_is_followed() {
         let root = tmp_vault("bm-case");
@@ -11660,5 +11659,34 @@ mod devui_guard {
     #[test]
     fn devui_guard_default_build_has_no_devui() {
         assert!(!cfg!(feature = "devui"));
+    }
+}
+
+/* Windows port: tauri.windows.conf.json is merged over tauri.conf.json on
+   Windows only, and the one thing it changes is the CSP. A security boundary
+   kept in two files drifts unless something ties them: the Windows policy must
+   be the base policy with the two custom schemes spelled the way WebView2
+   serves them, and nothing else. Runs on every OS — it reads two files. */
+#[cfg(test)]
+mod windows_conf_guard {
+    fn csp(conf: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(conf).unwrap()["app"]["security"]["csp"].as_str().expect("csp").to_string()
+    }
+
+    #[test]
+    fn windows_csp_is_the_base_csp_with_the_two_schemes_as_webview2_serves_them() {
+        let base = csp(include_str!("../tauri.conf.json"));
+        let win = csp(include_str!("../tauri.windows.conf.json"));
+        let want = base
+            .replace("opensidian-plugin:", "http://opensidian-plugin.localhost")
+            .replace("opensidian-img:", "http://opensidian-img.localhost");
+        assert_ne!(want, base, "the base CSP no longer names the two schemes");
+        assert_eq!(win, want);
+    }
+
+    #[test]
+    fn windows_conf_overrides_nothing_but_the_csp() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        assert_eq!(v, serde_json::json!({ "app": { "security": { "csp": v["app"]["security"]["csp"] } } }));
     }
 }

@@ -207,3 +207,33 @@ Aucune dépendance ajoutée, `Cargo.lock` inchangé (`landlock` est seulement pa
 | Noms réservés (`CON`, `NUL`…), point ou espace final | non filtrés (point W) |
 | Test de lien symbolique de fichier | sauté sur ce poste (mode développeur désactivé) ; les jonctions sont testées |
 | Antivirus | McAfee verrouille par moments les `.exe` fraîchement liés (`LNK1104`) : relancer, ou exclure `C:\cargo-target` |
+
+## 8. Début de la Phase 4 (2026-11-13)
+
+### Fait
+
+- **CI** : `.github/workflows/build.yml` compile et teste sur `ubuntu-24.04` et `windows-latest`, et publie l'exe non signé avec `SHA256SUMS`.
+- **Schémas d'URL et CSP (point V)** : sous WebView2 la page est servie sur `http://tauri.localhost` et un schéma enregistré sur `http://<schéma>.localhost/`. Le préfixe est choisi côté Rust (`IMG_BASE`) et côté `ui/` (d'après l'hôte de la page) ; la CSP Windows est dans `tauri.windows.conf.json`, fusionnée par Tauri sous Windows seulement ; `nav_allowed` accepte `http://tauri.localhost` exactement. Un test lie les deux CSP : celle de Windows doit être celle de base avec les deux schémas réécrits, rien d'autre.
+- **Glisser (point U)** : sous Windows l'appui sur la barre de titre est toujours confié au système (`start_dragging`), ce qui donne Aero Snap et Snap Layouts. Correction de l'audit initial : le glisser n'était pas cassé, il fonctionnait par repositionnement, sans Snap.
+
+### Vérifié dans l'application réelle
+
+Binaire debug lancé sur une copie du coffre, WebView2 piloté par son port de débogage (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=…`), expressions évaluées dans la page :
+
+| Requête depuis la page | Résultat |
+|---|---|
+| origine de la page | `http://tauri.localhost` |
+| `http://opensidian-img.localhost/pic.png` | chargée (128 px) |
+| `http://opensidian-img.localhost/sub/my%20pic.png` | chargée |
+| image absente du coffre | erreur |
+| ancienne forme `opensidian-img://localhost/pic.png` | bloquée |
+| image distante `https://example.com/x.png` | bloquée par la CSP |
+| script `http://opensidian-plugin.localhost/nope/main.js` | atteint le gestionnaire Rust, refusé « restricted mode » |
+
+L'arborescence du coffre et la note ouverte s'affichent.
+
+### Non vérifié
+
+- Le glisser, le Snap et le redimensionnement par les bords : demandent une souris, pas testés.
+- Un vrai plugin communautaire dans un coffre de confiance (CSP `unsafe-eval`, `blob:`).
+- Les pages PDF et les cartes média du canvas (même schéma que les images, pas exercés).
