@@ -267,9 +267,41 @@ pub struct Spec {
     pub env: Vec<(String, String)>,
 }
 
+/// Windows: the command line of a `sh -c <line>` request. The page presents
+/// itself to plugins as Linux (node-desktop.js: process.platform, "/vault"), so
+/// child_process.exec() and `shell: true` arrive as `/bin/sh -c "<line>"`.
+/// There is no /bin/sh here; what Node itself runs for exec() on Windows is the
+/// system's command interpreter, and so do we.
+#[cfg(windows)]
+fn shell_line(sp: &Spec) -> Option<&str> {
+    let sh = matches!(sp.file.as_str(), "/bin/sh" | "sh" | "/bin/bash" | "bash");
+    (sh && sp.args.len() == 2 && sp.args[0] == "-c").then(|| sp.args[1].as_str())
+}
+
 fn build(sp: &Spec) -> Command {
-    let mut c = Command::new(&sp.file);
-    c.args(&sp.args).current_dir(&sp.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(not(windows))]
+    let mut c = {
+        let mut c = Command::new(&sp.file);
+        c.args(&sp.args);
+        c
+    };
+    #[cfg(windows)]
+    let mut c = match shell_line(sp) {
+        // Node's own form: cmd.exe /d /s /c "<line>", the line passed VERBATIM —
+        // cmd does not parse quotes the way std's argument escaping writes them
+        Some(line) => {
+            let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+            let mut c = Command::new(comspec);
+            std::os::windows::process::CommandExt::raw_arg(&mut c, format!("/d /s /c \"{line}\""));
+            c
+        }
+        None => {
+            let mut c = Command::new(&sp.file);
+            c.args(&sp.args);
+            c
+        }
+    };
+    c.current_dir(&sp.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (k, v) in &sp.env {
         c.env(k, v);
     }
@@ -346,6 +378,11 @@ pub fn start(sp: Spec) -> Result<Arc<Run>, String> {
     }
     let file = sp.file.clone();
     let mut child = fork(sp).map_err(|e| spawn_err(&file, &e))?;
+    // Windows: tie the child (and what it starts) to the app's lifetime
+    #[cfg(windows)]
+    if let Err(e) = crate::plat::adopt(&child) {
+        eprintln!("[desk] child {} is not in the app's job ({e}): it can outlive the app", child.id());
+    }
     let run = Arc::new(Run {
         pid: child.id() as i32,
         stdin: Mutex::new(child.stdin.take()),
@@ -513,5 +550,58 @@ mod tests {
         assert!(e.starts_with("ENOENT: spawn no-such-exe-desk"), "{e}");
         assert_eq!(sig_num("SIGKILL"), Some(sig::SIGKILL));
         assert_eq!(sig_num(""), Some(sig::SIGTERM));
+    }
+
+    /// Windows: a program run directly — cwd, the plugin's env laid over ours,
+    /// stdin, both pipes and the exit code
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_spawn_runs_in_cwd_with_env_stdin_and_exit_code() {
+        let d = std::env::temp_dir().canonicalize().unwrap();
+        let mut sp = spec("cmd.exe", &["/d", "/c", "cd & echo %DESK_T% & findstr x & echo e 1>&2 & exit 3"], &d);
+        sp.env = vec![("DESK_T".into(), "tee".into())];
+        let r = start(sp).unwrap();
+        r.write(b"axb\r\n").unwrap();
+        r.end();
+        let (o, e, c) = drain(&r);
+        let o = String::from_utf8_lossy(&o).to_lowercase();
+        let cwd = d.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase();
+        assert!(o.contains(&cwd), "cwd {cwd:?} not in {o:?}");
+        assert!(o.contains("tee") && o.contains("axb"), "{o:?}");
+        assert_eq!(String::from_utf8_lossy(&e).trim(), "e");
+        assert_eq!((c.exit, c.signal, c.done), (Some(3), None, true));
+    }
+
+    /// Windows: exec() / shell:true arrive as `/bin/sh -c <line>` (the page says
+    /// it is Linux) and run in the system's command interpreter, the line verbatim
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_sh_c_runs_the_line_in_the_command_interpreter() {
+        let d = std::env::temp_dir();
+        let r = start(spec("/bin/sh", &["-c", "echo \"a b\" & echo two>&2 & exit 5"], &d)).unwrap();
+        let (o, e, c) = drain(&r);
+        assert_eq!(String::from_utf8_lossy(&o).trim(), "\"a b\"", "quotes reach cmd as written");
+        assert_eq!(String::from_utf8_lossy(&e).trim(), "two");
+        assert_eq!(c.exit, Some(5));
+        // not a shell request: three arguments, or another program
+        assert!(shell_line(&spec("/bin/sh", &["-c", "x", "y"], &d)).is_none());
+        assert!(shell_line(&spec("git", &["-c", "x"], &d)).is_none());
+    }
+
+    /// Windows: no signal exists, so kill() ends the tree and the page still
+    /// reads the name it asked for; a missing program is ENOENT
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_kill_ends_the_tree_and_reports_the_signal() {
+        let d = std::env::temp_dir();
+        // cmd -> ping: the grandchild must go too
+        let r = start(spec("cmd.exe", &["/d", "/c", "ping -n 60 127.0.0.1 >nul"], &d)).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(r.kill(sig::SIGTERM));
+        let (_, _, c) = drain(&r);
+        assert_eq!((c.exit, c.signal, c.done), (None, Some("SIGTERM"), true));
+        assert!(!r.kill(sig::SIGTERM), "a reaped child cannot be killed again");
+        let e = start(spec("no-such-exe-desk", &[], &d)).err().unwrap();
+        assert!(e.starts_with("ENOENT: spawn no-such-exe-desk"), "{e}");
     }
 }

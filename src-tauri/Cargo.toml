@@ -98,7 +98,7 @@ dbus = "=0.9.12"
 # it). Not hand-declared like the four calls in plat.rs: this is ~20 functions
 # and a struct whose layout must be exact.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # listtoggle A2 — the unit table runs ui/editor.js in JavaScriptCore, the engine
 # the webview runs it in. javascriptcore-rs 1.1.2 is ALREADY in Cargo.lock as

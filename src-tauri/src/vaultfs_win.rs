@@ -863,6 +863,30 @@ mod tests {
         assert!(!root.join("d").exists());
     }
 
+    /// a plugin naming the REAL vault dir (git prints it with '/', in whatever
+    /// case it was typed) reaches the same file; a path outside does not
+    #[test]
+    fn vaultfs_win_plugin_paths_naming_the_real_vault_dir_are_vault_relative() {
+        use crate::vaultfs::plugin_unroot;
+        let (root, out) = fresh("unroot");
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/info/exclude"), "# x\n").unwrap();
+        let plain = root.to_str().unwrap().to_string();
+        let slashed = plain.replace('\\', "/");
+        assert_eq!(plugin_unroot(&root, &plain), "");
+        assert_eq!(plugin_unroot(&root, &format!("{slashed}/")), "");
+        assert_eq!(plugin_unroot(&root, &format!("{slashed}/.git/info/exclude")), ".git/info/exclude");
+        assert_eq!(plugin_unroot(&root, &format!("{}\\.GIT\\info\\exclude", plain.to_uppercase())), ".GIT/info/exclude");
+        assert_eq!(plugin_unroot(&root, "notes/a.md"), "notes/a.md", "a relative path is left alone");
+        let op = |p: &str| plugin_op(&root, "read", p, None, None, false);
+        assert_eq!(op(&format!("{slashed}/.git/info/exclude")).unwrap(), serde_json::json!(crate::vaultfs::b64_encode(b"# x\n")));
+        fs::write(out.join("f"), "secret").unwrap();
+        for bad in [format!("{slashed}/../outside/f"), format!("{slashed}x/f"), format!("{}/f", out.to_str().unwrap().replace('\\', "/")), r"C:\Windows\win.ini".to_string()] {
+            let e = op(&bad).unwrap_err();
+            assert!(e.starts_with("EPERM"), "{bad}: {e}");
+        }
+    }
+
     #[test]
     fn vaultfs_win_chmod_maps_owner_write_to_read_only() {
         let (root, _) = fresh("chmod");

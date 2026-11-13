@@ -135,6 +135,44 @@ pub fn kill_tree(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Windows: put `child` in the app-wide job, so it — and everything it starts
+/// later — is ended by the system when this process goes away, however it
+/// goes (crash, Task Manager, power-user kill). This is what
+/// prctl(PR_SET_PDEATHSIG) buys on Linux, and a little more: the grandchildren
+/// are covered too. The job is created once and its handle is never closed:
+/// the system closes it with the process, and KILL_ON_JOB_CLOSE does the rest.
+/// Best effort: on failure the child simply runs unsupervised, as before.
+#[cfg(windows)]
+pub fn adopt(child: &std::process::Child) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::*;
+    // the handle as an integer: a raw pointer is not Sync, the value is
+    static JOB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let job = JOB.get_or_init(|| {
+        // SAFETY: no name, default security; the info struct is plain data of the stated size
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(h, JobObjectExtendedLimitInformation, &info as *const _ as *const core::ffi::c_void, std::mem::size_of_val(&info) as u32);
+            // a job that would NOT kill on close is worse than none: children
+            // would be tied to a handle that does nothing
+            (ok != 0).then_some(h as usize)
+        }
+    });
+    let Some(job) = *job else {
+        return Err(std::io::Error::other("no job object"));
+    };
+    // SAFETY: a live job handle and the child's own process handle
+    if unsafe { AssignProcessToJobObject(job as *mut core::ffi::c_void, child.as_raw_handle() as *mut core::ffi::c_void) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 mod win {
     pub type Handle = *mut core::ffi::c_void;

@@ -1045,6 +1045,47 @@ pub fn plugin_err(op: &str, path: &str, e: &io::Error) -> String {
 /// prints, obsidian-git reads .git/info/exclude by it) -> the same path vault-relative.
 /// Root itself -> "". Anything else is returned as given (plugin_rel still refuses it).
 /// The rest still goes through plugin_rel, so "<root>/../x" is a dot component, refused.
+#[cfg(windows)]
+pub fn plugin_unroot<'a>(root: &Path, path: &'a str) -> std::borrow::Cow<'a, str> {
+    // Windows: the real vault dir is a drive path, and git prints it with '/'
+    // ("C:/Users/x/vault/.git/info/exclude") while everything else writes '\'.
+    // Names compare without case, as the filesystem does. Only a path that IS
+    // under the root is rewritten; anything else is returned as given, and
+    // plugin_rel then refuses a drive-letter path.
+    let b = path.as_bytes();
+    if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\')) {
+        return path.into();
+    }
+    /// `p` minus the prefix `r`, compared char by char without case
+    fn strip_nocase<'p>(p: &'p str, r: &str) -> Option<&'p str> {
+        let mut pi = p.char_indices();
+        for rc in r.chars() {
+            let (_, pc) = pi.next()?;
+            if !pc.to_lowercase().eq(rc.to_lowercase()) {
+                return None;
+            }
+        }
+        Some(pi.next().map_or("", |(i, _)| &p[i..]))
+    }
+    let p = path.replace('\\', "/");
+    let canon = root.canonicalize().ok();
+    for r in std::iter::once(root).chain(canon.as_deref()) {
+        let Some(r) = r.to_str() else { continue };
+        let r = r.strip_prefix(r"\\?\").unwrap_or(r).replace('\\', "/");
+        let r = r.trim_end_matches('/');
+        if r.is_empty() {
+            continue;
+        }
+        match strip_nocase(&p, r) {
+            Some("") => return "".into(),
+            Some(rest) if rest.starts_with('/') => return rest.trim_start_matches('/').to_string().into(),
+            _ => {}
+        }
+    }
+    path.into()
+}
+
+#[cfg(not(windows))]
 pub fn plugin_unroot<'a>(root: &Path, path: &'a str) -> std::borrow::Cow<'a, str> {
     if !path.starts_with('/') {
         return path.into();
