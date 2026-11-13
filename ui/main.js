@@ -11422,7 +11422,29 @@ async function cmdLocalGraph() {       // R7.2: local graph of focused note -> n
 $("lgbtn").onclick = cmdLocalGraph;
 
 /* ---------- vault picker ---------- */
-function base(p) { return p.replace(/\/+$/, "").split("/").pop() || p; }
+/* Windows port — HOST paths in the picker (never vault-relative ones, which are
+   "/"-separated on every OS). On Windows a host path uses "\", has a drive
+   letter and no single root: the level above "C:\" is the list of drives, which
+   list_dirs("") returns. WIN is read off the page's own host, which is
+   "tauri.localhost" only under WebView2 (editor.js IMG_BASE). Elsewhere each
+   helper is the expression the picker had inline before, unchanged. */
+const WIN = location.hostname === "tauri.localhost";
+function base(p) {
+  if (WIN) return p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
+  return p.replace(/\/+$/, "").split("/").pop() || p;
+}
+function pUp(p) {
+  if (!WIN) return p.replace(/\/[^/]+\/?$/, "") || "/";
+  const t = p.replace(/[\\/]+$/, "");
+  if (t === "" || /^[A-Za-z]:$/.test(t)) return "";        // above a drive root: the drives
+  const u = t.replace(/[\\/][^\\/]+$/, "");
+  return /^[A-Za-z]:$/.test(u) ? u + "\\" : u;              // "C:" alone is not the root, "C:\" is
+}
+function pJoin(p, d) {
+  if (!WIN) return (p === "/" ? "" : p) + "/" + d;
+  if (p === "") return d;                                   // a drive, listed as "C:\"
+  return p.replace(/[\\/]+$/, "") + "\\" + d;
+}
 
 function showPicker() {
   pmode = null;
@@ -11480,12 +11502,12 @@ async function browseTo(p) {
   ul.innerHTML = "";
   const up = document.createElement("li");
   up.textContent = "..";
-  up.onclick = () => browseTo(bpath.replace(/\/[^/]+\/?$/, "") || "/");
+  up.onclick = () => browseTo(pUp(bpath));
   ul.appendChild(up);
   for (const d of dirs) {
     const li = document.createElement("li");
-    li.textContent = d + "/";
-    li.onclick = () => browseTo((bpath === "/" ? "" : bpath) + "/" + d);
+    li.textContent = WIN && bpath === "" ? d : d + "/";      // a drive already ends in its separator
+    li.onclick = () => browseTo(pJoin(bpath, d));
     ul.appendChild(li);
   }
 }

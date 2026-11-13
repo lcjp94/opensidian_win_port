@@ -2069,7 +2069,7 @@ static WIN_TRACK: Mutex<winsize::Track> = Mutex::new(winsize::Track::new());
 
 /// the record's key: the canonical vault path
 fn winsize_key(p: &Path) -> String {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).display().to_string()
+    plat::canon(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string()
 }
 
 /// setup: sanitise the record against the monitors' work areas, then size,
@@ -2407,7 +2407,7 @@ fn resolve_vault_arg(a: &std::ffi::OsStr) -> Result<PathBuf, String> {
     if s.is_empty() {
         return Err("empty path".into());
     }
-    let p = fs::canonicalize(s).map_err(|e| match e.kind() {
+    let p = plat::canon(Path::new(s)).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "does not exist".to_string(),
         _ => e.to_string(),
     })?;
@@ -2501,9 +2501,31 @@ fn list_dirs(path: String) -> Vec<String> {
     })
 }
 
+/// Windows hides a folder with an attribute, not with a leading dot: what
+/// Explorer does not show by default (hidden or system: `$Recycle.Bin`,
+/// `AppData`, `System Volume Information`) is not offered either, and neither
+/// are the legacy junctions (`Application Data`, `Cookies`) that lead nowhere
+/// a user may read. Typing such a path by hand still works.
+#[cfg(windows)]
+fn picker_shows(e: &fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+    e.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_OR_SYSTEM == 0 && !m.file_type().is_symlink())
+}
+#[cfg(not(windows))]
+fn picker_shows(_: &fs::DirEntry) -> bool {
+    true
+}
+
 /// the picker listing itself (S4 rules), in-process or in the spawner
 fn list_dirs_here(path: &str) -> Vec<String> {
     {
+        // Windows: there is no single root. The empty path is the level above
+        // the drives, and what it lists is the drives themselves (`C:\`, ...).
+        #[cfg(windows)]
+        if path.is_empty() {
+            return plat::drives();
+        }
         if !picker_allows(Path::new(&path)) {
             return vec![]; // S4: the picker just shows ".." there
         }
@@ -2512,6 +2534,7 @@ fn list_dirs_here(path: &str) -> Vec<String> {
             .flatten()
             .flatten()
             .filter(|e| e.path().is_dir())
+            .filter(picker_shows)
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| !n.starts_with('.'))
             .collect();
@@ -3431,7 +3454,7 @@ fn mint_vault_id() -> Option<String> {
 fn vault_id(v: State<Vault>, mint: Option<bool>) -> Option<String> {
     span_timed!("vault_id", (|| -> Option<String> {
         let root = cur_vault(&v)?;
-        let key = fs::canonicalize(&root).unwrap_or(root).display().to_string();
+        let key = plat::canon(&root).unwrap_or(root).display().to_string();
         if let Some(id) = cfg_value()["vault_ids"][key.as_str()].as_str() {
             return Some(id.to_string());
         }

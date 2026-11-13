@@ -25,6 +25,41 @@ pub fn home() -> PathBuf {
     PathBuf::from(home_string())
 }
 
+/// `canonicalize`, in the form a person (and the config file) should see.
+/// Windows answers in the verbatim form (`\\?\C:\Users\...`), which is right for
+/// file calls but wrong as a NAME: it is not what the user typed or will
+/// recognise, Explorer does not accept it, and the picker's rule (a plain `X:\`
+/// path) refuses it. The prefix is dropped when what remains is an ordinary
+/// drive or UNC path short enough to need no such prefix.
+pub fn canon(p: &std::path::Path) -> std::io::Result<PathBuf> {
+    let c = p.canonicalize()?;
+    #[cfg(windows)]
+    if let Some(s) = c.to_str() {
+        if s.len() < 248 {
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                return Ok(PathBuf::from(format!(r"\\{rest}")));
+            }
+            if let Some(rest) = s.strip_prefix(r"\\?\") {
+                let b = rest.as_bytes();
+                if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+                    return Ok(PathBuf::from(rest));
+                }
+            }
+        }
+    }
+    Ok(c)
+}
+
+/// Windows: the roots a folder picker starts from — `C:\`, `D:\`, ... for every
+/// drive letter the system has mounted (no probing of the drives themselves, so
+/// an unreachable network drive cannot stall the listing).
+#[cfg(windows)]
+pub fn drives() -> Vec<String> {
+    // SAFETY: no arguments; returns a bitmask, bit 0 = A:
+    let mask = unsafe { win::GetLogicalDrives() };
+    (0..26u32).filter(|i| mask & (1 << i) != 0).map(|i| format!("{}:\\", (b'A' + i as u8) as char)).collect()
+}
+
 /// the desktop opener run as a plain child process (no shell). Windows has no
 /// such program worth trusting with arbitrary arguments: see `shell_open`.
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -112,6 +147,7 @@ mod win {
         pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         pub fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
         pub fn CloseHandle(h: Handle) -> i32;
+        pub fn GetLogicalDrives() -> u32;
     }
 
     #[link(name = "shell32")]
@@ -141,6 +177,19 @@ mod tests {
         assert!(kill_tree(pid));
         let _ = c.wait();
         assert!(!alive(pid), "an exited child reads as gone");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plat_canon_is_a_plain_drive_path_and_drives_lists_its_drive() {
+        let t = canon(&std::env::temp_dir()).unwrap();
+        let s = t.to_str().unwrap();
+        assert!(!s.starts_with(r"\\?\"), "verbatim prefix left in {s}");
+        assert!(s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'\\', "{s}");
+        assert_eq!(t.canonicalize().unwrap(), std::env::temp_dir().canonicalize().unwrap(), "same directory");
+        let d = drives();
+        assert!(d.iter().any(|x| s.to_ascii_uppercase().starts_with(x.as_str())), "{d:?} lacks the drive of {s}");
+        assert!(d.iter().all(|x| x.len() == 3 && x.ends_with(r":\")), "{d:?}");
     }
 
     #[cfg(windows)]
