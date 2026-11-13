@@ -268,3 +268,33 @@ Dépendance : `windows-sys =0.61.2` déclarée sous `cfg(windows)` (déjà dans 
 - Un vrai plugin communautaire dans un coffre approuvé ; pages PDF ; cartes média du canvas.
 - Collage d'image (point AA).
 - Dispositions Snap au survol du bouton « agrandir ».
+
+## 10. Plugins de bout en bout (2026-11-13)
+
+### Fait (point N)
+
+- **Durée de vie** : chaque processus lancé par un plugin rejoint un Job Object unique de l'application (`KILL_ON_JOB_CLOSE`) ; le système le termine, lui et sa descendance, quand l'application disparaît, quelle qu'en soit la cause.
+- **`exec()` / `shell: true`** : la page se présente aux plugins comme Linux, la demande arrive donc en `/bin/sh -c <ligne>`. Elle est exécutée comme Node le fait sous Windows : `cmd.exe /d /s /c "<ligne>"`, ligne transmise telle quelle.
+- **Chemins réels du coffre** (`plugin_unroot`) : `C:/Users/x/coffre/...` (forme imprimée par git) comme `C:\Users\x\coffre\...` sont ramenés au chemin relatif, sans tenir compte de la casse. Hors du coffre : toujours refusé.
+
+### Vérifié dans l'application réelle
+
+Un plugin de sonde écrit pour l'occasion (pas un plugin tiers), dans un coffre jetable approuvé :
+
+| Étape | Résultat |
+|---|---|
+| Chargement par `http://opensidian-plugin.localhost/` | chargé, `onload` exécuté |
+| CSP d'un coffre approuvé (`new Function`) | autorisé |
+| `adapter.write` / `read` / `list` | fichier écrit dans le coffre, relu, listé |
+| `child_process.exec("echo …")` | sortie reçue (via `cmd.exe`) |
+| `child_process.spawn("cmd.exe", …, { cwd: "/vault" })` | code 0, répertoire courant = dossier réel du coffre |
+| `fs.existsSync` / `readFileSync` sur `/vault/…` | corrects |
+| `app.secretStorage.setSecret` / `getSecret` | valeur relue, entrée supprimée ensuite |
+
+`~/.opensidian.json` de l'utilisateur a été sauvegardé avant l'essai et restauré à l'identique après.
+
+### Non fait, et pourquoi
+
+- **Un plugin communautaire réel** (Dataview, Excalidraw, obsidian-git) : l'installer revient à télécharger et exécuter du code tiers ; c'est à l'utilisateur de le faire. Le magasin liste et décrit les plugins ; l'installation elle-même n'a donc pas été exercée.
+- **Persona Linux** : les plugins voient `process.platform === "linux"` et des chemins POSIX. Un plugin qui lance un programme Linux (`which`, `xdg-open`, un script `sh`) échouera sous Windows. Changer la persona est une décision de conception, pas un correctif.
+- Lanceurs `.cmd` / `.bat` sans extension (`npm`, `code`) : non résolus par `spawn` sans shell, comme sous Node.
