@@ -26,6 +26,7 @@
    so no codec crate is needed. */
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -33,6 +34,29 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
+
+/// Signal numbers. Unix: the platform's. Windows has no signals, but the page
+/// still names them (child.kill("SIGTERM")) and reads the name back, so the
+/// numbers Node documents are kept as plain labels; every one of them ends the
+/// process tree (`Run::kill`).
+#[cfg(unix)]
+mod sig {
+    pub use libc::{SIGABRT, SIGALRM, SIGHUP, SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGTERM, SIGUSR1, SIGUSR2};
+}
+#[cfg(not(unix))]
+mod sig {
+    pub const SIGHUP: i32 = 1;
+    pub const SIGINT: i32 = 2;
+    pub const SIGQUIT: i32 = 3;
+    pub const SIGABRT: i32 = 6;
+    pub const SIGKILL: i32 = 9;
+    pub const SIGUSR1: i32 = 10;
+    pub const SIGSEGV: i32 = 11;
+    pub const SIGUSR2: i32 = 12;
+    pub const SIGPIPE: i32 = 13;
+    pub const SIGALRM: i32 = 14;
+    pub const SIGTERM: i32 = 15;
+}
 
 /// the page-side name of the vault root (FileSystemAdapter.getBasePath)
 pub const VAULT_ALIAS: &str = "/vault";
@@ -133,33 +157,33 @@ pub struct Chunk {
 
 pub fn sig_name(n: i32) -> &'static str {
     match n {
-        libc::SIGHUP => "SIGHUP",
-        libc::SIGINT => "SIGINT",
-        libc::SIGQUIT => "SIGQUIT",
-        libc::SIGKILL => "SIGKILL",
-        libc::SIGPIPE => "SIGPIPE",
-        libc::SIGALRM => "SIGALRM",
-        libc::SIGTERM => "SIGTERM",
-        libc::SIGUSR1 => "SIGUSR1",
-        libc::SIGUSR2 => "SIGUSR2",
-        libc::SIGABRT => "SIGABRT",
-        libc::SIGSEGV => "SIGSEGV",
+        sig::SIGHUP => "SIGHUP",
+        sig::SIGINT => "SIGINT",
+        sig::SIGQUIT => "SIGQUIT",
+        sig::SIGKILL => "SIGKILL",
+        sig::SIGPIPE => "SIGPIPE",
+        sig::SIGALRM => "SIGALRM",
+        sig::SIGTERM => "SIGTERM",
+        sig::SIGUSR1 => "SIGUSR1",
+        sig::SIGUSR2 => "SIGUSR2",
+        sig::SIGABRT => "SIGABRT",
+        sig::SIGSEGV => "SIGSEGV",
         _ => "SIGTERM",
     }
 }
 
 pub fn sig_num(name: &str) -> Option<i32> {
     Some(match name.trim_start_matches("SIG").to_ascii_uppercase().as_str() {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "KILL" => libc::SIGKILL,
-        "PIPE" => libc::SIGPIPE,
-        "ALRM" => libc::SIGALRM,
-        "" | "TERM" => libc::SIGTERM,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        "ABRT" => libc::SIGABRT,
+        "HUP" => sig::SIGHUP,
+        "INT" => sig::SIGINT,
+        "QUIT" => sig::SIGQUIT,
+        "KILL" => sig::SIGKILL,
+        "PIPE" => sig::SIGPIPE,
+        "ALRM" => sig::SIGALRM,
+        "" | "TERM" => sig::SIGTERM,
+        "USR1" => sig::SIGUSR1,
+        "USR2" => sig::SIGUSR2,
+        "ABRT" => sig::SIGABRT,
         _ => return None,
     })
 }
@@ -174,8 +198,24 @@ impl Run {
         if self.st.lock().unwrap_or_else(|e| e.into_inner()).reaped {
             return false;
         }
+        #[cfg(unix)]
         // SAFETY: plain syscall on our child's own group (process_group(0))
-        unsafe { libc::kill(-self.pid, sig) == 0 }
+        return unsafe { libc::kill(-self.pid, sig) == 0 };
+        // Windows: no signal can be delivered, so every one ends the tree. The
+        // number is recorded FIRST: the waiter reports it as the cause of death
+        // (Node: code null, signal "SIGTERM"), and it may reap before we return.
+        #[cfg(windows)]
+        return {
+            self.st.lock().unwrap_or_else(|e| e.into_inner()).signal.get_or_insert(sig);
+            let ok = crate::plat::kill_tree(self.pid as u32);
+            if !ok {
+                let mut s = self.st.lock().unwrap_or_else(|e| e.into_inner());
+                if !s.reaped {
+                    s.signal = None;
+                }
+            }
+            ok
+        };
     }
 
     pub fn write(&self, data: &[u8]) -> Result<(), String> {
@@ -227,16 +267,58 @@ pub struct Spec {
     pub env: Vec<(String, String)>,
 }
 
+/// Windows: the command line of a `sh -c <line>` request. The page presents
+/// itself to plugins as Linux (node-desktop.js: process.platform, "/vault"), so
+/// child_process.exec() and `shell: true` arrive as `/bin/sh -c "<line>"`.
+/// There is no /bin/sh here; what Node itself runs for exec() on Windows is the
+/// system's command interpreter, and so do we.
+#[cfg(windows)]
+fn shell_line(sp: &Spec) -> Option<&str> {
+    let sh = matches!(sp.file.as_str(), "/bin/sh" | "sh" | "/bin/bash" | "bash");
+    (sh && sp.args.len() == 2 && sp.args[0] == "-c").then(|| sp.args[1].as_str())
+}
+
 fn build(sp: &Spec) -> Command {
-    let mut c = Command::new(&sp.file);
-    c.args(&sp.args).current_dir(&sp.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    #[cfg(not(windows))]
+    let mut c = {
+        let mut c = Command::new(&sp.file);
+        c.args(&sp.args);
+        c
+    };
+    #[cfg(windows)]
+    let mut c = match shell_line(sp) {
+        // Node's own form: cmd.exe /d /s /c "<line>", the line passed VERBATIM —
+        // cmd does not parse quotes the way std's argument escaping writes them
+        Some(line) => {
+            let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+            let mut c = Command::new(comspec);
+            std::os::windows::process::CommandExt::raw_arg(&mut c, format!("/d /s /c \"{line}\""));
+            c
+        }
+        None => {
+            let mut c = Command::new(&sp.file);
+            c.args(&sp.args);
+            c
+        }
+    };
+    c.current_dir(&sp.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (k, v) in &sp.env {
         c.env(k, v);
     }
+    #[cfg(unix)]
+    c.process_group(0);
+    // Windows: std marks every handle it opens non-inheritable and passes only
+    // the three stdio pipes, so the child gets no other handle of ours (the
+    // vault lock included). No console window for a console program.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut c, crate::plat::CREATE_NO_WINDOW | crate::plat::CREATE_NEW_PROCESS_GROUP);
+    // prctl and close_range are Linux syscalls. Elsewhere a child can outlive
+    // the app (windows-port/AUDIT.md, point N).
+    #[cfg(target_os = "linux")]
     // SAFETY: async-signal-safe syscalls only, between fork and exec
     unsafe {
         c.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+            libc::prctl(libc::PR_SET_PDEATHSIG, sig::SIGKILL as libc::c_ulong, 0, 0, 0);
             if libc::getppid() == 1 {
                 return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
@@ -296,6 +378,11 @@ pub fn start(sp: Spec) -> Result<Arc<Run>, String> {
     }
     let file = sp.file.clone();
     let mut child = fork(sp).map_err(|e| spawn_err(&file, &e))?;
+    // Windows: tie the child (and what it starts) to the app's lifetime
+    #[cfg(windows)]
+    if let Err(e) = crate::plat::adopt(&child) {
+        eprintln!("[desk] child {} is not in the app's job ({e}): it can outlive the app", child.id());
+    }
     let run = Arc::new(Run {
         pid: child.id() as i32,
         stdin: Mutex::new(child.stdin.take()),
@@ -318,7 +405,16 @@ pub fn start(sp: Spec) -> Result<Arc<Run>, String> {
         let mut s = r.st.lock().unwrap_or_else(|e| e.into_inner());
         if let Ok(st) = st {
             s.exit = st.code();
-            s.signal = st.signal();
+            #[cfg(unix)]
+            {
+                s.signal = st.signal();
+            }
+            // Windows: a child we terminated has a signal recorded by kill()
+            // and, like Node reports it, no exit code
+            #[cfg(not(unix))]
+            if s.signal.is_some() {
+                s.exit = None;
+            }
         }
         s.reaped = true;
         drop(s);
@@ -353,7 +449,7 @@ pub fn forget(id: u64) {
 pub fn kill_all() {
     let all: Vec<Arc<Run>> = runs().lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, r)| r).collect();
     for r in all {
-        r.kill(libc::SIGKILL);
+        r.kill(sig::SIGKILL);
         r.end();
     }
 }
@@ -379,6 +475,7 @@ mod tests {
         panic!("child never finished");
     }
 
+    #[cfg(unix)] // asserts '/'-joined host paths
     #[test]
     fn desk_cwd_maps_the_vault_alias_to_the_real_dir() {
         let root = Path::new("/home/u/notes");
@@ -394,6 +491,7 @@ mod tests {
     }
 
 
+    #[cfg(unix)]
     #[test]
     fn desk_open_target_is_vault_confined_and_symlink_safe() {
         let base = std::env::temp_dir().join(format!("desk-vot-{}", std::process::id()));
@@ -424,6 +522,7 @@ mod tests {
         assert_eq!(latin1_to_bytes(&bytes_to_latin1(&all)), all);
     }
 
+    #[cfg(unix)]
     #[test]
     fn desk_spawn_runs_in_cwd_with_env_stdin_and_exit_code() {
         let d = std::env::temp_dir();
@@ -439,16 +538,70 @@ mod tests {
         assert_eq!((c.exit, c.signal), (Some(3), None));
     }
 
+    #[cfg(unix)]
     #[test]
     fn desk_kill_reports_the_signal_and_missing_exe_is_enoent() {
         let r = start(spec("/bin/sleep", &["30"], &std::env::temp_dir())).unwrap();
-        assert!(r.kill(libc::SIGTERM));
+        assert!(r.kill(sig::SIGTERM));
         let (_, _, c) = drain(&r);
         assert_eq!((c.exit, c.signal), (None, Some("SIGTERM")));
-        assert!(!r.kill(libc::SIGTERM));
+        assert!(!r.kill(sig::SIGTERM));
         let e = start(spec("no-such-exe-desk", &[], &std::env::temp_dir())).err().unwrap();
         assert!(e.starts_with("ENOENT: spawn no-such-exe-desk"), "{e}");
-        assert_eq!(sig_num("SIGKILL"), Some(libc::SIGKILL));
-        assert_eq!(sig_num(""), Some(libc::SIGTERM));
+        assert_eq!(sig_num("SIGKILL"), Some(sig::SIGKILL));
+        assert_eq!(sig_num(""), Some(sig::SIGTERM));
+    }
+
+    /// Windows: a program run directly — cwd, the plugin's env laid over ours,
+    /// stdin, both pipes and the exit code
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_spawn_runs_in_cwd_with_env_stdin_and_exit_code() {
+        let d = std::env::temp_dir().canonicalize().unwrap();
+        let mut sp = spec("cmd.exe", &["/d", "/c", "cd & echo %DESK_T% & findstr x & echo e 1>&2 & exit 3"], &d);
+        sp.env = vec![("DESK_T".into(), "tee".into())];
+        let r = start(sp).unwrap();
+        r.write(b"axb\r\n").unwrap();
+        r.end();
+        let (o, e, c) = drain(&r);
+        let o = String::from_utf8_lossy(&o).to_lowercase();
+        let cwd = d.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase();
+        assert!(o.contains(&cwd), "cwd {cwd:?} not in {o:?}");
+        assert!(o.contains("tee") && o.contains("axb"), "{o:?}");
+        assert_eq!(String::from_utf8_lossy(&e).trim(), "e");
+        assert_eq!((c.exit, c.signal, c.done), (Some(3), None, true));
+    }
+
+    /// Windows: exec() / shell:true arrive as `/bin/sh -c <line>` (the page says
+    /// it is Linux) and run in the system's command interpreter, the line verbatim
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_sh_c_runs_the_line_in_the_command_interpreter() {
+        let d = std::env::temp_dir();
+        let r = start(spec("/bin/sh", &["-c", "echo \"a b\" & echo two>&2 & exit 5"], &d)).unwrap();
+        let (o, e, c) = drain(&r);
+        assert_eq!(String::from_utf8_lossy(&o).trim(), "\"a b\"", "quotes reach cmd as written");
+        assert_eq!(String::from_utf8_lossy(&e).trim(), "two");
+        assert_eq!(c.exit, Some(5));
+        // not a shell request: three arguments, or another program
+        assert!(shell_line(&spec("/bin/sh", &["-c", "x", "y"], &d)).is_none());
+        assert!(shell_line(&spec("git", &["-c", "x"], &d)).is_none());
+    }
+
+    /// Windows: no signal exists, so kill() ends the tree and the page still
+    /// reads the name it asked for; a missing program is ENOENT
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_kill_ends_the_tree_and_reports_the_signal() {
+        let d = std::env::temp_dir();
+        // cmd -> ping: the grandchild must go too
+        let r = start(spec("cmd.exe", &["/d", "/c", "ping -n 60 127.0.0.1 >nul"], &d)).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(r.kill(sig::SIGTERM));
+        let (_, _, c) = drain(&r);
+        assert_eq!((c.exit, c.signal, c.done), (None, Some("SIGTERM"), true));
+        assert!(!r.kill(sig::SIGTERM), "a reaped child cannot be killed again");
+        let e = start(spec("no-such-exe-desk", &[], &d)).err().unwrap();
+        assert!(e.starts_with("ENOENT: spawn no-such-exe-desk"), "{e}");
     }
 }

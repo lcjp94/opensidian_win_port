@@ -42,7 +42,8 @@
   const T = window.__TAURI__;
   const invoke = T && T.core && T.core.invoke ? T.core.invoke.bind(T.core) : null;
   const listen = T && T.event && T.event.listen ? T.event.listen.bind(T.event) : null;   // item 5: vault-changed for the plugin vault model
-  const SCHEME = "opensidian-plugin://localhost/";
+  // WebView2 (Windows) serves a custom scheme as http://<scheme>.localhost/ (editor.js IMG_BASE)
+  const SCHEME = location.hostname === "tauri.localhost" ? "http://opensidian-plugin.localhost/" : "opensidian-plugin://localhost/";
   const NODE = window.__osNodeModules;   // captured at boot (index.html loads node-leaves.js first)
 
   const status = new Map();   // id -> {state: "loading"|"loaded"|"failed"|"unloaded", error?}

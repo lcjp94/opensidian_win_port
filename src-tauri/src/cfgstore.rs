@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// MRU cap of the recent-vaults list
@@ -122,7 +121,7 @@ fn target(cfg: &Path) -> PathBuf {
 pub fn lock_file(lock_dir: &Path, cfg: &Path) -> PathBuf {
     let t = target(cfg);
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in t.as_os_str().as_bytes() {
+    for &b in t.as_os_str().as_encoded_bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -162,7 +161,11 @@ fn write_renamed(t: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
         drop(f);
         fs::rename(&tmp, t)?;
-        File::open(dir).and_then(|d| d.sync_all())
+        // fsync the directory so the rename itself is durable. Unix only: Windows
+        // cannot open a directory as a plain File, and NTFS journals the rename.
+        #[cfg(unix)]
+        File::open(dir).and_then(|d| d.sync_all())?;
+        Ok(())
     })();
     if r.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -176,6 +179,16 @@ fn write_in_place(t: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// the create/rename was refused, not the write: fall back to writing in place.
+/// Unix: EPERM, EACCES, EXDEV (the sandbox). Windows: access denied or a sharing
+/// violation, i.e. an antivirus or a sync client holding the file for a moment.
+fn rename_refused(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    return matches!(e.raw_os_error(), Some(1 | 13 | 18));
+    #[cfg(not(unix))]
+    return e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32);
+}
+
 /// read-modify-write `cfg` under the exclusive lock in `lock_dir`
 pub fn update_in(lock_dir: &Path, cfg: &Path, ops: &[Op]) -> Result<Wrote, String> {
     let lf = open_lock(lock_dir, cfg).map_err(|e| format!("cfg lock {}: {e}", lock_dir.display()))?;
@@ -186,8 +199,7 @@ pub fn update_in(lock_dir: &Path, cfg: &Path, ops: &[Op]) -> Result<Wrote, Strin
     let bytes = v.to_string().into_bytes();
     match write_renamed(&t, &bytes) {
         Ok(()) => Ok(Wrote::Renamed),
-        // EPERM, EACCES, EXDEV: the sandbox refused the create/rename, not the write
-        Err(e) if matches!(e.raw_os_error(), Some(1 | 13 | 18)) => {
+        Err(e) if rename_refused(&e) => {
             write_in_place(&t, &bytes).map(|_| Wrote::InPlace).map_err(|e2| format!("{}: {e2} (rename: {e})", t.display()))
         }
         Err(e) => Err(format!("{}: {e}", t.display())),
@@ -197,6 +209,7 @@ pub fn update_in(lock_dir: &Path, cfg: &Path, ops: &[Op]) -> Result<Wrote, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -256,6 +269,7 @@ mod tests {
         assert_eq!(v, serde_json::json!({"windows":{"/b":{"x":1}}}));
     }
 
+    #[cfg(unix)]
     #[test]
     fn cfgstore_symlinked_config_stays_a_symlink() {
         let d = tmp("link");
@@ -310,6 +324,7 @@ mod tests {
 
     /// cross-PROCESS: an outside process holds the cfg lock; our update must
     /// wait for it (not write around it) and then merge onto ITS write.
+    #[cfg(unix)] // the outside holder is sh + flock(1)
     #[test]
     fn cfgstore_update_waits_for_another_process_holding_the_lock() {
         let d = tmp("proc");

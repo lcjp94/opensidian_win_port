@@ -24,6 +24,23 @@ Download one from the [v0.9.2 release](https://github.com/jpzk/opensidian/releas
 nix profile add github:jpzk/opensidian
 ```
 
+### Windows 11 x86_64 — unofficial port
+
+This fork carries a Windows port. It is **not** an upstream release: there is no
+Windows asset on the release page, and the builds are **unsigned**.
+
+- Installer: take `opensidian_<version>_x64-setup.exe` from the
+  `opensidian-windows-x86_64-unsigned` artifact of the latest *Build* workflow run
+  in this repository, and check it against the `SHA256SUMS` in the same artifact.
+- It installs for the current user (no administrator rights) and needs the
+  WebView2 runtime, which Windows 11 ships.
+- SmartScreen warns about an unsigned installer ("More info" > "Run anyway").
+
+What works, what differs from Linux (no Landlock sandbox, plugin secrets in the
+Credential Manager, case-insensitive names…) and what has not been verified is in
+[windows-port/README.md](windows-port/README.md); the full audit is
+[windows-port/AUDIT.md](windows-port/AUDIT.md).
+
 ## Verify your download
 `SHA256SUMS` is signed with key `A6E6 9ED6 BC47 79F3 2817  2148 4CC1 AFDE 15B6 4EA3`:
 
@@ -66,6 +83,22 @@ Tested 2026-10-03 on fresh Ubuntu 26.04 LTS and Fedora 44 with Rust 1.98.0
    git clone https://github.com/jpzk/opensidian && cd opensidian/src-tauri
    cargo build --release --locked   # -> target/release/opensidian
    ```
+
+### Windows
+
+Needs Visual Studio Build Tools ("Desktop development with C++" with a Windows 11
+SDK) and Rust 1.98.0 for `x86_64-pc-windows-msvc`. No Node, no npm.
+
+```powershell
+rustup toolchain install 1.98.0 --profile minimal
+cd src-tauri
+cargo +1.98.0 build --release --locked   # -> target\release\opensidian.exe
+cargo +1.98.0 test --locked
+```
+
+Do not build inside a OneDrive-synced folder (set `CARGO_TARGET_DIR` to a local
+path). Building the installer, and the rest, is in
+[windows-port/README.md](windows-port/README.md).
 
 ## Nix
 The repo ships a flake (Nix 2.4+). It pins nixpkgs unstable and builds with

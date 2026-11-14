@@ -4,3 +4,27 @@ ui/census.js merge=union
 .gitignore merge=union
 # built-in themes are byte-exact upstream files (sha256-pinned in builtins.rs): never normalise line endings
 src-tauri/themes/** -text
+# Windows clones (core.autocrlf=true) must not turn LF into CRLF in the checkout:
+#  - tests compare fixtures and source files byte-wise (include_str!, sha256, TSV tables),
+#  - data/updates/ holds a signed SHA256SUMS whose signature covers the exact bytes,
+#  - ui/ is served to the webview as-is, and a vault file is never ours to re-encode.
+# Sources are text with LF on every OS; fixtures and pinned data are never touched.
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.tsv text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+src-tauri/tests/fixtures/** -text
+src-tauri/data/** -text
+src-tauri/vendor/** -text
+vault/** -text
+fuzz/corpus/** -text
+fuzz/artifacts-triaged/** -text
+# (kept last so it wins over the *.css / *.json rules above)
+src-tauri/themes/** -text

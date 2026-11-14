@@ -39,6 +39,7 @@ pub const MAX_VALUE: usize = 64 * 1024;
 /// the error a restricted-mode vault gets; the bus is never touched
 pub const REFUSED: &str = "EPERM: restricted mode, secret storage is off";
 
+#[cfg_attr(windows, allow(dead_code))] // Windows has a keyring of its own (secrets_win.rs)
 fn unsupported(cause: impl std::fmt::Display) -> String {
     format!("unsupported: secret storage needs a Secret Service (org.freedesktop.secrets) on the session bus: {cause}")
 }
@@ -307,7 +308,10 @@ mod bus {
 pub use bus::run;
 
 /// no freedesktop Secret Service off Linux: unsupported, never a fallback store
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub use crate::secrets_win::run;
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn run(_addr: Option<&str>, _vault: &str, _op: Op) -> Result<serde_json::Value, String> {
     Err(unsupported("this platform has no freedesktop Secret Service"))
 }
@@ -389,6 +393,7 @@ mod tests {
 
     /// no Secret Service reachable: every op is an `unsupported:` error that
     /// names the cause, and nothing is stored anywhere (no fallback exists).
+    #[cfg(target_os = "linux")] // talks to a D-Bus address
     #[test]
     fn no_service_is_unsupported_not_a_fake_success() {
         let dir = std::env::temp_dir().join(format!("ossec-nobus-{}", std::process::id()));

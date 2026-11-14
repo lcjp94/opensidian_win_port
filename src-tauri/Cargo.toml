@@ -40,7 +40,6 @@ regex = "=1.13.1"
 # renderer-crates.txt, all >= 6 weeks old, resolved with --precise pins (never
 # "latest"). Design: harness docs/recon-pdfembed/README.md "security design".
 hayro = "=0.7.1"
-landlock = "=0.4.7"
 # vaultfs: openat/renameat/mkdirat/unlinkat with O_NOFOLLOW so vault writes never
 # follow a symlink. ALREADY in Cargo.lock (transitive via tauri/landlock); `=`
 # pins it to that exact version, so the lock gains no package.
@@ -77,6 +76,9 @@ gdkx11 = "=0.18.2"
 # already links (TLS = glib-networking, system CA store). soup3 0.5.0 (2023-08-01,
 # MIT) is webkit2gtk's own binding, ALREADY in Cargo.lock: no new crate, no new C lib.
 soup3 = "=0.5.0"
+# sandbox.rs: Landlock is a Linux kernel LSM; the crate does not build elsewhere
+# (it reads Linux-only prctl constants), so it is a Linux-only dependency.
+landlock = "=0.4.7"
 # ---- cp-secrets (begin) ----
 # app.secretStorage over the freedesktop Secret Service (src/secrets.rs). dbus
 # 0.9.12 is ALREADY in Cargo.lock (tauri -> tao's own dependency, libdbus via
@@ -84,6 +86,27 @@ soup3 = "=0.5.0"
 # nothing new. MIT OR Apache-2.0.
 dbus = "=0.9.12"
 # ---- cp-secrets (end) ----
+
+# Windows port — the two things Linux gets from libraries webkit already links
+# (libsoup for HTTPS, libdbus for the Secret Service) come from Windows itself:
+# WinHTTP (http_win.rs: TLS = Schannel, system trust store and proxy) and the
+# Credential Manager (secrets_win.rs). windows-sys is Microsoft's raw binding to
+# them: declarations only, no code of its own. NO NEW CRATE: windows-sys 0.61.2
+# (2025-10-06, MIT OR Apache-2.0, sha256 ae137229…f3fc) is ALREADY in Cargo.lock
+# as a dependency of the tauri tree on Windows; `=` pins that locked version and
+# the two features add no package (the lock gains one line: this crate now names
+# it). Not hand-declared like the four calls in plat.rs: this is ~20 functions
+# and a struct whose layout must be exact.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# pick_win.rs — the system folder dialog (IFileOpenDialog) is a COM interface,
+# which windows-sys does not model (it has no interfaces). `windows` is the same
+# project's safe binding and the crate tauri itself uses for its window: the HWND
+# tauri hands us IS this crate's type. NO NEW CRATE: windows 0.61.3 (2025-06-12,
+# MIT OR Apache-2.0, sha256 9babd3a7…6893) is ALREADY in Cargo.lock through tauri;
+# `=` pins that locked version and the features add no package.
+windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
 
 # listtoggle A2 — the unit table runs ui/editor.js in JavaScriptCore, the engine
 # the webview runs it in. javascriptcore-rs 1.1.2 is ALREADY in Cargo.lock as

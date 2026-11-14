@@ -11422,7 +11422,29 @@ async function cmdLocalGraph() {       // R7.2: local graph of focused note -> n
 $("lgbtn").onclick = cmdLocalGraph;
 
 /* ---------- vault picker ---------- */
-function base(p) { return p.replace(/\/+$/, "").split("/").pop() || p; }
+/* Windows port — HOST paths in the picker (never vault-relative ones, which are
+   "/"-separated on every OS). On Windows a host path uses "\", has a drive
+   letter and no single root: the level above "C:\" is the list of drives, which
+   list_dirs("") returns. WIN is read off the page's own host, which is
+   "tauri.localhost" only under WebView2 (editor.js IMG_BASE). Elsewhere each
+   helper is the expression the picker had inline before, unchanged. */
+const WIN = location.hostname === "tauri.localhost";
+function base(p) {
+  if (WIN) return p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
+  return p.replace(/\/+$/, "").split("/").pop() || p;
+}
+function pUp(p) {
+  if (!WIN) return p.replace(/\/[^/]+\/?$/, "") || "/";
+  const t = p.replace(/[\\/]+$/, "");
+  if (t === "" || /^[A-Za-z]:$/.test(t)) return "";        // above a drive root: the drives
+  const u = t.replace(/[\\/][^\\/]+$/, "");
+  return /^[A-Za-z]:$/.test(u) ? u + "\\" : u;              // "C:" alone is not the root, "C:\" is
+}
+function pJoin(p, d) {
+  if (!WIN) return (p === "/" ? "" : p) + "/" + d;
+  if (p === "") return d;                                   // a drive, listed as "C:\"
+  return p.replace(/[\\/]+$/, "") + "\\" + d;
+}
 
 function showPicker() {
   pmode = null;
@@ -11480,12 +11502,12 @@ async function browseTo(p) {
   ul.innerHTML = "";
   const up = document.createElement("li");
   up.textContent = "..";
-  up.onclick = () => browseTo(bpath.replace(/\/[^/]+\/?$/, "") || "/");
+  up.onclick = () => browseTo(pUp(bpath));
   ul.appendChild(up);
   for (const d of dirs) {
     const li = document.createElement("li");
-    li.textContent = d + "/";
-    li.onclick = () => browseTo((bpath === "/" ? "" : bpath) + "/" + d);
+    li.textContent = WIN && bpath === "" ? d : d + "/";      // a drive already ends in its separator
+    li.onclick = () => browseTo(pJoin(bpath, d));
     ul.appendChild(li);
   }
 }
@@ -11499,8 +11521,47 @@ async function enterMode(m) {
   $("p-gonew").textContent = m === "create" ? "Create in new window" : "Open in new window";
   $("p-err").textContent = "";
   await browseTo(await inv("home_dir"));
+  if (WIN) return winFolderMode(m);
   (m === "create" ? $("p-name") : $("p-path")).focus();
   if (vaultPath) { try { updateTitle(); } catch (_) {} }   // item 14: publish [pbtn:] for the sub-mode buttons (never at the boot picker)
+}
+/* Windows port — the folder is chosen in the SYSTEM dialog (Rust pick_folder ->
+   pick_win.rs), not in the in-app list: Explorer's own picker knows the user's
+   quick access, OneDrive, network places and "New folder", and is what a Windows
+   user expects. The list (#p-dirs) is hidden there and a "Browse…" button takes
+   its place; the path field stays, so a path can still be typed or pasted.
+   The dialog only fills the field. Opening or creating still goes through the
+   same buttons and the same commands as before (pickerGo), where the backend
+   decides whether that folder may be a vault.
+     open:   the dialog comes up at once. At the boot picker there is nothing
+             else to decide, so a chosen folder opens directly; a cancel goes
+             back. With a vault already open the two buttons stay (this window,
+             or a new one) and the user picks.
+     create: the dialog chooses the PARENT folder; the name is typed. */
+async function winBrowse() {
+  let p = null;
+  try { p = await inv("pick_folder", { title: pmode === "create" ? "Choose where to create the vault" : "Open folder as vault", start: bpath || null }); }
+  catch (err) { $("p-err").textContent = String(err); return null; }
+  if (p) { bpath = p; $("p-path").value = p; $("p-err").textContent = ""; }
+  return p;
+}
+async function winFolderMode(m) {
+  $("p-dirs").hidden = true;
+  if (vaultPath) { try { updateTitle(); } catch (_) {} }   // item 14: publish [pbtn:], as enterMode does on the other path
+  let b = $("p-browse");
+  if (!b) {
+    b = document.createElement("button");
+    b.id = "p-browse"; b.type = "button"; b.textContent = "Browse…";
+    b.style.cssText = "align-self:flex-start;margin-top:8px";   // layout only; colours come from the picker's button rule
+    b.onclick = winBrowse;
+    $("p-dirs").after(b);
+  }
+  if (m === "create") { $("p-name").focus(); return; }
+  const p = await winBrowse();
+  if (pmode !== m) return;                    // the user went elsewhere while the dialog was up
+  if (!p) { if (!vaultPath) showPicker(); return; }
+  if (!vaultPath) return pickerGo(true);       // boot picker: one possible action, take it
+  $("p-go").focus();
 }
 $("p-create").onclick = () => enterMode("create");
 $("p-open").onclick = () => enterMode("open");

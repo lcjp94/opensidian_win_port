@@ -1183,3 +1183,31 @@ Everything else is the published crate byte for byte.
 **Licence:** MIT, full text shipped beside the files as `src-tauri/vendor/glib-0.18.5/LICENSE`
 (with the project's `COPYRIGHT`). MIT is compatible with GPL-3.0. The vendored files carry no
 SPDX tag of ours: tagging them would modify them.
+
+## windows-sys 0.61.2 (Rust crate, Windows builds only)
+
+- Author: Microsoft (https://github.com/microsoft/windows-rs)
+- Version: 0.61.2, pinned with `=` in `src-tauri/Cargo.toml`; published 2025-10-06
+- Licence: MIT OR Apache-2.0
+- crates.io sha256: `ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc`
+- Not vendored and not a new package: it was already in `Cargo.lock` as a
+  dependency of the tauri tree on Windows. Naming it directly adds one line to
+  the lock and nothing to download.
+- Used for: raw declarations of WinHTTP (`src-tauri/src/http_win.rs`, the plugin
+  store's and the update check's HTTPS client) and of the Credential Manager
+  (`src-tauri/src/secrets_win.rs`, `app.secretStorage`). Features
+  `Win32_Foundation`, `Win32_Networking_WinHttp`, `Win32_Security_Credentials`.
+  It is not compiled on Linux or macOS.
+
+## windows 0.61.3 (Rust crate, Windows builds only)
+
+- Author: Microsoft (https://github.com/microsoft/windows-rs)
+- Version: 0.61.3, pinned with `=` in `src-tauri/Cargo.toml`; published 2025-06-12
+- Licence: MIT OR Apache-2.0
+- crates.io sha256: `9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893`
+- Not vendored and not a new package: it was already in `Cargo.lock`, tauri uses
+  it for its own window. Naming it directly adds one line to the lock.
+- Used for: the system folder dialog (`src-tauri/src/pick_win.rs`), a COM
+  interface that `windows-sys` does not model. Features `Win32_Foundation`,
+  `Win32_System_Com`, `Win32_UI_Shell`, `Win32_UI_Shell_Common`.
+  It is not compiled on Linux or macOS.

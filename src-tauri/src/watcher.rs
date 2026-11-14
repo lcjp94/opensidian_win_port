@@ -325,6 +325,7 @@ mod tests {
     /// GHOSTS (media CVR-B-063): our create, then an external rm -rf of its
     /// folder, both between two walks. The walks agree (nothing to diff), so
     /// only the Index can say the note is gone.
+    #[cfg(unix)]
     #[test]
     fn own_create_deleted_outside_before_a_walk_is_reported_removed() {
         let root = tmp("ghost");
@@ -359,6 +360,7 @@ mod tests {
         assert_eq!(sweep_ghosts(&root, &s3, &mut ix), vec!["Nope/ours".to_string()]);
         // a folder made unreadable from outside: the walk cannot list the note and lstat is refused, not
         // NotFound, so the note is kept (root ignores the mode bits: nothing to check then)
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(root.join("Locked")).unwrap();
         w(&root, "Locked/n", "");
@@ -548,6 +550,7 @@ mod tests {
     /// healed back into the baseline, and a note replaced by a SYMLINK counts
     /// as still there (snapshot skips symlinks — dropping the tab because we
     /// refuse to follow a link would lose the buffer for nothing).
+    #[cfg(unix)]
     #[test]
     fn heal_short_walk_confirms_every_claimed_removal() {
         let root = tmp("heal");
@@ -575,8 +578,10 @@ mod tests {
     /// tick reconciles no removal (its tab stays) and the next tick retries.
     /// Root ignores the mode bits: then the lstat succeeds and there is nothing
     /// to check.
+    #[cfg(unix)]
     #[test]
     fn heal_short_walk_keeps_a_note_it_cannot_stat() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let root = tmp("healperm");
         w(&root, "A", "a\n");

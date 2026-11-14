@@ -158,12 +158,26 @@ pub fn await_ready(ready: impl Fn() -> bool, alive: impl Fn() -> bool, timeout: 
 
 /// is `pid` a live (non-zombie) process? Reads /proc/<pid>/stat — a read
 /// root under landlock; signals (kill 0) may be scoped there.
+#[cfg(target_os = "linux")]
 pub fn alive(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         // "pid (comm) S ..." — comm may hold spaces/parens: state follows the LAST ')'
         Ok(s) => s.rfind(')').and_then(|i| s[i + 1..].trim_start().chars().next()).is_some_and(|c| c != 'Z' && c != 'X'),
         Err(_) => false,
     }
+}
+
+/// no /proc off Linux: signal 0 asks the kernel whether the pid exists (a zombie
+/// still counts until it is reaped, which the spawning thread does at once)
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing, it only checks the pid
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+pub fn alive(pid: u32) -> bool {
+    crate::plat::alive(pid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,15 +223,24 @@ pub fn argv(l: &Launcher, vault: &Path, sw: Option<&Switch>) -> (OsString, Vec<O
 /// the launcher of THIS process, read from the live environment.
 pub fn current() -> Result<Launcher, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // Flatpak and AppImage are Linux packagings; elsewhere the exe is the launcher
+    if !cfg!(target_os = "linux") {
+        return Ok(Launcher::Plain(exe));
+    }
     Ok(launcher(Path::new("/.flatpak-info").exists(), std::env::var_os("APPIMAGE"), exe))
 }
 
 /// build the Command (not spawned) — split out so the env scrub is testable.
 pub fn command(l: &Launcher, vault: &Path, sw: Option<&Switch>) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
     let (prog, args) = argv(l, vault, sw);
     let mut c = std::process::Command::new(prog);
-    c.args(args).env_remove("VAULT_DIR").stdin(std::process::Stdio::null()).process_group(0);
+    c.args(args).env_remove("VAULT_DIR").stdin(std::process::Stdio::null());
+    // its own process group: a signal (or Ctrl+C) aimed at this window's group
+    // must not take the other vault's window down with it
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut c, crate::plat::CREATE_NEW_PROCESS_GROUP);
     c
 }
 
@@ -283,6 +306,7 @@ mod tests {
         assert!(m.lines().any(|l| l.trim().starts_with("- install ") && l.trim().ends_with(&format!(" {FLATPAK_COMMAND}"))), "manifest install path drifted");
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_command_drops_vault_dir_and_detaches_stdin() {
         let c = command(&Launcher::Plain("/bin/true".into()), Path::new("/v/B"), None);
@@ -354,6 +378,7 @@ mod tests {
     }
 
     /// /proc liveness: we are alive, a reaped child is not, a zombie is not.
+    #[cfg(unix)]
     #[test]
     fn switch_alive_probe_reads_proc() {
         assert!(alive(std::process::id()));

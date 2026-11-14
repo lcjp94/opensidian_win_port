@@ -454,6 +454,12 @@ const Ed = {
      An unresolved target is R29.4's banner in both engines. */
   IMG_EXTS: ["png", "jpg", "jpeg", "gif", "webp"],
   IMG_SCHEME: "opensidian-img",
+  // How the page ADDRESSES that scheme. WebKit takes "opensidian-img://localhost/";
+  // WebView2 (Windows) has no custom scheme for subresources and serves it as
+  // "http://opensidian-img.localhost/". The page's own host tells which engine
+  // this is: "tauri.localhost" exists only there (main.rs IMG_BASE is the Rust twin).
+  IMG_BASE: (typeof location !== "undefined" && location.hostname === "tauri.localhost")
+    ? "http://opensidian-img.localhost/" : "opensidian-img://localhost/",
   isImg(t) {                                   // is this target an IMAGE embed, not a note embed?
     const i = t.lastIndexOf(".");
     return i >= 0 && Ed.IMG_EXTS.includes(t.slice(i + 1).toLowerCase());
@@ -495,7 +501,7 @@ const Ed = {
   },
   imgSrc(target) {
     const rel = Ed.imgRel(target);
-    return rel === null ? null : Ed.IMG_SCHEME + "://localhost/" + Ed.pctEnc(rel);
+    return rel === null ? null : Ed.IMG_BASE + Ed.pctEnc(rel);
   },
   // the ONE widget both syntaxes paint. Carries no TEXT node in either branch:
   // the row's textContent must stay === its source line (the token map walks
@@ -640,27 +646,37 @@ const Ed = {
       Ed.pdfSize(s);
       const n = sz.length || 0;           // pdf.rs caps the list (MAX_LISTED)
       const want = Math.min(of0(), n);
+      const m3d = Array.isArray(info.model3d) ? info.model3d : [];
+      if (m3d.includes(want)) s.classList.add("is-loaded");   // nothing will load for it: it is complete as it is
       const io = new IntersectionObserver(es => {
         for (const e of es) {
           if (!e.isIntersecting) continue;
           const im = e.target;
           io.unobserve(im);
+          if (im.tagName !== "IMG") continue;                // a 3D-model sheet: no image to fetch
           const px = Math.min(2048, Math.ceil(box.clientWidth * zoom * (window.devicePixelRatio || 1) / 64) * 64 || 640);
           im.onload = () => {
             if (+im.dataset.n !== want) return;
             s.classList.add("is-loaded");
             if (typeof xiAgain === "function") xiAgain();
           };
-          im.setAttribute("src", Ed.IMG_SCHEME + "://localhost/" + s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px);
+          im.setAttribute("src", Ed.IMG_BASE + s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px);
         }
       }, { root: box, rootMargin: "100% 0px" });
       for (let i = 0; i < n; i++) {
-        const im = Ed.el("img", "pdf-page");
+        // A page that holds ONLY an interactive 3D model (pdf.rs model_3d) has
+        // nothing a renderer can draw: it would come back as a white sheet. It
+        // gets a sheet of the same shape that says so (text from CSS, .pdf-3d),
+        // and no PNG is ever requested for it.
+        const is3d = m3d.includes(i + 1);
+        const im = Ed.el(is3d ? "div" : "img", is3d ? "pdf-page pdf-3d" : "pdf-page");
         const [pw, ph] = sz[i];
         im.dataset.n = String(i + 1);
         im.style.aspectRatio = (pw > 0 && ph > 0 ? pw + " / " + ph : "612 / 792");
-        im.setAttribute("alt", "");
-        im.draggable = false;
+        if (!is3d) {
+          im.setAttribute("alt", "");
+          im.draggable = false;
+        }
         box.appendChild(im);
         pages.push(im);
       }
