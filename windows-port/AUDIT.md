@@ -357,3 +357,29 @@ Rien ici n'explique un temps mort perceptible. Hypothèses non testées, par ord
 4. Taille ou forme du vrai coffre (bien plus de notes, très gros fichiers).
 
 Pour trancher : lancer l'app avec `OPENSIDIAN_OTEL=<fichier>`, refaire les gestes lents, et lire les durées par opération dans ce fichier.
+
+## 13. Suite des retours utilisateur (2026-11-14)
+
+Coffre de test de l'utilisateur : `D:\Rust_vault_test`, SSD USB en exFAT, 2119 notes, 39 PDF, 6 plugins communautaires actifs. Les essais ont été faits sur ce coffre (lecture, ouverture) et sur une copie locale (canvas d'essai).
+
+### Temps morts — cause trouvée : les plugins
+
+| Situation | Gels du fil de la page (30 premières secondes) |
+|---|---|
+| Coffre réel, 6 plugins actifs | plusieurs gels de 0,3 à 1 s ; commande triviale jusqu'à 1,1 s |
+| Premier lancement avec ces plugins | un gel de 17 s (6767 lectures de notes par un plugin : première indexation) |
+| Copie locale, plugins coupés | aucun |
+
+L'index du coffre se construit en 91 ms et une écriture synchronisée sur ce disque prend 1 à 16 ms : ni l'USB, ni l'exFAT, ni la couche fichiers du portage ne sont en cause. Non recherché : lequel des six plugins pèse le plus, et si l'amont se comporte pareil sous Linux (vraisemblable, non mesuré).
+
+Un vrai défaut, de l'amont : le rendu PDF est une file à un seul travailleur. Un PDF lent (19,6 s pour la première page d'un livre de 25 Mo) laisse toutes les autres cartes vides en attendant.
+
+### Vignette PDF vide — corrigé (toutes plateformes)
+
+Les PDF « 3D » d'un logiciel de CAO ont une page sans contenu et une annotation `/3D` portant le modèle en PRC, sans image d'aperçu. `pdf_info` signale ces pages (`model3d`) et le cadre affiche une feuille qui le dit. Le modèle lui-même n'est pas dessiné : décoder le PRC demanderait un moteur 3D complet.
+
+### Carte PDF qui tremble — corrigé (Windows)
+
+Reproduit avec le fichier désigné par l'utilisateur, sur une carte 400×300 (taille créée par « Add media ») : 89 changements de taille en 1,5 s, 396×289 ↔ 381×300. Cause : la barre de défilement de WebView2 occupe 15 px, et la hauteur du cadre dépend de sa largeur. Sous WebView2 le cadre remplit maintenant la carte. Après correction : 0 changement, images identiques.
+
+Les tentatives précédentes n'avaient pas reproduit le défaut parce qu'elles utilisaient des cartes de 400×400 : la boucle n'existe qu'à quelques pixels près.
