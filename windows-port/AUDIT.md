@@ -320,3 +320,40 @@ Un plugin de sonde écrit pour l'occasion (pas un plugin tiers), dans un coffre 
 - **Non signé** : SmartScreen avertit. La signature Authenticode demande un certificat que seul le mainteneur peut fournir.
 - `tauri bundle` marque l'exe de son type de bundle : le binaire installé diffère de quelques octets de celui que `cargo test` a exercé. Les sommes de contrôle sont prises après.
 - Non testé : une machine sans WebView2, l'installateur en mode interactif, une mise à niveau par-dessus une version installée.
+
+## 12. Retours du premier essai utilisateur (2026-11-14)
+
+L'utilisateur a essayé l'exécutable installé : installateur interactif, deux fenêtres, collage d'image et un plugin communautaire fonctionnent. Deux remarques.
+
+### Sélecteur de coffre « plus Windows » — fait
+
+Le choix du dossier passe par le dialogue du système (`IFileOpenDialog`, `pick_win.rs`) : barre d'adresse, accès rapide, OneDrive, « Nouveau dossier ». La liste maison (`#p-dirs`) est masquée sous Windows, remplacée par un bouton « Browse… » ; le champ de chemin reste, pour taper ou coller. Le dialogue ne fait que proposer un chemin : l'ouverture et la création passent par les mêmes commandes qu'avant, donc par `vault_rules`.
+
+- « Open » : le dialogue s'ouvre aussitôt ; au démarrage sans coffre, le dossier choisi s'ouvre directement.
+- « Create » : le dialogue choisit le dossier parent, le nom se tape.
+
+Vérifié dans l'app : une fenêtre de dialogue système (`#32770`) apparaît, rattachée à la fenêtre de l'application, et l'annulation renvoie « rien » à la page. **Non vérifié par automate : le choix effectif d'un dossier** (il faut une main sur le dialogue).
+
+Dépendance : `windows =0.61.3` sous `cfg(windows)` (déjà dans `Cargo.lock`, une ligne de plus).
+
+### Temps morts — NON reproduits, cause non trouvée
+
+Mesures sur la version release, coffre synthétique de 2000 notes (8,7 Mo) sur disque local `C:\`, hors OneDrive :
+
+| Opération | Durée |
+|---|---|
+| Démarrage (`boot`) | 242 ms |
+| Construction de l'index, 2000 notes | 72 ms |
+| Arborescence visible, depuis le début de la page | 1,1 s |
+| Liste des notes / lecture d'une note / graphe | 3 ms / 1–3 ms / 5 ms |
+| Joindre une image de 48 Ko | 5 ms |
+| Lire un média de 30 Mo par l'IPC (8 tranches) | 269 ms |
+
+Rien ici n'explique un temps mort perceptible. Hypothèses non testées, par ordre de vraisemblance :
+
+1. **Coffre sous OneDrive** : fichiers « à la demande » à rapatrier, verrous de synchronisation.
+2. **Antivirus** (McAfee sur ce poste) : analyse de chaque fichier ouvert ; l'ouverture d'un coffre en ouvre des milliers.
+3. **Import d'un gros média** : sous Windows, `import_move` copie puis relit les deux fichiers pour les comparer (trois passes), là où Linux crée un lien physique instantané. Corrigeable maintenant que `windows-sys` est disponible (identité de fichier par `GetFileInformationByHandle`).
+4. Taille ou forme du vrai coffre (bien plus de notes, très gros fichiers).
+
+Pour trancher : lancer l'app avec `OPENSIDIAN_OTEL=<fichier>`, refaire les gestes lents, et lire les durées par opération dans ce fichier.

@@ -11521,8 +11521,47 @@ async function enterMode(m) {
   $("p-gonew").textContent = m === "create" ? "Create in new window" : "Open in new window";
   $("p-err").textContent = "";
   await browseTo(await inv("home_dir"));
+  if (WIN) return winFolderMode(m);
   (m === "create" ? $("p-name") : $("p-path")).focus();
   if (vaultPath) { try { updateTitle(); } catch (_) {} }   // item 14: publish [pbtn:] for the sub-mode buttons (never at the boot picker)
+}
+/* Windows port — the folder is chosen in the SYSTEM dialog (Rust pick_folder ->
+   pick_win.rs), not in the in-app list: Explorer's own picker knows the user's
+   quick access, OneDrive, network places and "New folder", and is what a Windows
+   user expects. The list (#p-dirs) is hidden there and a "Browse…" button takes
+   its place; the path field stays, so a path can still be typed or pasted.
+   The dialog only fills the field. Opening or creating still goes through the
+   same buttons and the same commands as before (pickerGo), where the backend
+   decides whether that folder may be a vault.
+     open:   the dialog comes up at once. At the boot picker there is nothing
+             else to decide, so a chosen folder opens directly; a cancel goes
+             back. With a vault already open the two buttons stay (this window,
+             or a new one) and the user picks.
+     create: the dialog chooses the PARENT folder; the name is typed. */
+async function winBrowse() {
+  let p = null;
+  try { p = await inv("pick_folder", { title: pmode === "create" ? "Choose where to create the vault" : "Open folder as vault", start: bpath || null }); }
+  catch (err) { $("p-err").textContent = String(err); return null; }
+  if (p) { bpath = p; $("p-path").value = p; $("p-err").textContent = ""; }
+  return p;
+}
+async function winFolderMode(m) {
+  $("p-dirs").hidden = true;
+  if (vaultPath) { try { updateTitle(); } catch (_) {} }   // item 14: publish [pbtn:], as enterMode does on the other path
+  let b = $("p-browse");
+  if (!b) {
+    b = document.createElement("button");
+    b.id = "p-browse"; b.type = "button"; b.textContent = "Browse…";
+    b.style.cssText = "align-self:flex-start;margin-top:8px";   // layout only; colours come from the picker's button rule
+    b.onclick = winBrowse;
+    $("p-dirs").after(b);
+  }
+  if (m === "create") { $("p-name").focus(); return; }
+  const p = await winBrowse();
+  if (pmode !== m) return;                    // the user went elsewhere while the dialog was up
+  if (!p) { if (!vaultPath) showPicker(); return; }
+  if (!vaultPath) return pickerGo(true);       // boot picker: one possible action, take it
+  $("p-go").focus();
 }
 $("p-create").onclick = () => enterMode("create");
 $("p-open").onclick = () => enterMode("open");

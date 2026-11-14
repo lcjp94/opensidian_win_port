@@ -41,6 +41,8 @@ mod secrets;
 mod secrets_win; // app.secretStorage in the Windows Credential Manager
 #[cfg(windows)]
 mod http_win; // the plugin store's HTTPS client over WinHTTP
+#[cfg(windows)]
+mod pick_win; // the system folder dialog for choosing a vault
 mod settings;
 mod spawn;
 mod spawner;
@@ -2463,6 +2465,26 @@ fn argv_vault(args: &[std::ffi::OsString], env_set: bool) -> Option<PathBuf> {
 #[tauri::command]
 fn home_dir() -> String {
     plat::home_string()
+}
+
+/// Windows: ask for a folder with the system's own dialog (pick_win.rs), modal
+/// to this window. Ok(None) = cancelled. The answer is only a PROPOSAL: the
+/// page hands it to pick_vault / create_vault, where vault_rules decides.
+/// Elsewhere there is no such dialog and the in-app list is the picker; the
+/// page never calls this there (ui/main.js WIN).
+#[tauri::command]
+async fn pick_folder(win: tauri::Window, title: Option<String>, start: Option<String>) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let owner = win.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        let title = title.unwrap_or_else(|| "Choose a folder".into());
+        return tauri::async_runtime::spawn_blocking(move || pick_win::pick_folder(owner, title, start)).await.map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (win, title, start);
+        Err("no system folder dialog on this platform".into())
+    }
 }
 
 /// S1: the only way an external URL leaves the app — the webview never
@@ -6526,7 +6548,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_notes, list_images, canvas_io, canvas_attach, paste_image, read_note, write_note, create_note, render, render_blocks, block_lines, render_view, highlight_blocks, graph, graph_local, graph_view, vault_get, pick_vault,
-            create_vault, create_vault_dir, open_vault_window, switch_show, switch_ready, boot_notice, home_dir, list_dirs, list_folders, create_dir, backlinks, search,
+            create_vault, create_vault_dir, open_vault_window, switch_show, switch_ready, boot_notice, home_dir, pick_folder, list_dirs, list_folders, create_dir, backlinks, search,
             list_bookmarks, toggle_bookmark, bookmark_rows, bm_group_new, bm_group_rename, bm_group_delete, bm_move, bm_add, bm_drag, bm_add_at, recent_vaults, rename_note, media_rename, media_read, move_note, update_links, delete_note, link_consent, set_link_consent, strict_line_breaks, set_strict_line_breaks, qs_new_name, readable_line_length, graph_settings, set_graph_settings, tags, tag_counts,
             get_sidebar_w, set_sidebar_w, log_spans, graph_renderer_pref, type_probe, nob_probe, psg_probe, vb_probe, smoke_css,
             read_workspace, write_workspace,

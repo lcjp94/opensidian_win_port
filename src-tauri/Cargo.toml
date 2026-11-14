@@ -100,6 +100,14 @@ dbus = "=0.9.12"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
+# pick_win.rs — the system folder dialog (IFileOpenDialog) is a COM interface,
+# which windows-sys does not model (it has no interfaces). `windows` is the same
+# project's safe binding and the crate tauri itself uses for its window: the HWND
+# tauri hands us IS this crate's type. NO NEW CRATE: windows 0.61.3 (2025-06-12,
+# MIT OR Apache-2.0, sha256 9babd3a7…6893) is ALREADY in Cargo.lock through tauri;
+# `=` pins that locked version and the features add no package.
+windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+
 # listtoggle A2 — the unit table runs ui/editor.js in JavaScriptCore, the engine
 # the webview runs it in. javascriptcore-rs 1.1.2 is ALREADY in Cargo.lock as
 # webkit2gtk's own dependency; `=` pins it to that locked version, so this
