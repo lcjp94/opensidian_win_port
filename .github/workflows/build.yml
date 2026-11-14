@@ -71,18 +71,32 @@ jobs:
         run: cargo build --release --locked
       - name: Test
         run: cargo test --locked
-      # an unsigned, unpackaged binary: enough to try a build, not a release
+      # The installer wraps the binary built and tested above: `tauri bundle`
+      # packages what is in target/release, it does not compile again (it does
+      # stamp the exe with its bundle type, so the checksums are taken AFTER).
+      # tauri-cli is a build tool, pinned to the tauri version in Cargo.lock;
+      # rust-cache keeps the cargo bin directory, so it is compiled once.
+      - name: Tauri CLI
+        run: |
+          if (-not (Get-Command cargo-tauri -ErrorAction SilentlyContinue)) {
+            cargo install tauri-cli --locked --version "=2.11.5"
+          }
+          cargo tauri --version
+      - name: NSIS installer
+        run: cargo tauri bundle --bundles nsis --config ../packaging/windows/tauri.bundle.conf.json --ci
+      # unsigned: Windows SmartScreen will warn. Enough to try a build, not a release.
       - name: Checksums
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/bundle/nsis/*-setup.exe dist/
           Copy-Item target/release/opensidian.exe dist/
-          $h = (Get-FileHash dist/opensidian.exe -Algorithm SHA256).Hash.ToLower()
-          "$h  opensidian.exe" | Out-File -Encoding ascii -NoNewline dist/SHA256SUMS
+          $lines = Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          $lines | Out-File -Encoding ascii dist/SHA256SUMS
           Get-Content dist/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: opensidian-windows-x86_64-unsigned
-          path: |
-            src-tauri/dist/opensidian.exe
-            src-tauri/dist/SHA256SUMS
+          path: src-tauri/dist/
           if-no-files-found: error

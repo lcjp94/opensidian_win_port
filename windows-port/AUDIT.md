@@ -298,3 +298,25 @@ Un plugin de sonde écrit pour l'occasion (pas un plugin tiers), dans un coffre 
 - **Un plugin communautaire réel** (Dataview, Excalidraw, obsidian-git) : l'installer revient à télécharger et exécuter du code tiers ; c'est à l'utilisateur de le faire. Le magasin liste et décrit les plugins ; l'installation elle-même n'a donc pas été exercée.
 - **Persona Linux** : les plugins voient `process.platform === "linux"` et des chemins POSIX. Un plugin qui lance un programme Linux (`which`, `xdg-open`, un script `sh`) échouera sous Windows. Changer la persona est une décision de conception, pas un correctif.
 - Lanceurs `.cmd` / `.bat` sans extension (`npm`, `code`) : non résolus par `spawn` sans shell, comme sous Node.
+
+## 11. Phase 5 — installateur (2026-11-14)
+
+- **Icône** : `icons/icon.ico` porte sept tailles (16 à 256 px), construite par `packaging/windows/make-icon.ps1` à partir des PNG du projet. Contrôlée à l'œil à chaque taille, sur fond clair et sombre.
+- **Installateur NSIS** : `packaging/windows/tauri.bundle.conf.json`, passé à `cargo tauri bundle` par `--config`. `tauri.conf.json` garde `bundle.active = false` et `tauri.windows.conf.json` ne porte toujours que la CSP. Installation par utilisateur, WebView2 par le bootstrapper de Microsoft si absent. Outil : `tauri-cli =2.11.5`, la version de tauri du `Cargo.lock`.
+- **CI** : le job Windows construit l'installateur après les tests et publie `opensidian_<version>_x64-setup.exe`, `opensidian.exe` et `SHA256SUMS`.
+
+### Vérifié sur ce poste
+
+| Étape | Résultat |
+|---|---|
+| Construction | `opensidian_0.9.2_x64-setup.exe`, 8,3 Mo |
+| Installation silencieuse (`/S`) | code 0 ; `%LOCALAPPDATA%\opensidian\` (exe + désinstalleur), entrée « Applications », raccourcis menu Démarrer et Bureau |
+| Lancement du binaire installé | origine `http://tauri.localhost`, coffre affiché |
+| Désinstallation silencieuse | code 0 ; dossier, entrée de registre et raccourcis supprimés |
+| Après désinstallation | `%USERPROFILE%\.opensidian.json` et `%LOCALAPPDATA%\dev.koto.opensidian` conservés |
+
+### Limites
+
+- **Non signé** : SmartScreen avertit. La signature Authenticode demande un certificat que seul le mainteneur peut fournir.
+- `tauri bundle` marque l'exe de son type de bundle : le binaire installé diffère de quelques octets de celui que `cargo test` a exercé. Les sommes de contrôle sont prises après.
+- Non testé : une machine sans WebView2, l'installateur en mode interactif, une mise à niveau par-dessus une version installée.

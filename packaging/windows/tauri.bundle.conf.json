@@ -1,0 +1,21 @@
+{
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "publisher": "opensidian (unofficial Windows build)",
+    "homepage": "https://github.com/jpzk/opensidian",
+    "license": "GPL-3.0-or-later",
+    "licenseFile": "../LICENSE",
+    "category": "Productivity",
+    "shortDescription": "Local-first markdown vault editor",
+    "longDescription": "opensidian is a local-first markdown editor for a folder of plain files (a vault): tabbed editing, wiki links, a graph view and custom themes. It keeps your notes as files on disk.",
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}
