@@ -401,3 +401,7 @@ La carte affiche maintenant un message au lieu d'une feuille blanche (section 13
 - Dessiner le modèle dans l'application demande de décoder le format PRC (ISO 14739-1, flux binaire compressé, sans bibliothèque libre de lecture connue) puis un moteur de rendu 3D : hors de portée raisonnable.
 
 Décision laissée à l'utilisateur.
+
+### PDF 3D — lien vers le plan 2D (choix de l'utilisateur)
+
+La feuille 3D propose « Show the 2D drawing: <nom> » quand un PDF portant le même nom sans le marqueur « 3D » se trouve dans le même dossier ; un clic affiche ce plan dans le même cadre. Appariement volontairement strict (`pdf::twin_of`) : « 07 - Serre - Ind 00 - 3D.PDF » n'est pas apparié à « 07 - Serre.pdf ». Vérifié dans l'app, au clic réel, dans un canvas et dans une note.
