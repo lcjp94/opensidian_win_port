@@ -296,7 +296,7 @@ Un plugin de sonde écrit pour l'occasion (pas un plugin tiers), dans un coffre 
 ### Non fait, et pourquoi
 
 - **Un plugin communautaire réel** (Dataview, Excalidraw, obsidian-git) : l'installer revient à télécharger et exécuter du code tiers ; c'est à l'utilisateur de le faire. Le magasin liste et décrit les plugins ; l'installation elle-même n'a donc pas été exercée.
-- **Persona Linux** : les plugins voient `process.platform === "linux"` et des chemins POSIX. Un plugin qui lance un programme Linux (`which`, `xdg-open`, un script `sh`) échouera sous Windows. Changer la persona est une décision de conception, pas un correctif.
+- ~~**Persona Linux**~~ : traité le 2026-11-20, voir §15.
 - Lanceurs `.cmd` / `.bat` sans extension (`npm`, `code`) : non résolus par `spawn` sans shell, comme sous Node.
 
 ## 11. Phase 5 — installateur (2026-11-14)
@@ -405,3 +405,22 @@ Décision laissée à l'utilisateur.
 ### PDF 3D — lien vers le plan 2D (choix de l'utilisateur)
 
 La feuille 3D propose « Show the 2D drawing: <nom> » quand un PDF portant le même nom sans le marqueur « 3D » se trouve dans le même dossier ; un clic affiche ce plan dans le même cadre. Appariement volontairement strict (`pdf::twin_of`) : « 07 - Serre - Ind 00 - 3D.PDF » n'est pas apparié à « 07 - Serre.pdf ». Vérifié dans l'app, au clic réel, dans un canvas et dans une note.
+
+## 15. Plugins : la plateforme annoncée est Windows (2026-11-20)
+
+Les plugins voient désormais l'OS réel. Sous Windows : `process.platform === "win32"`, `os.platform()` vaut `"win32"`, `os.type()` vaut `"Windows_NT"` et `os.devNull` vaut `\.\nul`. Le test est celui de `Platform.isWin` (`api-core.js`), donc les deux disent toujours la même chose. Sous Linux, rien ne change.
+
+- **Lancement par un shell** : `exec()` et `spawn(…, { shell: true })` font ce que fait Node sous Windows, `cmd.exe /d /s /c "<ligne>"`, avec les arguments passés tels quels (`windowsVerbatimArguments`). Un plugin peut aussi demander ce mode lui-même, comme le font cross-spawn et execa. Côté Rust, `desk_proc::Spec.verbatim` (`raw_arg`) le prend en charge. Sans lui, la règle de quotage argv transformait la ligne en `\"…\"` et cmd ne l'exécutait pas (test `desk_win_verbatim_cmd_runs_the_line_as_node_sends_it`). Un plugin qui nomme lui-même `/bin/sh -c` passe encore par `cmd.exe`, comme avant.
+- **Inchangé, volontairement** :
+  - les fichiers restent ceux du coffre confiné : `/vault`, module `path` POSIX ;
+  - `os.EOL` reste `"\n"`, pour qu'un plugin ne mette pas des fins de ligne CRLF dans une note ;
+  - `os.homedir()` et `process.env` restent fictifs.
+- **Vérifié dans l'app** (build release, coffre jetable, profil `USERPROFILE` jetable, plugin sonde) :
+  - les quatre valeurs ci-dessus ;
+  - `exec('echo "a b"& echo done')` → `"a b"` puis `done` ;
+  - `exec("cd", { cwd: "/vault" })` → le vrai dossier du coffre ;
+  - `spawn("echo", ["x y"], { shell: true })` → `x y` ;
+  - `execFile("cmd.exe", […, '"echo "q r""'], { windowsVerbatimArguments: true })` → `"q r"` ;
+  - `execFile("where", ["cmd"])` → `C:\Windows\System32\cmd.exe` ;
+  - `exec(…, { shell: "/bin/sh" })` → exécuté.
+- **Plugins réels** (copie du `.obsidian` du coffre utilisateur) : Dataview, Importer, Tasks, Omnisearch, Templater et Copilot se chargent. Copilot échoue ensuite au démarrage (`process.stdout` indéfini dans `epr`), **à l'identique avec l'ancienne version** : le défaut existait déjà, il n'est pas lié à ce changement. Non analysé plus loin. Copilot demande aussi des requêtes `https` que la passerelle plugin refuse (« no TLS client »), comme sous Linux.

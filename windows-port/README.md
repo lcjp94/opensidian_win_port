@@ -58,7 +58,13 @@ Clone with any `core.autocrlf` setting: `.gitattributes` keeps sources in LF and
 | Names | `CON`, `NUL`, `COM1`… , `< > " \| ? *`, and a trailing dot or space are refused. |
 | Flatpak, AppImage, deb, rpm, Nix | Not applicable. |
 
-Plugins still see a Linux-like environment (`process.platform === "linux"`, the vault at `/vault`). `child_process.exec()` runs in `cmd.exe`. A plugin that starts a Linux-only program will fail.
+Plugins see Windows: `process.platform === "win32"`, `os.platform()` is `"win32"` and `os.type()` is `"Windows_NT"`, as `Platform.isWin` already said. A plugin therefore runs the Windows commands it has (`where`, `cmd.exe`). `child_process.exec()` and `shell: true` run in `cmd.exe /d /s /c "…"`, as Node does on Windows. Some things stay as on Linux:
+
+- Plugins reach files through the vault only, at `/vault`, with the POSIX `path` module.
+- `os.EOL` stays `"\n"`, so a plugin cannot turn a note's line endings into CRLF.
+- `os.homedir()` and `process.env` describe no real host, as on Linux.
+
+A plugin that starts a Linux-only program (`sh`, `xdg-open`) will fail.
 
 ## Not verified
 

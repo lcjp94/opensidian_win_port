@@ -265,11 +265,17 @@ pub struct Spec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Windows: Node's `windowsVerbatimArguments` — the arguments are joined
+    /// with spaces and passed as written, not quoted by the usual argv rules.
+    /// Node sets it for cmd.exe (`/d /s /c "<line>"`), which does not undo that
+    /// quoting. Ignored elsewhere, as Node ignores it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub verbatim: bool,
 }
 
-/// Windows: the command line of a `sh -c <line>` request. The page presents
-/// itself to plugins as Linux (node-desktop.js: process.platform, "/vault"), so
-/// child_process.exec() and `shell: true` arrive as `/bin/sh -c "<line>"`.
+/// Windows: the command line of a `sh -c <line>` request. The page says it is
+/// win32 (node-desktop.js), so exec() and `shell: true` come as cmd.exe; a
+/// plugin that names /bin/sh itself still asks for `/bin/sh -c "<line>"`.
 /// There is no /bin/sh here; what Node itself runs for exec() on Windows is the
 /// system's command interpreter, and so do we.
 #[cfg(windows)]
@@ -297,7 +303,13 @@ fn build(sp: &Spec) -> Command {
         }
         None => {
             let mut c = Command::new(&sp.file);
-            c.args(&sp.args);
+            if sp.verbatim {
+                if !sp.args.is_empty() {
+                    std::os::windows::process::CommandExt::raw_arg(&mut c, sp.args.join(" "));
+                }
+            } else {
+                c.args(&sp.args);
+            }
             c
         }
     };
@@ -459,7 +471,7 @@ mod tests {
     use super::*;
 
     fn spec(file: &str, args: &[&str], cwd: &Path) -> Spec {
-        Spec { file: file.into(), args: args.iter().map(|s| s.to_string()).collect(), cwd: cwd.into(), env: vec![] }
+        Spec { file: file.into(), args: args.iter().map(|s| s.to_string()).collect(), cwd: cwd.into(), env: vec![], verbatim: false }
     }
 
     fn drain(r: &Run) -> (Vec<u8>, Vec<u8>, Chunk) {
@@ -586,6 +598,25 @@ mod tests {
         // not a shell request: three arguments, or another program
         assert!(shell_line(&spec("/bin/sh", &["-c", "x", "y"], &d)).is_none());
         assert!(shell_line(&spec("git", &["-c", "x"], &d)).is_none());
+    }
+
+    /// Windows: what the page sends for exec() now that it says win32 — Node's
+    /// `cmd.exe /d /s /c "<line>"` with windowsVerbatimArguments. Verbatim, cmd
+    /// strips the outer quotes and runs the line as written; quoted by the argv
+    /// rules instead, the line reaches cmd as `\"echo ...\"` and does not run.
+    #[cfg(windows)]
+    #[test]
+    fn desk_win_verbatim_cmd_runs_the_line_as_node_sends_it() {
+        let d = std::env::temp_dir();
+        let line = "\"echo \"a b\"& exit 4\"";
+        let mut sp = spec("cmd.exe", &["/d", "/s", "/c", line], &d);
+        sp.verbatim = true;
+        let (o, _, c) = drain(&start(sp).unwrap());
+        assert_eq!(String::from_utf8_lossy(&o).trim(), "\"a b\"");
+        assert_eq!(c.exit, Some(4));
+        let (o, _, c) = drain(&start(spec("cmd.exe", &["/d", "/s", "/c", line], &d)).unwrap());
+        assert_ne!(String::from_utf8_lossy(&o).trim(), "\"a b\"", "argv quoting must not be what verbatim does");
+        assert_ne!(c.exit, Some(4));
     }
 
     /// Windows: no signal exists, so kill() ends the tree and the page still

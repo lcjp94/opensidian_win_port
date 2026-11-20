@@ -3900,13 +3900,20 @@ fn desk_proc_spawn(
     args: Option<Vec<String>>,
     cwd: Option<String>,
     env: Option<std::collections::BTreeMap<String, String>>,
+    verbatim: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
     if !plugins::is_trusted(&cfg_value(), &root) {
         return Err("EPERM: restricted mode, plugins cannot start programs".into());
     }
     let args: Vec<String> = args.unwrap_or_default().iter().map(|a| desk_proc::map_arg(&root, a)).collect();
-    let sp = desk_proc::Spec { file, args, cwd: desk_proc::map_cwd(&root, cwd.as_deref()), env: env.unwrap_or_default().into_iter().collect() };
+    let sp = desk_proc::Spec {
+        file,
+        args,
+        cwd: desk_proc::map_cwd(&root, cwd.as_deref()),
+        env: env.unwrap_or_default().into_iter().collect(),
+        verbatim: verbatim.unwrap_or(false),
+    };
     eprintln!("[desk] spawn {} {:?} cwd={}", sp.file, sp.args, sp.cwd.display());
     let run = span_timed!("desk_proc_spawn", desk_proc::start(sp))?;
     let pid = run.pid();
