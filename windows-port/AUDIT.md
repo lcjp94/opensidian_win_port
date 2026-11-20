@@ -383,3 +383,21 @@ Les PDF « 3D » d'un logiciel de CAO ont une page sans contenu et une annotatio
 Reproduit avec le fichier désigné par l'utilisateur, sur une carte 400×300 (taille créée par « Add media ») : 89 changements de taille en 1,5 s, 396×289 ↔ 381×300. Cause : la barre de défilement de WebView2 occupe 15 px, et la hauteur du cadre dépend de sa largeur. Sous WebView2 le cadre remplit maintenant la carte. Après correction : 0 changement, images identiques.
 
 Les tentatives précédentes n'avaient pas reproduit le défaut parce qu'elles utilisaient des cartes de 400×400 : la boucle n'existe qu'à quelques pixels près.
+
+## 14. SVG et PDF 3D (2026-11-20)
+
+### SVG — fait (toutes plateformes)
+
+Demandé par l'utilisateur. L'amont avait exclu le SVG volontairement (R29.8 : scriptable, pas de nettoyeur) ; la règle est changée, avec ses raisons dans `main.rs` (`IMG_TYPES`, `SVG_CSP`). Un SVG n'est jamais affiché que par `<img>`, contexte où il n'exécute aucun script et ne charge rien ; la réponse porte en plus une CSP `default-src 'none'; sandbox`.
+
+Vérifié dans l'app : note (`![[logo.svg]]`), canvas (trois cartes), glisser-déposer (fichier rangé dans les pièces jointes), et un SVG piégé (`<script>` + `onload`) qui n'exécute rien.
+
+### PDF 3D — le modèle n'est toujours pas visible
+
+La carte affiche maintenant un message au lieu d'une feuille blanche (section 13), mais l'utilisateur veut voir le modèle. Constats :
+
+- Les fichiers ne contiennent aucune image d'aperçu : seulement le modèle PRC (export SolidWorks via HOOPS Publish).
+- Sur ce poste, l'application PDF par défaut est Microsoft Edge, qui n'affiche pas les modèles 3D. Aucun lecteur compatible n'est installé.
+- Dessiner le modèle dans l'application demande de décoder le format PRC (ISO 14739-1, flux binaire compressé, sans bibliothèque libre de lecture connue) puis un moteur de rendu 3D : hors de portée raisonnable.
+
+Décision laissée à l'utilisateur.
