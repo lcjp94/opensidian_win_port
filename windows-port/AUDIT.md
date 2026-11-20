@@ -423,4 +423,10 @@ Les plugins voient désormais l'OS réel. Sous Windows : `process.platform === "
   - `execFile("cmd.exe", […, '"echo "q r""'], { windowsVerbatimArguments: true })` → `"q r"` ;
   - `execFile("where", ["cmd"])` → `C:\Windows\System32\cmd.exe` ;
   - `exec(…, { shell: "/bin/sh" })` → exécuté.
-- **Plugins réels** (copie du `.obsidian` du coffre utilisateur) : Dataview, Importer, Tasks, Omnisearch, Templater et Copilot se chargent. Copilot échoue ensuite au démarrage (`process.stdout` indéfini dans `epr`), **à l'identique avec l'ancienne version** : le défaut existait déjà, il n'est pas lié à ce changement. Non analysé plus loin. Copilot demande aussi des requêtes `https` que la passerelle plugin refuse (« no TLS client »), comme sous Linux.
+- **Plugins réels** (copie du `.obsidian` du coffre utilisateur) : Dataview, Importer, Tasks, Omnisearch, Templater et Copilot se chargent. Copilot échouait ensuite au démarrage (`process.stdout` indéfini dans `epr`), à l'identique avec l'ancienne version : le défaut existait déjà.
+
+  Cause : son bundle commence par `var process = globalThis.process || { env: {}, … }`, un repli prévu pour mobile. Ce `var` écrase le `process` que le chargeur lui passe. Comme la page n'avait pas de `process` global, Copilot se rabattait sur son objet réduit, sans `stdout`.
+
+  L'amont a corrigé exactement ce défaut (2cc0af2, #254) en installant un `process` global sur la page, comme dans Obsidian. Ce correctif est repris tel quel (cherry-pick 1884e2f). Seule adaptation : son test JavaScriptCore (`tests/procstdio.rs`, Linux) définit `WIN` et vérifie la plateforme annoncée.
+
+  Vérifié dans l'app : Copilot démarre, aucune erreur avec les six plugins chargés ensemble. Copilot demande aussi des requêtes `https` que la passerelle plugin refuse (« no TLS client »), comme sous Linux.
