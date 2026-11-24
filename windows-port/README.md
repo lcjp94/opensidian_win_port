@@ -9,6 +9,7 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [Morglaf/opensidian#1](https://github.com/Morglaf/opensidian/pull/1) | `.gitattributes` : LF dans les clones Windows (19 tests en échec → 0) | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#2](https://github.com/Morglaf/opensidian/pull/2) | WinHTTP au lieu de `reqwest` + rustls (−41 paquets) | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#3](https://github.com/Morglaf/opensidian/pull/3) | `vaultfs` : refus des noms que Windows ne gère pas (`CON`, `:`, point final…) | ouverte, fusionnée dans `windows` |
+| [Morglaf/opensidian#4](https://github.com/Morglaf/opensidian/pull/4) | CSP élargie sous Windows seulement ; « Render media » coupé retire aussi l'origine WebView2 | ouverte, fusionnée dans `windows` |
 | [jpzk/opensidian#262](https://github.com/jpzk/opensidian/pull/262) | images SVG | acceptée par le mainteneur, à fusionner chez l'amont |
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
 
@@ -18,14 +19,13 @@ Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
 Source : le tag `port-windows-v0.9.2` (`git show port-windows-v0.9.2:<chemin>`). Une ligne = une PR vers Morglaf, dans cet ordre de priorité. Rien de cette liste n'est encore vérifié sur la base v0.9.6.
 
-1. **CSP limitée à Windows** : `src-tauri/tauri.windows.conf.json` avec les sources `http://*.localhost`, et la CSP de base remise comme dans l'amont ; test qui lie les deux. Source : `tauri.windows.conf.json`, test `windows_conf_guard`.
-2. **CI Windows** : job `windows-latest` (build + `cargo test --locked`) à côté de ceux de l'amont. Source : `.github/workflows/build.yml`.
-3. **Installateur** : NSIS par utilisateur, non signé, `SHA256SUMS`, `icon.ico`, configuration séparée pour que `bundle.active` reste `false`. Source : `packaging/windows/`, `.github/workflows/build.yml`.
-4. **Secrets des plugins** dans le Credential Manager (2560 octets max). Source : `src-tauri/src/secrets_win.rs`.
-5. **Sélecteur de dossier natif** (IFileOpenDialog) pour choisir un coffre. Source : `src-tauri/src/pick_win.rs`, `ui/main.js` (`winBrowse`).
-6. **Fenêtre** : glisser de la barre de titre, Aero Snap, bords de redimensionnement. La base a un chemin générique `start_dragging` : **vérifier d'abord** ce qu'il donne sous Windows.
-7. **Plugins** : `process.platform === "win32"`, `os.platform()`/`os.type()`, `exec()` et `shell: true` via `cmd.exe /d /s /c` avec arguments passés tels quels (`windowsVerbatimArguments`). Source : `ui/plugins/node-desktop.js`, `desk_proc.rs` (`verbatim`) — à adapter au `desk_proc` v0.9.6 (consentement).
-8. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`).
+1. **CI Windows** : job `windows-latest` (build + `cargo test --locked`) à côté de ceux de l'amont. Source : `.github/workflows/build.yml`.
+2. **Installateur** : NSIS par utilisateur, non signé, `SHA256SUMS`, `icon.ico`, configuration séparée pour que `bundle.active` reste `false`. Source : `packaging/windows/`, `.github/workflows/build.yml`.
+3. **Secrets des plugins** dans le Credential Manager (2560 octets max). Source : `src-tauri/src/secrets_win.rs`.
+4. **Sélecteur de dossier natif** (IFileOpenDialog) pour choisir un coffre. Source : `src-tauri/src/pick_win.rs`, `ui/main.js` (`winBrowse`).
+5. **Fenêtre** : glisser de la barre de titre, Aero Snap, bords de redimensionnement. La base a un chemin générique `start_dragging` : **vérifier d'abord** ce qu'il donne sous Windows.
+6. **Plugins** : `process.platform === "win32"`, `os.platform()`/`os.type()`, `exec()` et `shell: true` via `cmd.exe /d /s /c` avec arguments passés tels quels (`windowsVerbatimArguments`). Source : `ui/plugins/node-desktop.js`, `desk_proc.rs` (`verbatim`) — à adapter au `desk_proc` v0.9.6 (consentement).
+7. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`).
 
 ## Limites connues (à documenter dans la PR finale)
 
