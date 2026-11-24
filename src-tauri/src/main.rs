@@ -28,6 +28,7 @@ use opensidian_lib::index;
 mod migrate;
 use opensidian_lib::outline;
 mod pdf;
+mod plat;
 mod plugins;
 mod plugin_store;
 mod pasteimg;
@@ -36,6 +37,12 @@ mod perf;
 mod sandbox;
 // cp-secrets: app.secretStorage over the OS keyring (Secret Service)
 mod secrets;
+#[cfg(windows)]
+mod secrets_win; // app.secretStorage in the Windows Credential Manager
+#[cfg(windows)]
+mod http_win; // the plugin store's HTTPS client over WinHTTP
+#[cfg(windows)]
+mod pick_win; // the system folder dialog for choosing a vault
 mod settings;
 mod spawn;
 mod spawner;
@@ -239,18 +246,44 @@ fn note_path(v: &State<Vault>, name: &str, create: bool) -> Option<PathBuf> {
    /etc and /usr for reading and sandbox.rs:94 reports it unsupported on this
    kernel; it is defence in depth that is currently absent.                */
 
-/// R29.8: what v1 serves — Obsidian's list minus `svg` (scriptable, and we have
-/// no sanitizer), `bmp` and `avif` (scope only). ext -> Content-Type.
-const IMG_TYPES: [(&str, &str); 5] = [
+/// R29.8: what is served — Obsidian's list minus `bmp` and `avif` (scope only).
+/// ext -> Content-Type.
+///
+/// `svg` was left out of v1 as scriptable with no sanitizer here. It is served
+/// now WITHOUT a sanitizer, because the page never lets an SVG run as a
+/// document: every place that shows one does it through `<img>` (image_html,
+/// editor.js imgEl, the canvas image card), and an SVG loaded as an image runs
+/// no script and fetches nothing, in WebKit and Chromium alike. Two fences
+/// stand behind that, in case some later code puts the URL somewhere else:
+///   - the page CSP keeps the image scheme out of frame/object/script sources
+///     (default-src 'self'), and navigation to it is refused (nav_allowed);
+///   - the SVG response itself carries `SVG_CSP` (below), a sandbox with no
+///     script and no network, so even opened as a document it is inert.
+const IMG_TYPES: [(&str, &str); 6] = [
     ("png", "image/png"),
     ("jpg", "image/jpeg"),
     ("jpeg", "image/jpeg"),
     ("gif", "image/gif"),
     ("webp", "image/webp"),
+    ("svg", "image/svg+xml"),
 ];
+
+/// The Content-Security-Policy every SVG response carries (see IMG_TYPES): no
+/// script, no network, no frames; only its own inline styles and data: images
+/// and fonts, which Illustrator-style exports embed.
+const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; sandbox";
 
 /// the scheme our images are served on; the CSP names it exactly (R29 / S1)
 const IMG_SCHEME: &str = "opensidian-img";
+/// The prefix the page uses to ADDRESS that scheme. WebKit (Linux, macOS) takes
+/// a custom scheme as it is. WebView2 has no such thing for subresources: wry
+/// serves a registered scheme as `http://<scheme>.localhost/` there and hands
+/// the handler the same request either way, so only the URL text differs — here,
+/// in ui/ (editor.js IMG_BASE) and in the Windows CSP (tauri.windows.conf.json).
+#[cfg(not(windows))]
+const IMG_BASE: &str = "opensidian-img://localhost/";
+#[cfg(windows)]
+const IMG_BASE: &str = "http://opensidian-img.localhost/";
 
 /// R29.10: the label the R29.4 banner carries in place of a REMOTE target.
 /// Both engines paint the same sentence (ui/editor.js `imgEl` sets it as
@@ -425,9 +458,11 @@ fn media_mime(ext: &str) -> Option<&'static str> {
 /// openat(O_NOFOLLOW) per component, and check the OPENED fd is a regular
 /// file (O_NONBLOCK so a FIFO cannot hang the open). No path is re-resolved
 /// between the check and the read.
+#[cfg(unix)]
 fn media_open(root: &Path, rel: &Path) -> Option<fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     let open_at = |dfd: libc::c_int, name: &std::ffi::OsStr, flags: libc::c_int| -> Option<OwnedFd> {
         let c = CString::new(name.as_bytes()).ok()?;
@@ -456,6 +491,14 @@ fn media_open(root: &Path, rel: &Path) -> Option<fs::File> {
     }
     let f = fs::File::from(open_at(dir.as_raw_fd(), leaf, libc::O_RDONLY | libc::O_NONBLOCK)?);
     f.metadata().ok()?.is_file().then_some(f)
+}
+
+/// Windows: the same guarantee from vaultfs's pinned-handle walk (vaultfs_win.rs)
+/// — every directory on the way is a real one, and the OPENED handle is a
+/// regular file.
+#[cfg(windows)]
+fn media_open(root: &Path, rel: &Path) -> Option<fs::File> {
+    vaultfs::Vault::open(root).ok()?.open_regular(rel).ok()
 }
 
 /// cvf-mediasrv (ruling 1.2): rename ONE media file inside the vault — the
@@ -573,7 +616,7 @@ fn image_html(imgs: &[String], target: &str, alt: &str) -> String {
     let dec = pct_decode(target).unwrap_or_else(|| target.to_string());
     match index::resolve(imgs, &dec).map(|i| &imgs[i]) {
         Some(rel) => format!(
-            "<img class=\"vimg\" src=\"{IMG_SCHEME}://localhost/{}\" alt=\"{}\">",
+            "<img class=\"vimg\" src=\"{IMG_BASE}{}\" alt=\"{}\">",
             pct_encode(rel),
             esc(alt)
         ),
@@ -652,13 +695,39 @@ fn is_pdf_target(target: &str) -> bool {
 /// i.e. what the frame waits for before it can size itself.
 #[tauri::command]
 async fn pdf_info(v: State<'_, Vault>, path: String, otel: Option<perf::Ctx>) -> Result<Option<pdf::Info>, String> {
-    let Some(p) = cur_vault(&v).and_then(|r| pdf_path_in(&r, &path)) else { return Ok(None) };
+    let Some(root) = cur_vault(&v) else { return Ok(None) };
+    let Some(p) = pdf_path_in(&root, &path) else { return Ok(None) };
     let (tx, rx) = std::sync::mpsc::channel();
     pdf::queue_info(p, Box::new(move |i| {
         let _ = tx.send(i);
     }));
-    span_timed!(otel => "pdf_info", tauri::async_runtime::spawn_blocking(move || rx.recv().ok().flatten()).await)
-        .map_err(|e| e.to_string())
+    let info = span_timed!(otel => "pdf_info", tauri::async_runtime::spawn_blocking(move || rx.recv().ok().flatten()).await)
+        .map_err(|e| e.to_string())?;
+    Ok(info.map(|mut i| {
+        if !i.model3d.is_empty() {
+            i.twin = pdf_twin_in(&root, &path);
+        }
+        i
+    }))
+}
+
+/// the 2D drawing of the 3D PDF `target` (an encoded vault path, as pdf_info
+/// gets it): a sibling regular file paired by name (pdf::twin_of), returned as
+/// a vault-relative path ONLY if pdf_path_in accepts it, i.e. under the very
+/// rules the frame will fetch it by. Names only; nothing is opened here.
+fn pdf_twin_in(root: &Path, target: &str) -> Option<String> {
+    let rel = safe_rel(&pct_decode(target)?)?;
+    let name = rel.file_name()?.to_str()?;
+    let dir = rel.parent().unwrap_or(Path::new(""));
+    let names: Vec<String> = fs::read_dir(root.join(dir))
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    let twin = pdf::twin_of(name, names.iter().map(String::as_str))?;
+    let out = vaultfs::rel_str(&dir.join(twin));
+    pdf_path_in(root, &pct_encode(&out)).map(|_| out)
 }
 
 /* ---- R31 drop-to-attach (feedback #18), MOVE since osdrop -----------------
@@ -863,7 +932,7 @@ fn attach_drop(root: &Path, note: &str, paths: &[PathBuf]) -> Result<Attached, D
     let (dir, notice) = attach_dir(root)?;
     let croot = root.canonicalize().map_err(|_| DropErr::BadAttachDir)?;
     let rel_path = dir.strip_prefix(&croot).map_err(|_| DropErr::BadAttachDir)?.to_path_buf();
-    let rel_dir = rel_path.display().to_string();
+    let rel_dir = vaultfs::rel_str(&rel_path);
     // audit #6: every create/rename/unlink below is relative to this dir fd
     let vfs = vaultfs::Vault::open(root).map_err(|_| DropErr::BadAttachDir)?;
     let mut out = Attached::default();
@@ -1124,7 +1193,7 @@ fn write_note_in(root: &Path, ix: &mut Index, name: &str, content: &str) -> Resu
     vaultfs::write_atomic(root, &frel, content.as_bytes()).map_err(|e| e.to_string())?;
     // index == disk: reparse this note, patch its outgoing edges
     // (a NEW key triggers a full in-memory edge rebuild inside upsert)
-    ix.upsert(&rel.display().to_string(), content);
+    ix.upsert(&vaultfs::rel_str(&rel), content);
     Ok(())
 }
 
@@ -1174,7 +1243,7 @@ fn create_note_in(root: &Path, ix: &mut Index, name: &str, content: &str) -> Res
         })?;
     f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
-    ix.upsert(&rel.display().to_string(), content);
+    ix.upsert(&vaultfs::rel_str(&rel), content);
     Ok(())
 }
 
@@ -1220,7 +1289,7 @@ fn move_note_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> Result<(us
     // LATER: file watcher) gets its [[old]] links rewritten too. One walk per
     // rename — the hot paths (search/graph/backlinks) stay disk-free.
     *ix = Index::build(root);
-    let (okey, nkey) = (orel.display().to_string(), nrel.display().to_string());
+    let (okey, nkey) = (vaultfs::rel_str(&orel), vaultfs::rel_str(&nrel));
     // counted BEFORE the move, off the freshly-resynced index
     let radius = ix.rename_blast(&okey, &nkey);
     // audit #6: claim (O_EXCL|O_NOFOLLOW) + renameat, both relative to parent
@@ -1256,8 +1325,8 @@ fn move_note_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> Result<(us
    preserving alias, #anchor and embed form (index::rewrite_links). Returns
    how many files were written. Never called without the user's answer. */
 fn update_links_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> usize {
-    let okey = safe_rel(old).map(|p| p.display().to_string()).unwrap_or_default();
-    let nkey = safe_rel(new).map(|p| p.display().to_string()).unwrap_or_default();
+    let okey = safe_rel(old).map(|p| vaultfs::rel_str(&p)).unwrap_or_default();
+    let nkey = safe_rel(new).map(|p| vaultfs::rel_str(&p)).unwrap_or_default();
     let mut wrote = 0;
     let Ok(vfs) = vaultfs::Vault::open(root) else { return 0 };
     for (n, c) in ix.rewrite_to(&okey, &nkey) {
@@ -1566,7 +1635,7 @@ const TRASH_DIR: &str = ".trash";
 /// what the UI reports, and what a test reads the original bytes back from.
 fn delete_note_in(root: &Path, ix: &mut Index, name: &str) -> Result<String, String> {
     let rel = safe_rel(name).ok_or("invalid name")?;
-    let key = rel.display().to_string();
+    let key = vaultfs::rel_str(&rel);
     let frel = note_rel(name).ok_or("invalid name")?;
     // S2: confined to the vault, and never through a symlinked leaf/parent
     let p = note_path_in(root, name, false).ok_or("invalid name")?;
@@ -1588,7 +1657,7 @@ fn delete_note_in(root: &Path, ix: &mut Index, name: &str) -> Result<String, Str
             // index==disk: the key is gone, so every inbound link stops resolving
             // and R24.9's faded rendering appears. No other note is touched.
             ix.remove(&key);
-            dest.display().to_string()
+            vaultfs::rel_str(&dest)
         })
         .map_err(|e| format!("cannot move the note to the vault trash: {e}"))
 }
@@ -1611,7 +1680,7 @@ fn vault_get(v: State<Vault>) -> Option<String> {
 /* R1.6 vault persistence: ~/.opensidian.json {"last": path, "list": [paths]}.
    Written only on explicit open/create — VAULT_DIR boots (probes) never touch it. */
 fn cfg_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())).join(".opensidian.json")
+    plat::home().join(".opensidian.json")
 }
 
 /// whole config as a Value, read under the shared cfg lock (cfgstore.rs)
@@ -2049,7 +2118,7 @@ static WIN_TRACK: Mutex<winsize::Track> = Mutex::new(winsize::Track::new());
 
 /// the record's key: the canonical vault path
 fn winsize_key(p: &Path) -> String {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).display().to_string()
+    plat::canon(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string()
 }
 
 /// setup: sanitise the record against the monitors' work areas, then size,
@@ -2188,6 +2257,7 @@ fn spawn_checked(p: &Path, sw: Option<&spawn::Switch>) -> Result<u32, String> {
 /// vaultbleed D: what the unconfined spawner (spawner.rs) does for a confined
 /// window. Every check runs HERE again — the request comes from a process the
 /// sandbox exists to distrust.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Landlock helper builds one
 struct LiveSpawner;
 
 impl spawner::Handler for LiveSpawner {
@@ -2285,10 +2355,43 @@ fn save_debounce_ms() -> u64 {
         .unwrap_or(250)
 }
 
+/// S4 on Windows: a plain `X:\...` path only — no UNC share, no verbatim or
+/// device form (`\\?\`, `\\.\`), no dot-component. The system trees are
+/// denied (names compared without case, as the filesystem does); the user's
+/// profile stays browsable wherever it lives.
+#[cfg(windows)]
+fn picker_allows(p: &Path) -> bool {
+    use std::path::Prefix;
+    let mut it = p.components();
+    if !matches!(it.next(), Some(Component::Prefix(pre)) if matches!(pre.kind(), Prefix::Disk(_))) {
+        return false;
+    }
+    if it.next() != Some(Component::RootDir) {
+        return false;
+    }
+    if it.any(|c| !matches!(c, Component::Normal(s) if !s.to_string_lossy().starts_with('.'))) {
+        return false;
+    }
+    let low = |x: &Path| x.to_string_lossy().to_lowercase();
+    let under = |base: &Path| {
+        let (a, b) = (low(p), low(base));
+        let b = b.trim_end_matches('\\');
+        !b.is_empty() && (a == b || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('\\')))
+    };
+    if under(&plat::home()) {
+        return true;
+    }
+    !["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .any(|d| under(Path::new(&d)))
+}
+
 /// S4: the picker commands take arbitrary absolute paths from the webview.
 /// Deny system trees and any dot-component (hidden dirs, `..`); /workspace
 /// and $HOME stay browsable even when they sit under a denied prefix (e.g.
 /// HOME=/root). /, /home, /mnt, /media, /run/media, /tmp remain open.
+#[cfg(not(windows))]
 fn picker_allows(p: &Path) -> bool {
     const DENY: [&str; 8] = ["/proc", "/sys", "/dev", "/etc", "/usr", "/boot", "/root", "/var"];
     if !p.is_absolute() {
@@ -2353,7 +2456,7 @@ fn resolve_vault_arg(a: &std::ffi::OsStr) -> Result<PathBuf, String> {
     if s.is_empty() {
         return Err("empty path".into());
     }
-    let p = fs::canonicalize(s).map_err(|e| match e.kind() {
+    let p = plat::canon(Path::new(s)).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "does not exist".to_string(),
         _ => e.to_string(),
     })?;
@@ -2404,7 +2507,27 @@ fn argv_vault(args: &[std::ffi::OsString], env_set: bool) -> Option<PathBuf> {
 
 #[tauri::command]
 fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    plat::home_string()
+}
+
+/// Windows: ask for a folder with the system's own dialog (pick_win.rs), modal
+/// to this window. Ok(None) = cancelled. The answer is only a PROPOSAL: the
+/// page hands it to pick_vault / create_vault, where vault_rules decides.
+/// Elsewhere there is no such dialog and the in-app list is the picker; the
+/// page never calls this there (ui/main.js WIN).
+#[tauri::command]
+async fn pick_folder(win: tauri::Window, title: Option<String>, start: Option<String>) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let owner = win.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        let title = title.unwrap_or_else(|| "Choose a folder".into());
+        return tauri::async_runtime::spawn_blocking(move || pick_win::pick_folder(owner, title, start)).await.map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (win, title, start);
+        Err("no system folder dialog on this platform".into())
+    }
 }
 
 /// S1: the only way an external URL leaves the app — the webview never
@@ -2419,14 +2542,18 @@ fn open_external(url: String) -> Result<(), String> {
     check_external(&url)?;
     // std::process::Command only — no shell, no opener plugin. Missing xdg-open
     // (headless smoke, minimal hosts) is a plain Err, never a fallback.
-    std::process::Command::new("xdg-open")
+    // Windows has no opener program to run: the shell's own handler (plat.rs).
+    #[cfg(windows)]
+    return plat::shell_open(url.as_ref()).map_err(|e| format!("open: {e}"));
+    #[cfg(not(windows))]
+    return std::process::Command::new(plat::OPENER)
         .arg(&url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("xdg-open: {e}"))
+        .map_err(|e| format!("{}: {e}", plat::OPENER));
 }
 
 #[tauri::command]
@@ -2443,9 +2570,31 @@ fn list_dirs(path: String) -> Vec<String> {
     })
 }
 
+/// Windows hides a folder with an attribute, not with a leading dot: what
+/// Explorer does not show by default (hidden or system: `$Recycle.Bin`,
+/// `AppData`, `System Volume Information`) is not offered either, and neither
+/// are the legacy junctions (`Application Data`, `Cookies`) that lead nowhere
+/// a user may read. Typing such a path by hand still works.
+#[cfg(windows)]
+fn picker_shows(e: &fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+    e.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_OR_SYSTEM == 0 && !m.file_type().is_symlink())
+}
+#[cfg(not(windows))]
+fn picker_shows(_: &fs::DirEntry) -> bool {
+    true
+}
+
 /// the picker listing itself (S4 rules), in-process or in the spawner
 fn list_dirs_here(path: &str) -> Vec<String> {
     {
+        // Windows: there is no single root. The empty path is the level above
+        // the drives, and what it lists is the drives themselves (`C:\`, ...).
+        #[cfg(windows)]
+        if path.is_empty() {
+            return plat::drives();
+        }
         if !picker_allows(Path::new(&path)) {
             return vec![]; // S4: the picker just shows ".." there
         }
@@ -2454,6 +2603,7 @@ fn list_dirs_here(path: &str) -> Vec<String> {
             .flatten()
             .flatten()
             .filter(|e| e.path().is_dir())
+            .filter(picker_shows)
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| !n.starts_with('.'))
             .collect();
@@ -3373,7 +3523,7 @@ fn mint_vault_id() -> Option<String> {
 fn vault_id(v: State<Vault>, mint: Option<bool>) -> Option<String> {
     span_timed!("vault_id", (|| -> Option<String> {
         let root = cur_vault(&v)?;
-        let key = fs::canonicalize(&root).unwrap_or(root).display().to_string();
+        let key = plat::canon(&root).unwrap_or(root).display().to_string();
         if let Some(id) = cfg_value()["vault_ids"][key.as_str()].as_str() {
             return Some(id.to_string());
         }
@@ -3750,13 +3900,20 @@ fn desk_proc_spawn(
     args: Option<Vec<String>>,
     cwd: Option<String>,
     env: Option<std::collections::BTreeMap<String, String>>,
+    verbatim: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
     if !plugins::is_trusted(&cfg_value(), &root) {
         return Err("EPERM: restricted mode, plugins cannot start programs".into());
     }
     let args: Vec<String> = args.unwrap_or_default().iter().map(|a| desk_proc::map_arg(&root, a)).collect();
-    let sp = desk_proc::Spec { file, args, cwd: desk_proc::map_cwd(&root, cwd.as_deref()), env: env.unwrap_or_default().into_iter().collect() };
+    let sp = desk_proc::Spec {
+        file,
+        args,
+        cwd: desk_proc::map_cwd(&root, cwd.as_deref()),
+        env: env.unwrap_or_default().into_iter().collect(),
+        verbatim: verbatim.unwrap_or(false),
+    };
     eprintln!("[desk] spawn {} {:?} cwd={}", sp.file, sp.args, sp.cwd.display());
     let run = span_timed!("desk_proc_spawn", desk_proc::start(sp))?;
     let pid = run.pid();
@@ -3898,7 +4055,10 @@ fn desk_shell(v: State<Vault>, op: String, target: String) -> Result<(), String>
         _ => return Err(format!("EINVAL: unknown shell op {op}")),
     };
     eprintln!("[desk] shell {op} {}", arg.to_string_lossy());
-    std::process::Command::new("xdg-open")
+    #[cfg(windows)]
+    return plat::shell_open(&arg).map_err(|e| format!("ENOENT: open: {e}"));
+    #[cfg(not(windows))]
+    return std::process::Command::new(plat::OPENER)
         .arg(&arg)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -3909,7 +4069,7 @@ fn desk_shell(v: State<Vault>, op: String, target: String) -> Result<(), String>
                 let _ = c.wait();   // reap it, no zombie
             });
         })
-        .map_err(|e| format!("ENOENT: xdg-open: {e}"))
+        .map_err(|e| format!("ENOENT: {}: {e}", plat::OPENER));
 }
 
 /* ---- themefs R5 (themes): the listing predicate is the oracle's, verbatim
@@ -5686,6 +5846,19 @@ fn drag_path(is_x11: bool, moveresize_advertised: bool, position_honoured: Optio
     }
 }
 
+/// The path for THIS session. Linux: `drag_path` over the probe. Windows: always
+/// "wm" — handing the press to the system (start_dragging) is what gives the
+/// user Aero Snap, Snap Layouts and drag-to-top-maximises; moving the window
+/// ourselves works but offers none of them. Nothing is measured there: a
+/// top-level window is always moved by the system's own loop.
+fn session_path(proto: &DragProto) -> &'static str {
+    if cfg!(windows) {
+        return "wm";
+    }
+    let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
+    drag_path(proto.x11, proto.moveresize, honoured)
+}
+
 /// What this session lets us do, probed once at setup + refined by measurement.
 struct DragProto {
     /// is the live GdkDisplay an X11 one (a real X server OR XWayland)?
@@ -5747,8 +5920,7 @@ fn probe_drag_proto() -> DragProto {
 /// re-read after each drag because the empirical half can flip it mid-session.
 #[tauri::command]
 fn win_move_proto(proto: tauri::State<'_, DragProto>) -> String {
-    let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
-    drag_path(proto.x11, proto.moveresize, honoured).to_string()
+    session_path(&proto).to_string()
 }
 
 /// R33.6b: hand the press to the WM/compositor when this session will not let the
@@ -5778,8 +5950,7 @@ fn win_drag_start(win: tauri::Window, proto: tauri::State<'_, DragProto>) -> Res
     span_timed!(
         "win_drag_start",
         {
-            let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
-            let p = drag_path(proto.x11, proto.moveresize, honoured);
+            let p = session_path(&proto);
             taken = p;
             // Written by the process that actually asks, for the same reason
             // win_gesture logs: a title census that stops updating looks exactly
@@ -5845,6 +6016,7 @@ static QUIT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static QUIT_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static QUIT_T0: OnceLock<std::time::Instant> = OnceLock::new();
 /// write end of the SIGTERM self-pipe (-1 = no handler installed)
+#[cfg(target_os = "linux")]
 static TERM_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5867,6 +6039,7 @@ fn quit_step(armed: bool, already_asked: bool) -> QuitStep {
 /// SIGTERM back to its default disposition and re-raised: the exit status a
 /// TERM'd process has always had
 fn term_default() -> ! {
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::raise(libc::SIGTERM);
@@ -5935,6 +6108,7 @@ fn quit_ready(app: tauri::AppHandle, dirty: Option<u32>) {
     app.exit(0);
 }
 
+#[cfg(target_os = "linux")]
 extern "C" fn on_term(_: libc::c_int) {
     // async-signal-safe: one write(2) to the self-pipe, nothing else
     let fd = TERM_FD.load(std::sync::atomic::Ordering::SeqCst);
@@ -5947,6 +6121,7 @@ extern "C" fn on_term(_: libc::c_int) {
 /// SIGTERM -> self-pipe -> a plain thread -> quit_request. The handler itself
 /// only writes one byte; a caught disposition resets to default across exec, so
 /// processes we spawn (desk_proc) keep the stock SIGTERM.
+#[cfg(target_os = "linux")]
 fn install_term(app: tauri::AppHandle) {
     let mut fds = [0 as libc::c_int; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -5977,6 +6152,13 @@ fn install_term(app: tauri::AppHandle) {
         }
     });
 }
+
+/// Off Linux there is no SIGTERM path yet. Windows has no such signal: a polite
+/// stop arrives as a window close (WM_CLOSE, `taskkill` without /F), which
+/// `quit_event` already holds for the flush. macOS: pipe2 does not exist there;
+/// to be written with pipe + fcntl (windows-port/AUDIT.md, point F).
+#[cfg(not(target_os = "linux"))]
+fn install_term(_app: tauri::AppHandle) {}
 
 /* ---------- R36 INTERFACE ZOOM (operator, 2026-09-14: "interface wide zoom,
    not only text") ----------------------------------------------------------
@@ -6085,8 +6267,17 @@ fn set_zoom_cfg(level: f64) {
 /// (any local server answering that name), and matching on the scheme alone
 /// admitted tauri://<any host>. The image scheme is a subresource (<img src>),
 /// never a navigation target, so it is not listed.
+#[cfg(not(windows))]
 fn nav_allowed(u: &tauri::Url) -> bool {
     u.scheme() == "tauri" && u.host_str() == Some("localhost") && u.port().is_none()
+}
+
+/// Windows: WebView2 serves frontendDist as `http://tauri.localhost` (Tauri v2
+/// default, useHttpsScheme off). Same rule, same strictness: exact scheme, exact
+/// host, no port — `http://tauri.localhost:8080` is some local server, not us.
+#[cfg(windows)]
+fn nav_allowed(u: &tauri::Url) -> bool {
+    u.scheme() == "http" && u.host_str() == Some("tauri.localhost") && u.port().is_none()
 }
 
 fn main() {
@@ -6097,7 +6288,13 @@ fn main() {
     // vaultbleed D: `opensidian --opensidian-spawner` is the unconfined helper a
     // confined window started (spawner.rs) — it serves fd 0 and is nothing else
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(spawner::ARG)) {
+        #[cfg(target_os = "linux")]
         std::process::exit(spawner::run(&LiveSpawner));
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("opensidian: {} is the Landlock helper and exists on Linux only", spawner::ARG);
+            std::process::exit(2);
+        }
     }
     // perf-console: state the rule on the console BEFORE anything can breach it.
     // ONE line, printed unconditionally (breach or not), so "unusually long" is a
@@ -6131,7 +6328,7 @@ fn main() {
     //   RUSTIDIAN_LL_ALONE          -> OPENSIDIAN_LL_ALONE (test only)
     //   RUSTIDIAN_OTELSINK_CHILD    -> OPENSIDIAN_OTELSINK_CHILD (test only)
     //   localStorage rustidian.graphRenderer -> opensidian.graphRenderer (hidden dev knob)
-    migrate::run_home(&PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())));
+    migrate::run_home(&plat::home());
     // VAULT_DIR (probes/tests) wins; else the argv vault (vaultarg, README §2) —
     // resolved HERE, before sandbox::enforce below; else last persisted vault if
     // still a dir (R1.6)
@@ -6154,6 +6351,7 @@ fn main() {
     // landlock: OPT-IN since 2026-09-30 (operator). OPENSIDIAN_LANDLOCK=1 confines
     // the whole process tree to the vault before webkit spawns;
     // OPENSIDIAN_NO_LANDLOCK wins. Both switches are named ONCE, in sandbox.rs.
+    #[cfg(target_os = "linux")]
     if sandbox::landlock_enabled() {
         if let Some(p) = &init {
             // vaultbleed D: the unconfined spawner, started BEFORE the ruleset
@@ -6173,6 +6371,11 @@ fn main() {
         }
     } else {
         eprintln!("{}", sandbox::OFF_LINE);
+    }
+    // no Landlock here: say so only to someone who asked for it
+    #[cfg(not(target_os = "linux"))]
+    if std::env::var_os(sandbox::LANDLOCK_ENV).is_some() {
+        eprintln!("{}", sandbox::UNAVAILABLE_LINE);
     }
     // R3 (item 4): the built-ins are FILES, and this is where a vault with no
     // `.obsidian/themes/` gets them — AFTER landlock, deliberately: seeding
@@ -6264,7 +6467,7 @@ fn main() {
                     "[win_drag] session: x11={} _NET_WM_MOVERESIZE={} -> path {}",
                     proto.x11,
                     proto.moveresize,
-                    drag_path(proto.x11, proto.moveresize, None)
+                    session_path(&proto)
                 );
                 let wayland = !proto.x11;
                 app.manage(proto);
@@ -6358,12 +6561,16 @@ fn main() {
                 }));
             }
             let res = match root.as_deref().and_then(|r| serve_image(r, &target)) {
-                Some((mime, body)) => tauri::http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", mime)
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Cache-Control", "no-store")
-                    .body(body),
+                Some((mime, body)) => {
+                    let b = tauri::http::Response::builder()
+                        .status(200)
+                        .header("Content-Type", mime)
+                        .header("X-Content-Type-Options", "nosniff")
+                        .header("Cache-Control", "no-store");
+                    // an SVG is a document format: inert even if opened as one
+                    let b = if mime == "image/svg+xml" { b.header("Content-Security-Policy", SVG_CSP) } else { b };
+                    b.body(body)
+                }
                 None => tauri::http::Response::builder().status(404).body(Vec::new()),
             }
             .expect("img response");
@@ -6395,7 +6602,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_notes, list_images, canvas_io, canvas_attach, paste_image, read_note, write_note, create_note, render, render_blocks, block_lines, render_view, highlight_blocks, graph, graph_local, graph_view, vault_get, pick_vault,
-            create_vault, create_vault_dir, open_vault_window, switch_show, switch_ready, boot_notice, home_dir, list_dirs, list_folders, create_dir, backlinks, search,
+            create_vault, create_vault_dir, open_vault_window, switch_show, switch_ready, boot_notice, home_dir, pick_folder, list_dirs, list_folders, create_dir, backlinks, search,
             list_bookmarks, toggle_bookmark, bookmark_rows, bm_group_new, bm_group_rename, bm_group_delete, bm_move, bm_add, bm_drag, bm_add_at, recent_vaults, rename_note, media_rename, media_read, move_note, update_links, delete_note, link_consent, set_link_consent, strict_line_breaks, set_strict_line_breaks, qs_new_name, readable_line_length, graph_settings, set_graph_settings, tags, tag_counts,
             get_sidebar_w, set_sidebar_w, log_spans, graph_renderer_pref, type_probe, nob_probe, psg_probe, vb_probe, smoke_css,
             read_workspace, write_workspace,
@@ -6464,6 +6671,7 @@ mod tests {
         assert!(ui.contains("savesInFlight.add("));
     }
 
+    #[cfg(not(windows))] // asserts the WebKit origin tauri://localhost
     #[test]
     fn appguard_nav_app_origin_allowed() {
         assert!(nav("tauri://localhost"));
@@ -6471,6 +6679,7 @@ mod tests {
         assert!(nav("tauri://localhost/#/note"));
     }
 
+    #[cfg(not(windows))] // asserts the WebKit origin tauri://localhost
     #[test]
     fn appguard_nav_lookalikes_refused() {
         for u in [
@@ -6617,8 +6826,11 @@ mod tests {
     }
 
     /// git-chmod: chmod rides the trusted sync route only, mode masked to 0o777
+    #[cfg(unix)]
     #[test]
     fn vfs_sync_chmod_is_trusted_masked_and_confined() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let root = tmp_vault("vfssync-chmod");
         fs::write(root.join("h.sh"), "#!/bin/sh\n").unwrap();
@@ -6644,6 +6856,7 @@ mod tests {
     }
 
     /* goal insdate REQ-3/REQ-4: templates.json is read per key, never written. */
+    #[cfg(unix)]
     #[test]
     fn templates_json_is_read_per_key_and_never_written() {
         let root = tmp_vault("insdate");
@@ -6710,8 +6923,11 @@ mod tests {
     /// W5 + audit #5: a write that FAILS must leave the previous layout
     /// byte-identical. The failure is forced by a symlinked `.obsidian`: the
     /// no-follow walk refuses it, so the layout it points at is never touched.
+    #[cfg(unix)]
     #[test]
     fn w5_a_failed_layout_write_leaves_the_old_file_intact() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("wsfail");
         let outside = std::env::temp_dir().join(format!("opensidian-wsfail-out-{}", std::process::id()));
@@ -6730,8 +6946,11 @@ mod tests {
     /// W5 + audit #2: a leftover `workspace.json.tmp` (the old fixed temp name,
     /// e.g. from a crash, or PLANTED as a symlink) neither blocks the next
     /// write nor is followed: the temp name is random and O_EXCL.
+    #[cfg(unix)]
     #[test]
     fn w5_a_stale_temp_from_a_crash_is_replaced_not_obeyed() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("wsstale");
         let p = workspace_path(&root);
@@ -7301,8 +7520,11 @@ mod tests {
     /// renderers resolve against, so anything wrongly in it is a URL the
     /// webview will ask for: hidden dirs, symlinks and non-image extensions
     /// must stay out, and the extension set must match the byte server's.
+    #[cfg(unix)]
     #[test]
     fn index_lists_vault_images_only() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         // the renderer's allowlist and the byte server's table cannot drift:
         // a name the index resolves but serve_image refuses is a broken image
@@ -7328,7 +7550,7 @@ mod tests {
         }
         symlink(outside.join("secret.png"), root.join("link.png")).unwrap();
         let ix = Index::build(&root);
-        assert_eq!(ix.images(), ["UP.JPG", "pic.png", "sub/nested.webp"], "{:?}", ix.images());
+        assert_eq!(ix.images(), ["UP.JPG", "doc.svg", "pic.png", "sub/nested.webp"], "{:?}", ix.images());
         assert_eq!(ix.names(), ["A"], "images must never become notes");
         let _ = fs::remove_dir_all(&outside);
     }
@@ -7349,7 +7571,7 @@ mod tests {
             let h = render_with(md, &[], ix.images(), true);
             let i = h.find("src=\"").unwrap_or_else(|| panic!("no img for {md}: {h}")) + 5;
             let url = h[i..].split('"').next().unwrap();
-            let target = url.strip_prefix(&format!("{IMG_SCHEME}://localhost/")).expect(url);
+            let target = url.strip_prefix(&format!("{IMG_BASE}")).expect(url);
             // exactly the path the protocol handler passes to serve_image
             let (mime, bytes) = serve_image(&root, target).unwrap_or_else(|| panic!("{md} -> {url} served nothing"));
             assert_eq!(bytes, png, "{md}");
@@ -7374,12 +7596,12 @@ mod tests {
         let rmd = |c: &str| render_with(c, &[], &imgs, false);
         // R29.2 relative path, alt preserved and escaped
         let h = rmd("![a pic](pic.png)");
-        assert_eq!(src(&h), format!("{IMG_SCHEME}://localhost/pic.png"), "{h}");
+        assert_eq!(src(&h), format!("{IMG_BASE}pic.png"), "{h}");
         assert!(h.contains(r#"alt="a pic""#), "{h}");
         // subfolder: full path AND bare basename resolve to the same file
         let full = rmd("![](sub/nested.png)");
         let bare = rmd("![](nested.png)");
-        assert_eq!(src(&full), format!("{IMG_SCHEME}://localhost/sub/nested.png"), "{full}");
+        assert_eq!(src(&full), format!("{IMG_BASE}sub/nested.png"), "{full}");
         assert_eq!(src(&bare), src(&full), "basename must resolve like the path");
         // R29.1: the wikilink embed form agrees with the markdown form, exactly
         assert_eq!(src(&rmd("![[pic.png]]")), src(&rmd("![](pic.png)")));
@@ -7387,7 +7609,7 @@ mod tests {
         assert!(!rmd("![[pic.png]]").contains('!'), "bang leaked as text");
         // R29.3: %20 resolves and comes back percent-ENCODED in the url
         let h = rmd("![](my%20pic.png)");
-        assert_eq!(src(&h), format!("{IMG_SCHEME}://localhost/my%20pic.png"), "{h}");
+        assert_eq!(src(&h), format!("{IMG_BASE}my%20pic.png"), "{h}");
         // R29.3 second half: a RAW space is not an image at all (pulldown), text
         let h = rmd("![](my pic.png)");
         assert!(!h.contains("<img") && h.contains("![](my pic.png)"), "{h}");
@@ -8459,6 +8681,7 @@ mod tests {
     /// search entry, every ctime — the fixture's own; the new ctime is
     /// normalised). Then the refusals: an already-bookmarked note (top level
     /// AND nested) and a file row as parent return Err with the tree unchanged.
+    #[cfg(unix)]
     #[test]
     fn bm_add_at_painted_slot_round_trips_byte_wise() {
         let orig: &str =
@@ -8960,6 +9183,7 @@ mod tests {
 
     /// ...and an app.json we cannot parse is REFUSED, byte-for-byte intact.
     /// Same rule as the collision: data loss outranks the feature.
+    #[cfg(unix)]
     #[test]
     fn set_link_consent_never_overwrites_an_unparseable_config() {
         let root = r34_vault("badcfg");
@@ -9089,6 +9313,7 @@ mod tests {
 
     /// an unparsable or non-object graph.json is refused, not replaced; foreign
     /// keys and wrongly typed values are refused before anything is written
+    #[cfg(unix)]
     #[test]
     fn graphforces_refuses_bad_file_and_bad_patch() {
         let root = r34_vault("graphforces-refuse");
@@ -9183,8 +9408,11 @@ mod tests {
 
     /// audit #1: the consented link rewrite writes fd-relative and skips a
     /// note that became a symlink after the index saw it
+    #[cfg(unix)]
     #[test]
     fn vaultfs_link_rewrite_skips_a_note_swapped_for_a_symlink() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("vfs-links");
         let outside = std::env::temp_dir().join(format!("opensidian-vfs-links-out-{}", std::process::id()));
@@ -9212,8 +9440,11 @@ mod tests {
 
     /// audit #2/#4 at the command core: save + new note never follow a planted
     /// temp symlink or a symlinked parent
+    #[cfg(unix)]
     #[test]
     fn vaultfs_note_save_and_create_refuse_symlinks() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("vfs-save");
         let outside = std::env::temp_dir().join(format!("opensidian-vfs-save-out-{}", std::process::id()));
@@ -9241,8 +9472,11 @@ mod tests {
     /// out of the vault, EVERY config writer refuses — app.json, the layout,
     /// bookmarks, appearance.json and the built-in theme seed — and nothing
     /// is created or changed behind the link
+    #[cfg(unix)]
     #[test]
     fn vaultfs_symlinked_obsidian_refuses_every_config_write() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("vfs-obs");
         let outside = std::env::temp_dir().join(format!("opensidian-vfs-obs-out-{}", std::process::id()));
@@ -9265,8 +9499,11 @@ mod tests {
 
     /// audit #6: delete-to-trash, move, mkdir and attachment drop refuse a
     /// symlinked directory in the vault and create NOTHING behind it.
+    #[cfg(unix)]
     #[test]
     fn vaultfs_trash_move_mkdir_drop_refuse_symlinked_dirs() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("vfs-mv");
         let outside = std::env::temp_dir().join(format!("opensidian-vfs-mv-out-{}", std::process::id()));
@@ -9301,8 +9538,11 @@ mod tests {
     }
 
     /// audit #9: the sidebar folder walk never descends a symlinked dir
+    #[cfg(unix)]
     #[test]
     fn vaultfs_list_folders_skips_symlinked_dirs_and_cycles() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("vfs-lf");
         let outside = std::env::temp_dir().join(format!("opensidian-vfs-lf-out-{}", std::process::id()));
@@ -9322,8 +9562,11 @@ mod tests {
     /// audit #6, the race: the trash dir (and a move's target dir) is swapped
     /// for a symlink AFTER it was resolved. The rename goes through the held
     /// dir fd, so the note lands in the moved real dir — never outside.
+    #[cfg(unix)]
     #[test]
     fn vaultfs_dir_swapped_mid_trash_and_move_never_leaves_the_vault() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("vfs-race");
         let outside = std::env::temp_dir().join(format!("opensidian-vfs-race-out-{}", std::process::id()));
@@ -9360,8 +9603,11 @@ mod tests {
 
     /// S2: symlinked dir + file inside the vault are invisible: not indexed,
     /// not snapshotted, not readable, not writable, not creatable-through
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_not_part_of_the_vault() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("sym");
         let outside = std::env::temp_dir().join(format!("opensidian-sym-out-{}", std::process::id()));
@@ -9399,6 +9645,43 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    /// SVG is served on one condition (IMG_TYPES): it is only ever shown as an
+    /// image. Pinned here: the embed is an <img>, nothing else; and the policy the
+    /// response carries runs no script, opens no connection and sandboxes it.
+    #[test]
+    fn svg_embeds_are_images_and_their_response_policy_is_inert() {
+        let root = tmp_vault("svg-embed");
+        fs::write(root.join("logo.svg"), "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>").unwrap();
+        let ix = Index::build(&root);
+        assert_eq!(ix.images(), ["logo.svg"]);
+        let h = image_html(ix.images(), "logo.svg", "");
+        assert!(h.starts_with("<img ") && h.contains(&format!("src=\"{IMG_BASE}logo.svg\"")), "{h}");
+        for tag in ["<object", "<iframe", "<embed", "<svg", "<script"] {
+            assert!(!h.contains(tag), "{tag} in {h}");
+        }
+        let d: Vec<&str> = SVG_CSP.split(';').map(str::trim).collect();
+        assert!(d.contains(&"default-src 'none'") && d.contains(&"sandbox"), "{SVG_CSP}");
+        assert!(!SVG_CSP.contains("script-src") && !SVG_CSP.contains("connect-src") && !SVG_CSP.contains("http"), "{SVG_CSP}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// the 2D drawing of a 3D model is found next to it, returned vault-relative
+    /// with '/', and only if the frame could fetch it (a PDF, a regular file)
+    #[test]
+    fn pdf_twin_is_the_drawing_beside_the_model_or_nothing() {
+        let root = tmp_vault("pdftwin");
+        fs::create_dir_all(root.join("sub/dir")).unwrap();
+        for f in ["sub/dir/Chassis - 3D.PDF", "sub/dir/Chassis.pdf", "sub/dir/Lone - 3D.pdf", "sub/dir/Odd - 3D.pdf"] {
+            fs::write(root.join(f), b"%PDF-1.6\n").unwrap();
+        }
+        fs::create_dir_all(root.join("sub/dir/Odd.pdf")).unwrap();   // a FOLDER named like the twin
+        assert_eq!(pdf_twin_in(&root, "sub/dir/Chassis%20-%203D.PDF").as_deref(), Some("sub/dir/Chassis.pdf"));
+        assert_eq!(pdf_twin_in(&root, "sub/dir/Lone%20-%203D.pdf"), None, "no drawing next to it");
+        assert_eq!(pdf_twin_in(&root, "sub/dir/Odd%20-%203D.pdf"), None, "a folder is not a drawing");
+        assert_eq!(pdf_twin_in(&root, "../x%20-%203D.pdf"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// R29 images, POSITIVE half: the shapes that MUST serve bytes. Kept next
     /// to the traversal test because a containment check that refuses
     /// everything also passes the negative one.
@@ -9419,8 +9702,9 @@ mod tests {
         assert_eq!(serve_image(&root, "UPPER.PNG").unwrap().0, "image/png");
         assert_eq!(serve_image(&root, "sub/nested.jpeg").unwrap().0, "image/jpeg");
         assert_eq!(serve_image(&root, "pic.png").unwrap().1, px.to_vec());
-        // R29.8: svg is NOT in v1 (scriptable, no sanitizer here); non-images never
-        assert_eq!(img_path_in(&root, "vec.svg"), None);
+        // R29.8: svg is served, as svg (IMG_TYPES says why that is safe); non-images never
+        assert_eq!(img_path_in(&root, "vec.svg"), Some(croot.join("vec.svg")));
+        assert_eq!(serve_image(&root, "vec.svg").unwrap().0, "image/svg+xml");
         assert_eq!(img_path_in(&root, "doc.md"), None);
         assert_eq!(img_path_in(&root, "pic"), None);
         // R29.4: a missing file serves nothing — same None as an escape, no leak
@@ -9440,8 +9724,11 @@ mod tests {
     /// The positive control (a genuinely SYMLINKED VAULT still serves) is in
     /// the same test on purpose: canonicalizing only one side passes one half
     /// and fails the other, which is the likely failure mode.
+    #[cfg(unix)]
     #[test]
     fn img_traversal_and_symlink_escapes_serve_no_bytes() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let root = tmp_vault("img-esc");
         let outside = std::env::temp_dir().join(format!("opensidian-img-out-{}", std::process::id()));
@@ -9530,9 +9817,9 @@ mod tests {
     fn media_rename_refuses_an_extension_change_or_non_media() {
         let (root, outside) = media_vault("mren-ext");
         fs::write(root.join("n.md"), b"#").unwrap();
-        fs::write(root.join("v.svg"), b"<svg/>").unwrap();
+        fs::write(root.join("v.html"), b"<html/>").unwrap();
         fs::write(root.join("pic.png"), b"png").unwrap();
-        for (a, b) in [("tone.mp3", "tone.wav"), ("tone.mp3", "tone.md"), ("tone.mp3", "tone"), ("n.md", "n.mp3"), ("n.md", "m.md"), ("pic.png", "pic.jpg"), ("v.svg", "w.svg")] {
+        for (a, b) in [("tone.mp3", "tone.wav"), ("tone.mp3", "tone.md"), ("tone.mp3", "tone"), ("n.md", "n.mp3"), ("n.md", "m.md"), ("pic.png", "pic.jpg"), ("v.html", "w.html"), ("pic.png", "pic.svg")] {
             assert!(media_rename_in(&root, a, b).is_err(), "{a} -> {b}");
         }
         assert!(root.join("tone.mp3").is_file() && root.join("n.md").is_file());
@@ -9571,8 +9858,11 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn media_rename_refuses_symlinks() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let (root, outside) = media_vault("mren-link");
         symlink("/etc/hostname", root.join("evil.mp3")).unwrap();
@@ -9635,6 +9925,7 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn media_read_refuses_non_whitelisted_types() {
         let (root, outside) = media_vault("mread-ext");
@@ -9657,8 +9948,11 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn media_read_refuses_every_symlink_component() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let (root, outside) = media_vault("mread-link");
         // leaf link out of the vault (the gate's evil.mp3 -> /etc/hostname), leaf link
@@ -9782,6 +10076,7 @@ mod tests {
 
     /// S4: picker commands refuse system trees and dot-components, keep the
     /// roots the folder picker offers
+    #[cfg(unix)]
     #[test]
     fn picker_denies_system_paths_allows_user_roots() {
         for p in ["/etc", "/proc", "/etc/ssh", "/proc/self", "/sys", "/dev", "/usr/bin", "/boot", "/root", "/var/log",
@@ -9812,6 +10107,7 @@ mod tests {
 
     /// vaultarg README §3-§5: canonical dir ok (incl. spaces+unicode and `..`);
     /// missing / file / denied / empty / non-UTF-8 rejected and NOTHING created
+    #[cfg(unix)]
     #[test]
     fn vaultarg_resolve_rules() {
         let root = tmp_vault("vaultarg");
@@ -9832,6 +10128,8 @@ mod tests {
         assert!(resolve_vault_arg(std::ffi::OsStr::new("/etc")).unwrap_err().starts_with("not allowed"));
         assert_eq!(resolve_vault_arg(std::ffi::OsStr::new("")), Err("empty path".into()));
         {
+            #[cfg(unix)]
+            #[cfg(unix)]
             use std::os::unix::ffi::OsStrExt;
             let bad = std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe");
             assert_eq!(resolve_vault_arg(bad), Err("not valid UTF-8".into()));
@@ -9885,8 +10183,11 @@ mod tests {
     /// worked and the edit was gone. A refused write must reach the caller.
     /// Read-only vault dir = a real refusal (write_atomic must create a
     /// sibling temp in it), not a deleted file, which is a different path.
+    #[cfg(unix)]
     #[test]
     fn lw_link_mention_surfaces_a_refused_write() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         /// restores the mode even if an assert below panics — a test that
         /// dies with the fixture at 0555 poisons every later run
@@ -9930,8 +10231,11 @@ mod tests {
     /// sibling-temp + fsync + rename, not a truncating open. rename(2)
     /// installs a NEW inode over the name; a truncating write keeps the old
     /// one — that identity IS the window where a crash leaves a short file.
+    #[cfg(unix)]
     #[test]
     fn f3_note_write_is_sibling_temp_rename_not_a_truncating_open() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         let root = tmp_vault("f3");
         let p = root.join("Note.md");
@@ -10093,6 +10397,7 @@ mod tests {
        only places that could plausibly rewrite a file. The oracle is the
        whole vault's bytes AND mtimes, so a rewrite that happened to produce
        identical content elsewhere would still be caught. */
+    #[cfg(unix)]
     #[test]
     fn f20_an_existing_body_heading_survives_open_render_close_byte_for_byte() {
         let root = tmp_vault("f20keep");
@@ -10188,6 +10493,7 @@ mod tests {
        So the Rust half drives the REAL matcher over notes whose bodies cannot
        help (one zero-byte, one whose text never mentions its name), and the
        switcher half pins its data source + the field it matches on. */
+    #[cfg(unix)]
     #[test]
     fn f20_a_note_is_findable_by_its_title_now_that_the_title_is_not_in_the_body() {
         let root = tmp_vault("f20find");
@@ -10326,8 +10632,11 @@ mod tests {
     /// S1: a file manager can hand us anything. A symlink is REFUSED, not
     /// followed (following it is how a drop reads /etc/shadow into the vault),
     /// and so is a directory, a fifo and a path that is simply gone.
+    #[cfg(unix)]
     #[test]
     fn drop_refuses_symlink_dir_fifo_and_missing_sources() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let (root, srcd) = drop_vault("drop-s1");
         let real = src_file(&srcd, "real.png", b"\x89PNGreal");
@@ -10369,11 +10678,12 @@ mod tests {
     /// never content-sniffed. svg included: Obsidian renders it after sanitizing,
     /// we have no sanitizer (R29.8). pdfdrop: .pdf IS attachable now, but only
     /// when the bytes start with %PDF- — this png-bodied doc.pdf is a mismatch.
+    #[cfg(unix)]
     #[test]
     fn drop_refuses_everything_outside_img_types() {
         let (root, srcd) = drop_vault("drop-ext");
         let mut paths = Vec::new();
-        for n in ["doc.pdf", "arch.zip", "vec.svg", "pic.bmp", "note.md", "noext", "script.png.sh"] {
+        for n in ["doc.pdf", "arch.zip", "page.html", "pic.bmp", "note.md", "noext", "script.png.sh"] {
             paths.push(src_file(&srcd, n, b"\x89PNGdisguised-as-an-image"));
         }
         let a = attach_drop(&root, "Note", &paths).unwrap();
@@ -10466,8 +10776,11 @@ mod tests {
     /// Threat: vault/attachments -> /home/user, and every drop writes there.
     /// The positive control (a real subfolder works, and the link is still the
     /// BASENAME, which resolves by suffix) is in the same test on purpose.
+    #[cfg(unix)]
     #[test]
     fn drop_refuses_a_destination_that_leaves_the_vault() {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let (root, srcd) = drop_vault("drop-dest");
         let outside = std::env::temp_dir().join(format!("opensidian-drop-out-{}", std::process::id()));
@@ -10518,10 +10831,14 @@ mod tests {
         v.sort();
         v
     }
+    #[cfg(unix)]
     fn dev_of(p: &Path) -> u64 {
+        #[cfg(unix)]
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         fs::metadata(p).unwrap().dev()
     }
+    #[cfg(unix)]
     fn shm_src(tag: &str) -> PathBuf {
         let d = PathBuf::from(format!("/dev/shm/opensidian-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -10531,6 +10848,7 @@ mod tests {
     const BODY: &[u8] = b"\x89PNG\r\n\x1a\nosdrop-body-0123456789";
 
     /// the two roads, each proven by WHICH road it took, not just by the result
+    #[cfg(unix)]
     #[test]
     fn osdrop_import_moves_by_link_on_one_fs_and_by_verified_copy_across() {
         let (root, srcd) = drop_vault("osd-roads");
@@ -10557,6 +10875,7 @@ mod tests {
     }
 
     /// THE crash-safety criterion: a fault before the final rename, on both roads
+    #[cfg(unix)]
     #[test]
     fn osdrop_injected_failure_before_commit_leaves_source_intact_and_no_partial_file() {
         let shm = shm_src("osd-crash");
@@ -10623,6 +10942,7 @@ mod tests {
 
     /// a refused type is never touched, and a collision on the cross-fs road
     /// gets a new name without overwriting
+    #[cfg(unix)]
     #[test]
     fn osdrop_refused_untouched_and_crossfs_collision_renames() {
         let (root, _srcd) = drop_vault("osd-ref");
@@ -10649,6 +10969,7 @@ mod tests {
     /// `![[x.pdf]]` inserted, indexed so the embed resolves; .PDF in caps is the
     /// same type; collisions take `stem N.pdf` (stock: `recon-a 1.pdf`) and never
     /// overwrite.
+    #[cfg(unix)]
     #[test]
     fn pdfdrop_copies_a_pdf_on_both_filesystems_and_indexes_it() {
         let (root, srcd) = drop_vault("pdfd-ok");
@@ -10663,6 +10984,8 @@ mod tests {
         assert_eq!(sha(&s), want, "the source was modified");
         assert_eq!(sha(&root.join("paper.pdf")), want);
         {
+            #[cfg(unix)]
+            #[cfg(unix)]
             use std::os::unix::fs::MetadataExt;
             let (ms, mv) = (fs::metadata(&s).unwrap(), fs::metadata(root.join("paper.pdf")).unwrap());
             assert_ne!((ms.dev(), ms.ino()), (mv.dev(), mv.ino()), "same-fs PDF copy is a hard link, not a copy");
@@ -10699,6 +11022,7 @@ mod tests {
     /// byte is staged, on both roads; a refused source is untouched and the
     /// vault gains nothing (no temp either). A file shorter than the magic is a
     /// mismatch, not a read error.
+    #[cfg(unix)]
     #[test]
     fn pdfdrop_refuses_a_pdf_whose_bytes_are_not_pdf() {
         let (root, srcd) = drop_vault("pdfd-magic");
@@ -10852,7 +11176,7 @@ mod tests {
         assert_eq!(ix.images(), ["abe.png", "zed.png"], "sorted, deduped");
         assert_eq!(ix.images(), Index::build(&root).images(), "== a fresh walk");
         // and the resolver the renderers use finds it
-        assert!(image_html(ix.images(), "zed.png", "").contains("opensidian-img://localhost/zed.png"));
+        assert!(image_html(ix.images(), "zed.png", "").contains(&format!("{IMG_BASE}zed.png")));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&srcd);
     }
@@ -11280,6 +11604,7 @@ mod vaultbleed_tests {
 
     /* census C4: a fresh vault gets `.obsidian/app.json` = `{}`; an existing
        one (or a symlink in its place) is never rewritten or followed. */
+    #[cfg(unix)]
     #[test]
     fn vault_init_creates_app_json_only_when_absent() {
         let a = mk("appjson-fresh", &[("n", "x\n")]);
@@ -11475,5 +11800,34 @@ mod devui_guard {
     #[test]
     fn devui_guard_default_build_has_no_devui() {
         assert!(!cfg!(feature = "devui"));
+    }
+}
+
+/* Windows port: tauri.windows.conf.json is merged over tauri.conf.json on
+   Windows only, and the one thing it changes is the CSP. A security boundary
+   kept in two files drifts unless something ties them: the Windows policy must
+   be the base policy with the two custom schemes spelled the way WebView2
+   serves them, and nothing else. Runs on every OS — it reads two files. */
+#[cfg(test)]
+mod windows_conf_guard {
+    fn csp(conf: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(conf).unwrap()["app"]["security"]["csp"].as_str().expect("csp").to_string()
+    }
+
+    #[test]
+    fn windows_csp_is_the_base_csp_with_the_two_schemes_as_webview2_serves_them() {
+        let base = csp(include_str!("../tauri.conf.json"));
+        let win = csp(include_str!("../tauri.windows.conf.json"));
+        let want = base
+            .replace("opensidian-plugin:", "http://opensidian-plugin.localhost")
+            .replace("opensidian-img:", "http://opensidian-img.localhost");
+        assert_ne!(want, base, "the base CSP no longer names the two schemes");
+        assert_eq!(win, want);
+    }
+
+    #[test]
+    fn windows_conf_overrides_nothing_but_the_csp() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        assert_eq!(v, serde_json::json!({ "app": { "security": { "csp": v["app"]["security"]["csp"] } } }));
     }
 }

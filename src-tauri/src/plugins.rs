@@ -292,6 +292,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn serves_enabled_main_js_wrapped() {
         let r = vault("ok");
@@ -339,6 +340,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinks_out_are_refused() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let r = vault("sym");
         let outside = r.with_extension("outside");
@@ -424,6 +426,7 @@ mod tests {
         assert_eq!(set_enabled(&r, "good", true).unwrap(), vec!["good"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn data_json_is_confined() {
         let r = vault("data");
@@ -451,6 +454,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn data_json_symlinks_refused() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
         let r = vault("datasym");
         symlink(r.join("secret.md"), r.join(".obsidian/plugins/good/data.json")).unwrap();

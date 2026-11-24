@@ -184,7 +184,7 @@ pub fn paste_into(
             let _ = vfs.unlink(&rel); // reason: best effort — a half-written file must not stay; the error below is what matters
             return Err(PasteErr::Io(e.to_string()));
         }
-        let path = rel.to_string_lossy().to_string();
+        let path = crate::vaultfs::rel_str(&rel);
         let target = if taken(&name) { path.clone() } else { name.clone() };
         let text = if md_links { format!("![]({})", enc_uri(&target)) } else { format!("![[{target}]]") };
         return Ok(Pasted { text, path });
@@ -275,6 +275,7 @@ mod tests {
         let _ = fs::remove_dir_all(&r); // reason: test cleanup
     }
 
+    #[cfg(unix)]
     #[test]
     fn ghpaste_symlink_refused() {
         let r = vault("sym");

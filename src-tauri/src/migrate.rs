@@ -100,6 +100,9 @@ fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
         if ft.is_dir() {
             copy_dir(&src, &dst)?;
         } else if ft.is_symlink() {
+            // carried as a link on Unix. Windows: creating one needs a privilege
+            // most users lack, and the old data dir never existed there — skipped.
+            #[cfg(unix)]
             std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
         } else {
             fs::copy(&src, &dst)?;
@@ -141,11 +144,19 @@ const MAX_BM_BYTES: u64 = 4 * 1024 * 1024;
 
 fn carry_vault_file(vault: &Path, old: &str, new: &str) -> io::Result<Carry> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     if fs::symlink_metadata(vault.join(new)).is_ok() {
         return Ok(Carry::NewWins);
     }
-    let f = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(vault.join(old)) {
+    // the old dotfile ITSELF, never a link's target: O_NOFOLLOW fails the open
+    // on Unix; on Windows FILE_FLAG_OPEN_REPARSE_POINT (0x0020_0000) opens the
+    // link, which the is_file() check below then rejects
+    let mut oo = fs::OpenOptions::new();
+    oo.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut oo, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut oo, 0x0020_0000);
+    let f = match oo.open(vault.join(old)) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Carry::Neither),
         Err(e) => return Err(e), // ELOOP: a symlinked old dotfile is not carried
@@ -256,6 +267,7 @@ mod tests {
     /// outside path -> it "wins", nothing is created there; (b) OLD_BM is a
     /// symlink to an outside secret -> not carried; (c) a planted symlink at
     /// the old predictable scratch name is left alone.
+    #[cfg(unix)]
     #[test]
     fn vaultfs_vault_bookmark_carry_refuses_symlinks() {
         let v = tmp("bmlink");

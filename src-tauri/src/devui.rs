@@ -255,6 +255,7 @@ mod tests {
         assert_eq!(resolve(&r, "/plugins"), Resolve::Missing);
     }
 
+    #[cfg(unix)]
     #[test]
     fn devui_resolve_refuses_traversal() {
         let d = tmp("trav");

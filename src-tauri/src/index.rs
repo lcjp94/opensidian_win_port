@@ -454,7 +454,7 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<String>, imgs: &mut Vec<String>) 
             out.push(if rel.as_os_str().is_empty() {
                 stem.to_string()
             } else {
-                format!("{}/{}", rel.display(), stem)
+                format!("{}/{}", crate::vaultfs::rel_str(rel), stem)
             });
         }
     }
@@ -464,7 +464,7 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<String>, imgs: &mut Vec<String>) 
 /// (scriptable, no sanitizer here), `bmp`, `avif` (scope). main.rs::IMG_TYPES
 /// maps the SAME set to Content-Types and a unit test pins the two together:
 /// a name the index resolves but the byte server refuses is a broken image.
-pub const IMG_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+pub const IMG_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
 
 /// pdfembed: PDFs are embeddable vault members too (`![[f.pdf]]`). They ride
 /// the SAME list as images (one walk, one symlink policy, one resolver), and
@@ -481,7 +481,7 @@ fn img_rel(p: &Path, base: &Path, name: &str) -> Option<String> {
     Some(if dir.as_os_str().is_empty() {
         name.to_string()
     } else {
-        format!("{}/{name}", dir.display())
+        format!("{}/{name}", crate::vaultfs::rel_str(dir))
     })
 }
 
@@ -505,7 +505,7 @@ pub fn attachments_of(root: &Path) -> Vec<String> {
                 go(&p, base, out);
             } else if !name.ends_with(".md") {
                 if let Ok(rel) = p.strip_prefix(base) {
-                    out.push(rel.to_string_lossy().into_owned());
+                    out.push(crate::vaultfs::rel_str(rel));
                 }
             }
         }

@@ -33,7 +33,13 @@ use crate::cfgstore::Op;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+// The transport is a socketpair. The helper exists only because Landlock is
+// inherited (module comment), so only Linux ever starts one; the protocol and
+// the client are plain Read + Write and stay compiled (and tested) everywhere.
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as Sock;
+#[cfg(not(unix))]
+use std::net::TcpStream as Sock;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -70,6 +76,7 @@ pub enum Resp {
 
 /// what the helper does for each request — main.rs implements it with the
 /// live vault rules; tests implement it with fakes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub trait Handler {
     fn open(&self, p: &Path, sw: Option<&crate::spawn::Switch>) -> Result<u32, String>;
     fn create(&self, parent: &str, name: &str) -> Result<PathBuf, String>;
@@ -78,6 +85,7 @@ pub trait Handler {
     fn list_dirs(&self, path: &str) -> Vec<String>;
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn handle(h: &dyn Handler, req: Req) -> Resp {
     match req {
         Req::Open { path, switch } => match switch.as_ref().map(crate::spawn::Switch::check).transpose() {
@@ -92,6 +100,7 @@ pub fn handle(h: &dyn Handler, req: Req) -> Resp {
 }
 
 /// serve until EOF. A line that is not a Req gets Err, never a crash.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn serve(r: impl BufRead, mut w: impl Write, h: &dyn Handler) {
     for line in r.lines() {
         let Ok(line) = line else { return };
@@ -110,11 +119,12 @@ pub fn serve(r: impl BufRead, mut w: impl Write, h: &dyn Handler) {
 /// the confined window's end. One request in flight at a time (Mutex), so
 /// replies cannot cross between tauri command threads.
 pub struct Client {
-    io: Mutex<(BufReader<UnixStream>, UnixStream)>,
+    io: Mutex<(BufReader<Sock>, Sock)>,
 }
 
 impl Client {
-    pub fn new(s: UnixStream) -> std::io::Result<Client> {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn new(s: Sock) -> std::io::Result<Client> {
         Ok(Client { io: Mutex::new((BufReader::new(s.try_clone()?), s)) })
     }
 
@@ -178,17 +188,19 @@ pub fn client() -> Option<&'static Client> {
     CLIENT.get()
 }
 
+#[cfg(target_os = "linux")]
 /// publish the client (main(), only once landlock really is enforced; an
 /// unpublished Client is dropped -> the helper reads EOF and exits).
 pub fn install(c: Client) {
     let _ = CLIENT.set(c);
 }
 
+#[cfg(target_os = "linux")]
 /// start the helper: this binary, argv[1] = ARG, stdin = its socket end.
 /// MUST run before sandbox::enforce (an exec after it is confined for life).
 pub fn start() -> Result<Client, String> {
     use std::os::fd::OwnedFd;
-    let (mine, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+    let (mine, theirs) = Sock::pair().map_err(|e| format!("socketpair: {e}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut child = std::process::Command::new(exe)
         .arg(ARG)
@@ -203,11 +215,12 @@ pub fn start() -> Result<Client, String> {
     Client::new(mine).map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "linux")]
 /// the helper's main: serve fd 0 until EOF.
 pub fn run(h: &dyn Handler) -> i32 {
     use std::os::fd::FromRawFd;
     // SAFETY: fd 0 is the socketpair end start() handed us; nothing else owns it.
-    let s = unsafe { UnixStream::from_raw_fd(0) };
+    let s = unsafe { Sock::from_raw_fd(0) };
     let r = match s.try_clone() {
         Ok(r) => r,
         Err(e) => {
@@ -223,6 +236,18 @@ pub fn run(h: &dyn Handler) -> i32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// a connected pair on every platform (the protocol only needs Read + Write)
+    #[cfg(unix)]
+    fn pair() -> (Sock, Sock) {
+        Sock::pair().unwrap()
+    }
+    #[cfg(not(unix))]
+    fn pair() -> (Sock, Sock) {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let a = Sock::connect(l.local_addr().unwrap()).unwrap();
+        (a, l.accept().unwrap().0)
+    }
 
     struct Fake {
         log: RefCell<Vec<String>>,
@@ -253,7 +278,7 @@ mod tests {
     /// as Err (not a hang), garbage gets an Err line, and EOF ends the server.
     #[test]
     fn spawner_protocol_round_trips_over_a_socketpair() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair();
         let srv = std::thread::spawn(move || {
             let f = Fake { log: RefCell::new(vec![]) };
             serve(BufReader::new(b.try_clone().unwrap()), b, &f);
@@ -267,7 +292,8 @@ mod tests {
         let bad = crate::spawn::Switch { token: "../x".into(), ..sw.clone() };
         assert!(c.open(Path::new("/v/d"), Some(&bad)).unwrap_err().contains("bad token"));
         assert_eq!(c.open(Path::new("/v/busy"), None), Err("already open in another window".into()));
-        assert_eq!(c.create("/v", "new"), Ok("/v/new".into()));
+        // the handler joins with the platform's separator
+        assert_eq!(c.create("/v", "new"), Ok(Path::new("/v").join("new").display().to_string()));
         assert_eq!(c.cfg(&[Op::PushRecent("/v/b".into())]), Ok(()));
         assert_eq!(c.read_cfg(), Ok(serde_json::json!({"last": "/v/a"})));
         assert_eq!(c.list_dirs("/v"), Ok(vec!["A".to_string(), "B".into()]));
@@ -287,7 +313,7 @@ mod tests {
     /// a dead helper is an Err for the caller, never a hang or a panic.
     #[test]
     fn spawner_gone_is_an_error() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair();
         drop(b);
         let c = Client::new(a).unwrap();
         assert!(c.open(Path::new("/v/b"), None).unwrap_err().contains("spawner gone"));

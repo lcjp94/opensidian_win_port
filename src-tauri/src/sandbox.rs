@@ -21,6 +21,12 @@
    the vault, with one exception: create_vault makes the new folder and its
    Welcome.md seed before the restart. That is the folder the user asked for.
    boot_pick_must_restart() is that decision as a pure function. */
+// Landlock is a Linux LSM. Elsewhere this module keeps its switches and its
+// plan-as-data (pure, nothing platform-specific) so main.rs asks the same
+// questions on every OS: `landlock_enabled()` is simply never true there, no
+// process is ever confined, and `enforce` does not exist.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 use landlock::{
     path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
     RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
@@ -124,6 +130,9 @@ pub const LANDLOCK_ENV: &str = "OPENSIDIAN_LANDLOCK";
 /// the off-switch). Phase lloff greps for it verbatim.
 pub const OFF_LINE: &str = "landlock: off (default; OPENSIDIAN_LANDLOCK=1 enables)";
 
+/// The same line where there is no Landlock to enable.
+pub const UNAVAILABLE_LINE: &str = "landlock: unavailable on this platform (Linux only); the process is not sandboxed";
+
 /// Pure switch resolution, testable without touching process env (see the
 /// `ruleset_plan` note on why tests must not `set_var`). `opt_in` / `no` are
 /// the raw values of OPENSIDIAN_LANDLOCK / OPENSIDIAN_NO_LANDLOCK.
@@ -136,8 +145,10 @@ pub fn landlock_switch(opt_in: Option<&std::ffi::OsStr>, no: Option<&std::ffi::O
 }
 
 /// Should main() build a ruleset? Reads both env vars, spelled once each.
+/// Never on a platform without Landlock, whatever the environment says.
 pub fn landlock_enabled() -> bool {
-    landlock_switch(
+    cfg!(target_os = "linux")
+        && landlock_switch(
         std::env::var_os(LANDLOCK_ENV).as_deref(),
         std::env::var_os(NO_LANDLOCK_ENV).as_deref(),
     )
@@ -190,6 +201,7 @@ pub fn ruleset_plan(disabled: bool, home: &Path, vault: &Path) -> Option<Ruleset
     })
 }
 
+#[cfg(target_os = "linux")]
 pub fn enforce(vault: &Path) -> Result<RulesetStatus, Box<dyn std::error::Error>> {
     let off = no_landlock_requested();
     if off {
@@ -254,7 +266,7 @@ pub fn enforce(vault: &Path) -> Result<RulesetStatus, Box<dyn std::error::Error>
     Ok(status.ruleset)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::fs;

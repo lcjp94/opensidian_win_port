@@ -550,11 +550,18 @@
        - async_hooks.AsyncLocalStorage: the store is visible inside run()'s synchronous
          extent only (no async-context propagation in the page); getStore() is undefined
          elsewhere, which callers already handle (?? default). */
+  /* The host OS, as Node names it, so a plugin picks the commands of the system it really runs
+     on (where vs which, cmd vs sh, ";" in PATH, Windows install paths). Same test as
+     Platform.isWin (api-core.js), so the two never disagree. Everything that names a FILE stays
+     the confined fs's: "/vault" paths and the posix `path` module, whatever the host. os.EOL
+     stays "\n" on Windows too: a plugin that joins lines with it writes into notes, and "\r\n"
+     there would rewrite every line of a note it touches. */
+  const WIN = /Win/.test(navigator.platform);
   const OS_HOME = "/home/opensidian";
   const osOwn = Object.freeze({
     homedir: () => OS_HOME, tmpdir: () => "/tmp", hostname: () => "localhost",
-    platform: () => "linux", type: () => "Linux", arch: () => "x64", machine: () => "x86_64",
-    release: () => "0.0.0", version: () => "", endianness: () => "LE", EOL: "\n", devNull: "/dev/null",
+    platform: () => (WIN ? "win32" : "linux"), type: () => (WIN ? "Windows_NT" : "Linux"), arch: () => "x64", machine: () => "x86_64",
+    release: () => "0.0.0", version: () => "", endianness: () => "LE", EOL: "\n", devNull: WIN ? "\\\\.\\nul" : "/dev/null",
     userInfo: () => ({ uid: -1, gid: -1, username: "opensidian", homedir: OS_HOME, shell: null }),
     networkInterfaces: () => ({}), cpus: () => [], availableParallelism: () => 1,
     totalmem: () => 0, freemem: () => 0, uptime: () => 0, loadavg: () => [0, 0, 0],
@@ -582,23 +589,27 @@
   /* the free variable `process` an owner's bundle reads (Electron-renderer code: module-scope
      process.umask(), semver checks on process.version, process.platform, process.env.NODE_DEBUG).
      plugins.rs wrap_cjs_ctx binds it as the owners' 4th factory parameter and loader.js fills
-     it from view.process. I/O-free: constants and no-ops only. No exit/kill/stdout/stdin/
+     it from view.process. I/O-free: constants and no-ops only. No exit/kill/stdin/
      binding/getuid/chdir, no electron version, an empty env. chdir is absent, not a throwing
      member: graceful-fs (zotero, slides) wraps a present chdir and setPrototypeOf(wrapper, chdir)s it;
      on this frozen shim the wrap assignment is dropped, so that became setPrototypeOf(chdir, chdir)
      ("Cyclic __proto__ value") and failed the load. execa / which check chdir !== undefined first. */
+  /* stdout / stderr as stock 1.13.7 shows them to a plugin (black box, devtools values only):
+     not a terminal stream, so NO isTTY / columns / rows property at all ("isTTY" in stdout is
+     false) and no tty.WriteStream methods; fd 1 / 2, writable, write() returns true and calls
+     its callback once. tests/procstdio.rs runs this shim in JavaScriptCore against those values. */
   function stdioShim(fd) {
     const s = Object.create(null);
     const noop = () => s;
-    return Object.freeze(Object.assign(s, { fd, isTTY: false, columns: 80, rows: 24, writable: true,
+    return Object.freeze(Object.assign(s, { fd, writable: true,
       write: (c, e, cb) => { const f = typeof e === "function" ? e : cb; if (typeof f === "function") queueMicrotask(() => f()); return true; },
       end: noop, on: noop, once: noop, off: noop, addListener: noop, removeListener: noop, emit: () => false }));
   }
-  function processShim() {
-    const self = Object.create(null);
+  function processShim(proto = null) {
+    const self = Object.create(proto);
     const noop = () => self;
     return Object.freeze(Object.assign(self, {
-      platform: "linux", arch: "x64", browser: false, pid: 0,
+      platform: WIN ? "win32" : "linux", arch: "x64", browser: false, pid: 0,
       env: Object.freeze(Object.create(null)),
       version: "v18.0.0",
       versions: Object.freeze(Object.assign(Object.create(null), { node: "18.0.0" })),
@@ -607,8 +618,8 @@
       umask: () => 0o022,
       nextTick: (fn, ...a) => { queueMicrotask(() => fn(...a)); },
       emitWarning: () => {},   // deprecation warnings: dropped (no stderr)
-      // stdout/stderr: no terminal (isTTY false, as in a GUI renderer); writes are dropped, like
-      // emitWarning: the page has no stdio. realclaudian's SDK reads process.stdout.isTTY on send.
+      // stdout/stderr: no terminal (no isTTY, as stock); writes are dropped, like emitWarning:
+      // the page has no stdio. realclaudian's SDK reads process.stdout.isTTY on send.
       stdout: stdioShim(1), stderr: stdioShim(2),
       on: noop, once: noop, off: noop, addListener: noop, removeListener: noop, removeAllListeners: noop, emit: () => false,
     }));
@@ -728,10 +739,20 @@
     if (!Array.isArray(args)) { opts = args; args = []; }
     return [args.map(String), opts && typeof opts === "object" ? opts : {}];
   }
+  /* a shell request, as Node builds it: on Windows the default shell is cmd.exe, which gets
+     /d /s /c "<line>" with the arguments passed verbatim (cmd does not undo the quoting the
+     usual argv rules would add); any other shell gets -c <line>. */
+  const IS_CMD = /^(?:.*\\)?cmd(?:\.exe)?$/i;
+  function shellCmd(shell, line) {
+    const sh = typeof shell === "string" ? shell : WIN ? "cmd.exe" : "/bin/sh";
+    return WIN && IS_CMD.test(sh) ? [sh, ["/d", "/s", "/c", "\"" + line + "\""], true] : [sh, ["-c", line], false];
+  }
   function cpSpawn(file, args0, opts0) {
     let [args, opts] = spawnArgs(args0, opts0);
     file = String(file);
-    if (opts.shell) { const cmd = [file, ...args].join(" "); file = typeof opts.shell === "string" ? opts.shell : "/bin/sh"; args = ["-c", cmd]; }
+    // windowsVerbatimArguments: Node's own flag (cross-spawn and execa set it for cmd)
+    let verbatim = WIN && opts.windowsVerbatimArguments === true;
+    if (opts.shell) [file, args, verbatim] = shellCmd(opts.shell, [file, ...args].join(" "));
     const cp = new ChildProcess();
     cp.spawnfile = file; cp.spawnargs = [file, ...args];
     const st = typeof opts.stdio === "string" ? [opts.stdio, opts.stdio, opts.stdio] : Array.isArray(opts.stdio) ? opts.stdio : [];
@@ -743,7 +764,7 @@
     let env;
     if (opts.env && typeof opts.env === "object") { env = {}; for (const k of Object.keys(opts.env)) if (opts.env[k] != null) env[k] = String(opts.env[k]); }
     const cwd = opts.cwd == null ? undefined : String(opts.cwd instanceof URL ? opts.cwd.pathname : opts.cwd);
-    cp._q = (desk ? desk("desk_proc_spawn", { file, args, cwd, env }) : Promise.reject(new Error("EPERM: no desktop backend")))
+    cp._q = (desk ? desk("desk_proc_spawn", { file, args, cwd, env, verbatim }) :Promise.reject(new Error("EPERM: no desktop backend")))
       .then(r => { cp.pid = r.pid; later(() => cp.emit("spawn")); return r.id; },
         e => { later(() => { cp.emit("error", deskErr(e, file, cp.spawnargs)); cp.emit("close", -2, null); }); return null; });
     let timer = null;
@@ -795,8 +816,8 @@
   function exec(cmd, opts, cb) {
     if (typeof opts === "function") { cb = opts; opts = {}; }
     opts = opts || {};
-    const sh = typeof opts.shell === "string" ? opts.shell : "/bin/sh";
-    return cpRun(sh, ["-c", String(cmd)], Object.assign({}, opts, { shell: false }), cb, String(cmd));
+    const [sh, args, verbatim] = shellCmd(opts.shell, String(cmd));
+    return cpRun(sh, args, Object.assign({}, opts, { shell: false, windowsVerbatimArguments: verbatim }), cb, String(cmd));
   }
   const asPromise = run => function (...a) {
     let cp;
@@ -2019,10 +2040,28 @@
   };
 
   const PLUGIN_DIR = id => "/vault/.obsidian/plugins/" + id;
+  /* the page-global `process` (copilot-tty). In stock a plugin's process IS window.process, so
+     bundled code that reaches the global object (globalThis.process / window.process) finds the
+     same Node process the factory variable is. Ours had none: copilot reads the global process
+     (box t1 with a read-logging getter) and failed to start with "undefined is not an object
+     (evaluating 'process.stdout.isTTY')"; with this global it starts. Installed when the first plugin view is made
+     (plugins only run in a trusted vault), so a vault without plugins keeps a page with no
+     process. One shared shim, the same constants and no-ops as a plugin's own; its prototype is
+     Object.prototype so String(process) is "[object Object]", never a throw, and page code that
+     sniffs for Node (pdf.js checks process+"" === "[object process]") still sees a browser.
+     Writable and configurable like a plain global, so a plugin's own polyfill assignment works. */
+  let pageProcess = false;
+  function installPageProcess() {
+    if (pageProcess) return;
+    pageProcess = true;
+    if (Object.prototype.hasOwnProperty.call(window, "process")) return;
+    Object.defineProperty(window, "process", { value: processShim(Object.prototype), writable: true, configurable: true, enumerable: false });
+  }
   const views = new Map();   // id -> view (one per plugin id for the page's life)
   function view(id) {
     id = String(id);
     if (views.has(id)) return views.get(id);
+    installPageProcess();
     const made = new Map();   // one module object per builtin name (require twice -> same object)
     let boundReq = null;      // the loader's require for this plugin, for module.createRequire
     const ownRequire = function require(n) {

@@ -78,8 +78,8 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize, keep: fn(&
             walk(&p, base, out, depth + 1, keep);
         } else if t.is_file() && keep(n) {
             if let Ok(rel) = p.strip_prefix(base) {
-                if let Some(s) = rel.to_str() {
-                    out.push(s.to_string());
+                if rel.to_str().is_some() {
+                    out.push(crate::vaultfs::rel_str(rel));
                 }
             }
         }
@@ -333,7 +333,7 @@ pub fn op(root: &Path, op: &str, path: &str, data: Option<&str>) -> Result<Value
             let stem = rel.file_name().and_then(|s| s.to_str()).map(|s| s[..s.len() - EXT.len()].to_string()).unwrap_or_default();
             let tdir = Path::new(TRASH);
             v.mkdir_p(tdir).map_err(e)?;
-            v.trash(&rel, tdir, &stem, &EXT[1..]).map(|d| Value::String(d.display().to_string())).map_err(e)
+            v.trash(&rel, tdir, &stem, &EXT[1..]).map(|d| Value::String(crate::vaultfs::rel_str(&d))).map_err(e)
         }
         _ => Err(format!("ENOSYS: canvas op {op:?} does not exist")),
     }
@@ -404,13 +404,14 @@ pub fn attach(root: &Path, path: &str, data_b64: &str) -> Result<String, String>
         let _ = v.unlink(&rel);
         return Err(e(x));
     }
-    Ok(rel.to_string_lossy().into_owned())
+    Ok(crate::vaultfs::rel_str(&rel))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn fresh(tag: &str) -> (PathBuf, PathBuf) {
@@ -470,6 +471,7 @@ mod tests {
         assert!(op(&root, "unlink", "A.canvas", None).unwrap_err().starts_with("ENOSYS"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_symlinks_are_never_followed() {
         let (root, out) = fresh("link");
@@ -541,6 +543,7 @@ mod tests {
         assert!(fs::read_dir(&out).unwrap().next().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_relink_rewrites_file_cards_only_byte_exact() {
         let (root, out) = fresh("relink");
@@ -570,6 +573,7 @@ mod tests {
         assert_eq!(v["nodes"][3]["file"], json!("Note.md"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_trash_moves_into_dot_trash() {
         let (root, out) = fresh("trash");
@@ -629,6 +633,7 @@ mod tests {
         assert!(!root.join("nodir").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_attach_refuses_traversal_absolute_hidden_and_symlinks() {
         let (root, out) = fresh("attach-esc");

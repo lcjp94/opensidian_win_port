@@ -41,7 +41,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// exit status of a boot that found its vault already open elsewhere
@@ -51,6 +50,8 @@ pub const DUP_MSG: &str = "already open in another window";
 /// the held lock; dropping it (process exit) releases the flock
 #[derive(Debug)]
 pub struct VaultLock {
+    // on Windows the handle is only HELD (it is the lock); the ready marker is a sibling file
+    #[cfg_attr(windows, allow(dead_code))]
     f: File,
     pub path: PathBuf,
 }
@@ -77,6 +78,7 @@ impl VaultLock {
     /// lock file through the fd this process already holds. Only the holder
     /// writes here, and acquire_in truncates, so a line from an earlier holder
     /// never survives into a new one.
+    #[cfg(not(windows))]
     pub fn mark_ready(&self, token: &str) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom};
         let mut f = &self.f;
@@ -86,14 +88,39 @@ impl VaultLock {
     }
 }
 
+/* Windows: a lock taken with LockFileEx is MANDATORY — while it is held, no
+   other handle can read a byte of the locked file (ERROR_LOCK_VIOLATION), so
+   the old window could never see a `ready` line written into the lock file.
+   The line goes into a sibling `<lock>.ready` instead: written only by the
+   holder, emptied by every new holder right after it gets the lock (below),
+   so a line from an earlier holder never survives into a new one. */
+#[cfg(windows)]
+fn ready_file(lock: &Path) -> PathBuf {
+    lock.with_extension("ready")
+}
+#[cfg(not(windows))]
+fn ready_file(lock: &Path) -> PathBuf {
+    lock.to_path_buf()
+}
+
+#[cfg(windows)]
+impl VaultLock {
+    pub fn mark_ready(&self, token: &str) -> std::io::Result<()> {
+        let mut f = OpenOptions::new().append(true).create(true).open(ready_file(&self.path))?;
+        f.write_all(format!("ready {token}\n").as_bytes())?;
+        f.flush()
+    }
+}
+
 /// has the holder of `canon`'s lock marked `token` ready? (the old window's
 /// probe; a missing file / no line = not yet)
 pub fn ready_in(dir: &Path, canon: &Path, token: &str) -> bool {
     let want = format!("ready {token}");
-    fs::read_to_string(lock_file(dir, canon)).map(|s| s.lines().any(|l| l == want)).unwrap_or(false)
+    fs::read_to_string(ready_file(&lock_file(dir, canon))).map(|s| s.lines().any(|l| l == want)).unwrap_or(false)
 }
 
 /// directory the lock files live in (pure: the caller reads the environment)
+#[cfg_attr(windows, allow(dead_code))] // Windows: env_lock_dir answers from %LOCALAPPDATA%
 pub fn lock_dir(flatpak_id: Option<OsString>, xdg_runtime: Option<OsString>, home: &Path) -> PathBuf {
     let rt = xdg_runtime.map(PathBuf::from).filter(|p| p.is_absolute());
     match (flatpak_id.filter(|s| !s.is_empty()), rt) {
@@ -103,6 +130,19 @@ pub fn lock_dir(flatpak_id: Option<OsString>, xdg_runtime: Option<OsString>, hom
     }
 }
 
+/// Windows: per-user, local (never roamed or synced), outside every vault:
+/// %LOCALAPPDATA%\dev.koto.opensidian\locks. A lock FILE left behind by a
+/// crash is harmless: the lock is the handle, and the handle died with the process.
+#[cfg(windows)]
+pub fn env_lock_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| crate::plat::home().join("AppData").join("Local"));
+    base.join("dev.koto.opensidian").join("locks")
+}
+
+#[cfg(not(windows))]
 pub fn env_lock_dir() -> PathBuf {
     let in_flatpak = Path::new("/.flatpak-info").exists();
     let id = if in_flatpak { std::env::var_os("FLATPAK_ID") } else { None };
@@ -121,7 +161,7 @@ fn fnv1a64(b: &[u8]) -> u64 {
 
 /// lock file for a CANONICAL vault path
 pub fn lock_file(dir: &Path, canon: &Path) -> PathBuf {
-    dir.join(format!("vault-{:016x}.lock", fnv1a64(canon.as_os_str().as_bytes())))
+    dir.join(format!("vault-{:016x}.lock", fnv1a64(canon.as_os_str().as_encoded_bytes())))
 }
 
 fn open(dir: &Path, canon: &Path) -> Result<(File, PathBuf), LockErr> {
@@ -146,8 +186,11 @@ pub fn acquire_in(dir: &Path, canon: &Path) -> Result<VaultLock, LockErr> {
         Err(fs::TryLockError::WouldBlock) => return Err(LockErr::Busy(canon.to_path_buf())),
         Err(fs::TryLockError::Error(e)) => return Err(LockErr::Io(format!("{}: {e}", lf.display()))),
     }
+    // Windows: the previous holder's ready lines live beside the lock (ready_file)
+    #[cfg(windows)]
+    let _ = fs::remove_file(ready_file(&lf));
     // label for humans; we own the lock, so nobody else writes it concurrently
-    let _ = f.set_len(0).and_then(|_| f.write_all(canon.as_os_str().as_bytes())).and_then(|_| f.write_all(b"\n"));
+    let _ = f.set_len(0).and_then(|_| f.write_all(canon.as_os_str().as_encoded_bytes())).and_then(|_| f.write_all(b"\n"));
     Ok(VaultLock { f, path: lf })
 }
 
@@ -211,9 +254,13 @@ pub(crate) mod tests {
         let _lb = acquire_in(&locks, &b.canonicalize().unwrap()).expect("other vault is free");
         drop(first);
         let _again = acquire_eventually(&locks, &canon).expect("free again after the holder dropped");
+        // the human-readable label. Not on Windows: a held lock is mandatory there,
+        // nobody but the holder's own handle can read the file (see ready_file)
+        #[cfg(not(windows))]
         assert_eq!(fs::read_to_string(lock_file(&locks, &canon)).unwrap().trim_end(), canon.to_str().unwrap());
     }
 
+    #[cfg(unix)] // sh + flock(1)
     #[test]
     fn vaultlock_contention_across_processes() {
         // a real second PROCESS holds the lock: flock(1) from util-linux on the
@@ -245,6 +292,7 @@ pub(crate) mod tests {
         acquire_eventually(&locks, &canon).expect("free once that process is gone");
     }
 
+    #[cfg(unix)] // XDG / Flatpak runtime dirs
     #[test]
     fn vaultlock_dir_flatpak_uses_the_shared_per_app_runtime_dir() {
         let home = Path::new("/home/u");
