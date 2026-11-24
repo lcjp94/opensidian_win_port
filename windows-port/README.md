@@ -19,6 +19,8 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [Morglaf/opensidian#11](https://github.com/Morglaf/opensidian/pull/11) | Coffre passé en argument sans `\\?\`, un seul récent par coffre, nom du coffre coupé sur `\` ; aucune clé de config ne change | ouverte, fusionnée dans `windows` |
 | [jpzk/opensidian#262](https://github.com/jpzk/opensidian/pull/262) | images SVG | acceptée par le mainteneur, à fusionner chez l'amont |
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
+| [jpzk/opensidian#359](https://github.com/jpzk/opensidian/pull/359) | canevas : « Back to previous view » après « Zoom to selection » | ouverte |
+| [jpzk/opensidian#360](https://github.com/jpzk/opensidian/pull/360) | canevas : glisser sur le fond déplace la vue, Maj+glisser sélectionne | ouverte |
 
 Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
@@ -29,6 +31,10 @@ Toutes les pièces du tag `port-windows-v0.9.2` sont reportées (#5 à #11), le 
 Reste ouvert, non traité :
 - La confirmation d'un programme affiche `Program: \\?\C:\Windows\System32\cmd.exe` (forme verbatim). Texte de sécurité : à décider à part.
 - Les clés internes (confiance, secrets, taille de fenêtre, id de coffre) restent en forme `\\?\` : cohérentes entre elles, donc laissées telles quelles (#11).
+
+## Version installée sur le poste
+
+Branche locale `local/windows-svg` (non poussée), worktree `C:\cargo-target\wt\local-svg` : `windows` + #262 + #263 + #359 + #360, plus deux correctifs Windows qui manquent encore dans #262 et #263 (chemin du plan 2D en `/`, tests SVG sur l'adresse WebView2 et test du lien symbolique réservé à Unix). Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`. À signaler à l'amont pour #262 et #263.
 
 ## Limites connues (à documenter dans la PR finale)
 
