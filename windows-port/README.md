@@ -21,6 +21,7 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
 | [jpzk/opensidian#359](https://github.com/jpzk/opensidian/pull/359) | canevas : « Back to previous view » après « Zoom to selection » | ouverte |
 | [jpzk/opensidian#360](https://github.com/jpzk/opensidian/pull/360) | canevas : glisser sur le fond déplace la vue, Maj+glisser sélectionne | ouverte |
+| [jpzk/opensidian#361](https://github.com/jpzk/opensidian/pull/361) | `workspace.json` n'est plus réécrit à l'ouverture d'un coffre (attente de 17 s mesurée sous Windows) | ouverte |
 
 Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
@@ -34,7 +35,7 @@ Reste ouvert, non traité :
 
 ## Version installée sur le poste
 
-Branche locale `local/windows-svg` (non poussée), worktree `C:\cargo-target\wt\local-svg` : `windows` + #262 + #263 + #359 + #360, plus deux correctifs Windows qui manquent encore dans #262 et #263 (chemin du plan 2D en `/`, tests SVG sur l'adresse WebView2 et test du lien symbolique réservé à Unix). Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`. Signalé en commentaire sur #262 et #263 le 2026-11-24 (pour celle des deux, PR ou #34, qui arrive en second).
+Branche locale `local/windows-svg` (non poussée), worktree `C:\cargo-target\wt\local-svg` : `windows` + #262 + #263 + #359 + #360 + #361, plus deux correctifs Windows qui manquent encore dans #262 et #263 (chemin du plan 2D en `/`, tests SVG sur l'adresse WebView2 et test du lien symbolique réservé à Unix). Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`. Signalé en commentaire sur #262 et #263 le 2026-11-24 (pour celle des deux, PR ou #34, qui arrive en second).
 
 ## Limites connues (à documenter dans la PR finale)
 
