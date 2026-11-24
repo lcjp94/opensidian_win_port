@@ -25,7 +25,7 @@ Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
 Source : le tag `port-windows-v0.9.2` (`git show port-windows-v0.9.2:<chemin>`). Une ligne = une PR vers Morglaf, dans cet ordre de priorité. Rien de cette liste n'est encore vérifié sur la base v0.9.6.
 
-1. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`). Attention : la clé du coffre (`plugins::trust_key`, avec `\\?\`) nomme aussi les secrets (#7) et les entrées de `~/.opensidian.json` ; si elle change, migrer l'existant. Vu en testant #8 : la liste des coffres récents montre le même coffre deux fois (`\\?\D:\…` et `D:\…`), et son nom affiche le chemin entier (`base()` de `ui/main.js` ne coupe que sur `/`). Le dialogue de confirmation affiche aussi `Program: \?C:WindowsSystem32d.exe` (vu en testant #10).
+1. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`). Attention : la clé du coffre (`plugins::trust_key`, avec `\\?\`) nomme aussi les secrets (#7) et les entrées de `~/.opensidian.json` ; si elle change, migrer l'existant. Vu en testant #8 : la liste des coffres récents montre le même coffre deux fois (`\\?\D:\…` et `D:\…`), et son nom affiche le chemin entier (`base()` de `ui/main.js` ne coupe que sur `/`). Vu en testant #10 : la confirmation d'un programme affiche `Program: \\?\C:\Windows\System32\cmd.exe`.
 
 ## Limites connues (à documenter dans la PR finale)
 
