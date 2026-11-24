@@ -34,7 +34,7 @@ Reste ouvert, non traité :
 
 ## Version installée sur le poste
 
-Branche locale `local/windows-svg` (non poussée), worktree `C:\cargo-target\wt\local-svg` : `windows` + #262 + #263 + #359 + #360, plus deux correctifs Windows qui manquent encore dans #262 et #263 (chemin du plan 2D en `/`, tests SVG sur l'adresse WebView2 et test du lien symbolique réservé à Unix). Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`. À signaler à l'amont pour #262 et #263.
+Branche locale `local/windows-svg` (non poussée), worktree `C:\cargo-target\wt\local-svg` : `windows` + #262 + #263 + #359 + #360, plus deux correctifs Windows qui manquent encore dans #262 et #263 (chemin du plan 2D en `/`, tests SVG sur l'adresse WebView2 et test du lien symbolique réservé à Unix). Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`. Signalé en commentaire sur #262 et #263 le 2026-11-24 (pour celle des deux, PR ou #34, qui arrive en second).
 
 ## Limites connues (à documenter dans la PR finale)
 
