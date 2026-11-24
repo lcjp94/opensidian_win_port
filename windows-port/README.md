@@ -25,7 +25,7 @@ Source : le tag `port-windows-v0.9.2` (`git show port-windows-v0.9.2:<chemin>`).
 1. **Sélecteur de dossier natif** (IFileOpenDialog) pour choisir un coffre. Source : `src-tauri/src/pick_win.rs`, `ui/main.js` (`winBrowse`).
 2. **Fenêtre** : glisser de la barre de titre, Aero Snap, bords de redimensionnement. La base a un chemin générique `start_dragging` : **vérifier d'abord** ce qu'il donne sous Windows.
 3. **Plugins** : `process.platform === "win32"`, `os.platform()`/`os.type()`, `exec()` et `shell: true` via `cmd.exe /d /s /c` avec arguments passés tels quels (`windowsVerbatimArguments`). Source : `ui/plugins/node-desktop.js`, `desk_proc.rs` (`verbatim`) — à adapter au `desk_proc` v0.9.6 (consentement).
-4. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`).
+4. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`). Attention : la clé du coffre (`plugins::trust_key`, avec `\\?\`) nomme aussi les secrets (#7) et les entrées de `~/.opensidian.json` ; si elle change, migrer l'existant.
 
 ## Limites connues (à documenter dans la PR finale)
 
