@@ -16,6 +16,7 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [Morglaf/opensidian#8](https://github.com/Morglaf/opensidian/pull/8) | Choix du coffre dans le dialogue de dossier Windows (IFileOpenDialog), crate `windows` déjà dans le lock | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#9](https://github.com/Morglaf/opensidian/pull/9) | Barre de titre : le glisser passe à Windows (Aero Snap, Snap Layouts, agrandir en haut) | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#10](https://github.com/Morglaf/opensidian/pull/10) | Plugins : `win32`, `exec()`/`shell: true` via `cmd.exe /d /s /c` en verbatim, la confirmation montre la ligne exacte | ouverte, fusionnée dans `windows` |
+| [Morglaf/opensidian#11](https://github.com/Morglaf/opensidian/pull/11) | Coffre passé en argument sans `\\?\`, un seul récent par coffre, nom du coffre coupé sur `\` ; aucune clé de config ne change | ouverte, fusionnée dans `windows` |
 | [jpzk/opensidian#262](https://github.com/jpzk/opensidian/pull/262) | images SVG | acceptée par le mainteneur, à fusionner chez l'amont |
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
 
@@ -23,9 +24,11 @@ Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
 ## À reporter depuis l'ancien portage
 
-Source : le tag `port-windows-v0.9.2` (`git show port-windows-v0.9.2:<chemin>`). Une ligne = une PR vers Morglaf, dans cet ordre de priorité. Rien de cette liste n'est encore vérifié sur la base v0.9.6.
+Toutes les pièces du tag `port-windows-v0.9.2` sont reportées (#5 à #11), le 2026-11-24.
 
-1. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`). Attention : la clé du coffre (`plugins::trust_key`, avec `\\?\`) nomme aussi les secrets (#7) et les entrées de `~/.opensidian.json` ; si elle change, migrer l'existant. Vu en testant #8 : la liste des coffres récents montre le même coffre deux fois (`\\?\D:\…` et `D:\…`), et son nom affiche le chemin entier (`base()` de `ui/main.js` ne coupe que sur `/`). Vu en testant #10 : la confirmation d'un programme affiche `Program: \\?\C:\Windows\System32\cmd.exe`.
+Reste ouvert, non traité :
+- La confirmation d'un programme affiche `Program: \\?\C:\Windows\System32\cmd.exe` (forme verbatim). Texte de sécurité : à décider à part.
+- Les clés internes (confiance, secrets, taille de fenêtre, id de coffre) restent en forme `\\?\` : cohérentes entre elles, donc laissées telles quelles (#11).
 
 ## Limites connues (à documenter dans la PR finale)
 
