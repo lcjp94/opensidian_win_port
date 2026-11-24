@@ -11,6 +11,7 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [Morglaf/opensidian#3](https://github.com/Morglaf/opensidian/pull/3) | `vaultfs` : refus des noms que Windows ne gère pas (`CON`, `:`, point final…) | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#4](https://github.com/Morglaf/opensidian/pull/4) | CSP élargie sous Windows seulement ; « Render media » coupé retire aussi l'origine WebView2 | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#5](https://github.com/Morglaf/opensidian/pull/5) | CI Windows (`windows.yml`) : build + `cargo test` sur `windows-2025-vs2026`, durcie comme `macos.yml` | ouverte, fusionnée dans `windows` |
+| [Morglaf/opensidian#6](https://github.com/Morglaf/opensidian/pull/6) | Installateur par utilisateur (Inno Setup, sans bundler Tauri), construit et testé dans `windows.yml` ; s'appuie sur #5 | ouverte, fusionnée dans `windows` |
 | [jpzk/opensidian#262](https://github.com/jpzk/opensidian/pull/262) | images SVG | acceptée par le mainteneur, à fusionner chez l'amont |
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
 
@@ -20,12 +21,11 @@ Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
 Source : le tag `port-windows-v0.9.2` (`git show port-windows-v0.9.2:<chemin>`). Une ligne = une PR vers Morglaf, dans cet ordre de priorité. Rien de cette liste n'est encore vérifié sur la base v0.9.6.
 
-1. **Installateur** : NSIS par utilisateur, non signé, `SHA256SUMS`, `icon.ico`, configuration séparée pour que `bundle.active` reste `false`. Source : `packaging/windows/`, `.github/workflows/build.yml` (étapes à ajouter à `windows.yml`).
-2. **Secrets des plugins** dans le Credential Manager (2560 octets max). Source : `src-tauri/src/secrets_win.rs`.
-3. **Sélecteur de dossier natif** (IFileOpenDialog) pour choisir un coffre. Source : `src-tauri/src/pick_win.rs`, `ui/main.js` (`winBrowse`).
-4. **Fenêtre** : glisser de la barre de titre, Aero Snap, bords de redimensionnement. La base a un chemin générique `start_dragging` : **vérifier d'abord** ce qu'il donne sous Windows.
-5. **Plugins** : `process.platform === "win32"`, `os.platform()`/`os.type()`, `exec()` et `shell: true` via `cmd.exe /d /s /c` avec arguments passés tels quels (`windowsVerbatimArguments`). Source : `ui/plugins/node-desktop.js`, `desk_proc.rs` (`verbatim`) — à adapter au `desk_proc` v0.9.6 (consentement).
-6. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`).
+1. **Secrets des plugins** dans le Credential Manager (2560 octets max). Source : `src-tauri/src/secrets_win.rs`.
+2. **Sélecteur de dossier natif** (IFileOpenDialog) pour choisir un coffre. Source : `src-tauri/src/pick_win.rs`, `ui/main.js` (`winBrowse`).
+3. **Fenêtre** : glisser de la barre de titre, Aero Snap, bords de redimensionnement. La base a un chemin générique `start_dragging` : **vérifier d'abord** ce qu'il donne sous Windows.
+4. **Plugins** : `process.platform === "win32"`, `os.platform()`/`os.type()`, `exec()` et `shell: true` via `cmd.exe /d /s /c` avec arguments passés tels quels (`windowsVerbatimArguments`). Source : `ui/plugins/node-desktop.js`, `desk_proc.rs` (`verbatim`) — à adapter au `desk_proc` v0.9.6 (consentement).
+5. **Chemin canonique sans `\\?\`** pour le coffre passé en argument (sinon le sélecteur le refuse). Source : `plat::canon`. Vérifier si la base a déjà l'équivalent (`plain` dans `desk_proc/windows.rs`).
 
 ## Limites connues (à documenter dans la PR finale)
 
