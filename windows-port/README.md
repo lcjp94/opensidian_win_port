@@ -18,7 +18,6 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [Morglaf/opensidian#10](https://github.com/Morglaf/opensidian/pull/10) | Plugins : `win32`, `exec()`/`shell: true` via `cmd.exe /d /s /c` en verbatim, la confirmation montre la ligne exacte | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#11](https://github.com/Morglaf/opensidian/pull/11) | Coffre passé en argument sans `\\?\`, un seul récent par coffre, nom du coffre coupé sur `\` ; aucune clé de config ne change | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#12](https://github.com/Morglaf/opensidian/pull/12) | Cadre PDF d'un canevas qui ne scintille plus (barre de défilement WebView2) | ouverte, fusionnée dans `windows` |
-| [Morglaf/opensidian#13](https://github.com/Morglaf/opensidian/pull/13) | Icône Windows en 7 tailles, avec son script `make-icon.ps1` | ouverte, fusionnée dans `windows` |
 | [jpzk/opensidian#262](https://github.com/jpzk/opensidian/pull/262) | images SVG | acceptée par le mainteneur, à fusionner chez l'amont |
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
 | [jpzk/opensidian#359](https://github.com/jpzk/opensidian/pull/359) | canevas : « Back to previous view » après « Zoom to selection » | ouverte |
@@ -31,7 +30,7 @@ Quand une PR est fusionnée chez Morglaf ou l'amont, la retirer de ce tableau.
 
 Le 2026-11-24, #5 à #11 ont été reportés, mais la liste de départ en oubliait deux. Un audit commit par commit des 30 commits du tag `port-windows-v0.9.2` les a trouvés :
 - `53b18143`, cadre PDF d'un canevas qui scintille (barre de défilement WebView2 de 15 px) : Morglaf/opensidian#12 ;
-- `3f56791d`, icône Windows en 7 tailles (la base n'en a qu'une) : Morglaf/opensidian#13.
+- `3f56791d`, icône Windows en 7 tailles tirée du logo officiel (lavande) : essayée puis abandonnée le 2026-11-25. Installée, elle est jugée moins belle que l'icône de la base de Morglaf, qui est gardée telle quelle. Morglaf/opensidian#13 est fermée, la fusion dans `windows` est annulée.
 
 Tout le reste est reporté, déjà dans la base (renommage qui ne change que la casse, job object des processus des plugins) ou chez l'amont (#254).
 
