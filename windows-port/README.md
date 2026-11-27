@@ -2,6 +2,10 @@
 
 Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opensidian/pull/34), v0.9.6). Flux de travail et règles : `CLAUDE.md` à la racine.
 
+## Lead du portage
+
+Le 2026-11-27, réponse publiée sur jpzk/opensidian#34 : nous prenons le lead proposé par Morglaf. Demandé à Morglaf : un accès en écriture à Morglaf/opensidian, pour fusionner nos PR #1 à #12 dans `platform-windows`. Demandé à jpzk : #34 doit-elle viser `develop` plutôt que `main` (230 commits de retard) ? En attente des deux réponses.
+
 ## PR en cours
 
 | PR | Sujet | État |
