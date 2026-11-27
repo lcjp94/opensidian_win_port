@@ -18,7 +18,6 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
 | [Morglaf/opensidian#10](https://github.com/Morglaf/opensidian/pull/10) | Plugins : `win32`, `exec()`/`shell: true` via `cmd.exe /d /s /c` en verbatim, la confirmation montre la ligne exacte | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#11](https://github.com/Morglaf/opensidian/pull/11) | Coffre passé en argument sans `\\?\`, un seul récent par coffre, nom du coffre coupé sur `\` ; aucune clé de config ne change | ouverte, fusionnée dans `windows` |
 | [Morglaf/opensidian#12](https://github.com/Morglaf/opensidian/pull/12) | Cadre PDF d'un canevas qui ne scintille plus (barre de défilement WebView2) | ouverte, fusionnée dans `windows` |
-| [jpzk/opensidian#262](https://github.com/jpzk/opensidian/pull/262) | images SVG | acceptée par le mainteneur, à fusionner chez l'amont |
 | [jpzk/opensidian#263](https://github.com/jpzk/opensidian/pull/263) | PDF 3D : avis + lien vers le plan 2D | en relecture chez l'amont |
 | [jpzk/opensidian#359](https://github.com/jpzk/opensidian/pull/359) | canevas : « Back to previous view » après « Zoom to selection » | ouverte |
 | [jpzk/opensidian#360](https://github.com/jpzk/opensidian/pull/360) | canevas : glisser sur le fond déplace la vue, Maj+glisser sélectionne | ouverte |
