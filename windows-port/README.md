@@ -40,7 +40,9 @@ Reste ouvert, non traité :
 
 ## Version installée sur le poste
 
-Branche locale `local/windows-svg` (non poussée), worktree `C:\cargo-target\wt\local-svg`, encore basée sur l'ancien `windows` (v0.9.6) + #262 + #263 + #359 + #360 + #361. Elle ne contient pas encore la mise à jour sur `develop`. Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`.
+Depuis le 2026-11-28 : branche locale `local/win-dev` (non poussée), worktree `C:\cargo-target\wt\local-dev`, soit `windows` (= `platform-windows` à jour sur `develop`, qui contient #262) + #263 (avec le correctif Windows du chemin du plan 2D) + #359 + #360 + #361. Windows : 630 + 34 tests. Installateur : Inno Setup 6.7.3 (par utilisateur), `ISCC` comme dans `windows.yml`. L'ancienne branche `local/windows-svg` (worktree `local-svg`) est remplacée.
+
+Au premier lancement de cette version, #251 (épinglage du code des plugins) a demandé d'autoriser les 5 plugins du coffre ; c'est autorisé. Mesuré au lancement : `workspace.json` n'est pas réécrit, `read_note` au plus 1,1 ms.
 
 ## Limites connues (à documenter dans la PR finale)
 
