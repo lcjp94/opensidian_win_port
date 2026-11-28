@@ -12,7 +12,7 @@ Base : le portage de Morglaf ([jpzk/opensidian#34](https://github.com/jpzk/opens
   - l'audit des lectures de #250.
 
   Windows : 627 + 34 tests. Linux : 736 tests, CI verte.
-- À faire : demander à Morglaf de faire viser `develop` à #34 (elle vise encore `main`), publier le point d'étape sur #34, fournir un installateur à Morglaf pour son test.
+- 2026-11-28 : point d'étape publié sur #34. La CI Windows (#5) a construit, testé (627 + 34) et empaqueté cette pointe ; l'installateur est l'artefact `opensidian-windows-x86_64-unsigned` du run 46120610624 de `lcjp94/opensidian_win_port`. Demandé à Morglaf : faire viser `develop` à #34, et tester avec cet installateur. En attente.
 
 Non couvert sous Windows : les tests de #250 qui créent des liens vers `/dev/zero`, des tubes nommés ou jouent sur les droits Unix (`read250_tests` et quelques autres) sont réservés à Unix. Le renforcement #250 n'a pas encore de test Windows à lui.
 
