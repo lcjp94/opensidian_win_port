@@ -156,6 +156,16 @@
        watcher reconciles against the index and reports none of them, so the model kept the old path: a canvas file card
        relinked to the new name painted "not found". A Vault "rename", as for a plugin's renameFile. */
     host.noteMoved = (o, n) => { if (!K.st.filesOn || typeof o !== "string" || typeof n !== "string" || o === n) return; applyChange({ renamed: [[o, n]] }); };
+    /* CodeAnt #262/#283: the core's media_rename (a canvas media card's Rename in a restricted vault, where
+       renameFile hits EPERM) moves the file on disk only, and the watcher reports notes only — so the model kept
+       the old path and the relinked image card painted "missing". The same model move + Vault "rename" as
+       renameFile's own tail. A no-op until ensureFiles is up, for a path the model does not hold, or a note. */
+    host.mediaMoved = (o, n) => {
+      if (!K.st.filesOn || typeof o !== "string" || typeof n !== "string" || o === n || noteOf(o) != null) return;
+      const f = files.get(o);
+      if (!(f instanceof TFile) || files.has(n)) return;
+      movePath(f, n); vault.trigger("rename", f, o);
+    };
     /* the runtime a plugin needs before its main.js is evaluated: moment (vendored,
        pinned — ui/vendor/moment.min.js), the file model (ensureFiles), the vault
        config and the metadata sweep. Idempotent; first enable() pays it. */
@@ -321,7 +331,27 @@
       async append(p, data) { const s = String(data); await core.append(ap(p), s); await adapterMade(p, te.encode(s).byteLength); }
       async appendBinary(p, data) { const u = toBytes(data); await core.append(ap(p), u); await adapterMade(p, u.byteLength); }
       async process(p, fn) { const out = fn(await this.read(p)); await this.write(p, out); return out; }
-      getResourcePath() { return ""; }
+      /* stock: a vault-relative path -> a URL the webview can fetch. Plugin files under
+         .obsidian/plugins/<id>/… ride opensidian-plugin (wasm / workers / assets); everything
+         else rides opensidian-img (the same scheme the note renderer uses for embeds). */
+      getResourcePath(p) {
+        const raw = String(p == null ? "" : p);
+        const trail = /\/$/.test(raw);
+        let path = normalizePath(raw.replace(/\/+$/, ""));
+        const mk = window.__osCustomSchemeUrl;
+        const enc = rel => String(rel).split("/").map(encodeURIComponent).join("/");
+        const plug = path.match(/^\.obsidian\/plugins\/([^/]+)(?:\/(.*))?$/);
+        let url;
+        if (plug) {
+          const rest = plug[2] || "";
+          url = mk ? mk("opensidian-plugin", enc(plug[1] + (rest ? "/" + rest : "")))
+            : "opensidian-plugin://localhost/" + enc(plug[1] + (rest ? "/" + rest : ""));
+        } else {
+          url = mk ? mk("opensidian-img", enc(path)) : "opensidian-img://localhost/" + enc(path);
+        }
+        if (trail && !url.endsWith("/")) url += "/";
+        return url;
+      }
       async mkdir(p) { await core.mkdir(ap(p), true); await adapterMade(p, 0, true); }
       async trashSystem() { return false; }       // no system trash: callers fall back to trashLocal
       async trashLocal(p) {
@@ -506,7 +536,10 @@
         await core.append(f.path, u8);
         f.stat.mtime = Date.now(); f.stat.size += u8.byteLength; vault.trigger("modify", f);
       },
-      getResourcePath() { return ""; },
+      getResourcePath(file) {
+        const p = file && typeof file === "object" && file.path != null ? file.path : file;
+        return adapter.getResourcePath(p);
+      },
       getConfig(k) { return ({ useMarkdownLinks: false, newLinkFormat: "shortest", attachmentFolderPath: "/", newFileLocation: "root", newFileFolderPath: "", alwaysUpdateLinks: false, showUnsupportedFiles: false })[k] ?? null; },
       /* vault.config (undocumented, part vint): the vault's own .obsidian/app.json
          as read when the model is built — {} when there is none; no defaults are
@@ -914,9 +947,10 @@
        scripts/api-probes.d/vint.js): the vault's frontmatter properties
        (lowercase key -> {name: first spelling seen, occurrences: notes holding it,
        widget}), the types the user assigned (.obsidian/types.json) and the
-       registered type widgets. A widget's render() is the property editor UI,
-       which opensidian does not have: it throws 'unsupported in opensidian'. */
-    const TYPES_WHY = "the property editor widgets are not part of opensidian";
+       registered type widgets. A widget's render(containerEl, value, ctx) builds
+       the property editor's value widget (#119 ui/props.js Props.renderWidget);
+       an edit calls ctx.onChange(value) and the plugin owns the write. */
+    const TYPES_WHY = "the property editor widgets are not loaded";
     const isDateStr = s => {
       const m = window.moment;
       if (m && m.ISO_8601) return m(s, m.ISO_8601, true).isValid();
@@ -926,7 +960,11 @@
     const vStr = v => typeof v === "string", vList = v => typeof v === "string" || Array.isArray(v);
     const widget = (type, icon, label, validate, extra) => Object.assign({
       type, icon, name: () => label, validate,
-      render() { throw unsupported(TYPES_WHY); },
+      render(containerEl, value, ctx) {
+        if (!window.Props || typeof window.Props.renderWidget !== "function") throw unsupported(TYPES_WHY);
+        if (!containerEl || typeof containerEl.appendChild !== "function") throw new TypeError("render: containerEl is not an element");
+        return window.Props.renderWidget(type, containerEl, value, ctx);
+      },
     }, extra);
     const UNKNOWN_W = widget("unknown", "lucide-file-question", "Unknown", () => false);
     function inferType(v) {

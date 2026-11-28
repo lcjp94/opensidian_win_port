@@ -60,30 +60,27 @@ pub fn canvas_rel(op: &str, path: &str) -> Result<PathBuf, String> {
     Ok(rel)
 }
 
-fn walk(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize, keep: fn(&str) -> bool) {
-    if depth >= vaultfs::MAX_WALK_DEPTH {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let name = e.file_name();
-        let Some(n) = name.to_str() else { continue };
+fn walk(dir: &Path, base: &Path, out: &mut Vec<String>, keep: fn(&str) -> bool) {
+    // iterative (vaultfs::walk_tree): a deep vault cannot exhaust the stack
+    vaultfs::walk_tree(dir, vaultfs::MAX_WALK_DEPTH, |e, _| {
+        let Some(n) = e.name.to_str() else { return false };
         if n.starts_with('.') {
-            continue;
+            return false;
         }
         // DirEntry::file_type does not follow symlinks: a link is neither
-        let Ok(t) = e.file_type() else { continue };
-        let p = e.path();
+        let Some(t) = e.ft else { return false };
         if t.is_dir() {
-            walk(&p, base, out, depth + 1, keep);
-        } else if t.is_file() && keep(n) {
-            if let Ok(rel) = p.strip_prefix(base) {
-                if let Some(s) = rel.to_str() {
-                    out.push(s.to_string());
+            return true;
+        }
+        if t.is_file() && keep(n) {
+            if let Ok(rel) = e.path.strip_prefix(base) {
+                if rel.to_str().is_some() {
+                    out.push(vaultfs::rel_slash(rel));
                 }
             }
         }
-    }
+        false
+    })
 }
 
 fn is_canvas(n: &str) -> bool {
@@ -101,7 +98,7 @@ fn is_media(n: &str) -> bool {
 fn list_by(root: &Path, keep: fn(&str) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(c) = root.canonicalize() {
-        walk(&c, &c, &mut out, 0, keep);
+        walk(&c, &c, &mut out, keep);
     }
     out.sort();
     out
@@ -116,10 +113,20 @@ pub fn media(root: &Path) -> Vec<String> {
     list_by(root, is_media)
 }
 
+#[cfg(unix)]
+fn is_enoent(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOENT))
+}
+
+#[cfg(not(unix))]
+fn is_enoent(_: &io::Error) -> bool {
+    false
+}
+
 fn exists(v: &Vault, rel: &Path) -> io::Result<bool> {
     match v.p_stat(rel) {
         Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(libc::ENOENT)) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound || is_enoent(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -404,13 +411,14 @@ pub fn attach(root: &Path, path: &str, data_b64: &str) -> Result<String, String>
         let _ = v.unlink(&rel);
         return Err(e(x));
     }
-    Ok(rel.to_string_lossy().into_owned())
+    Ok(vaultfs::rel_slash(&rel))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn fresh(tag: &str) -> (PathBuf, PathBuf) {
@@ -470,6 +478,7 @@ mod tests {
         assert!(op(&root, "unlink", "A.canvas", None).unwrap_err().starts_with("ENOSYS"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_symlinks_are_never_followed() {
         let (root, out) = fresh("link");
@@ -541,6 +550,7 @@ mod tests {
         assert!(fs::read_dir(&out).unwrap().next().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_relink_rewrites_file_cards_only_byte_exact() {
         let (root, out) = fresh("relink");
@@ -570,6 +580,7 @@ mod tests {
         assert_eq!(v["nodes"][3]["file"], json!("Note.md"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_trash_moves_into_dot_trash() {
         let (root, out) = fresh("trash");
@@ -629,6 +640,7 @@ mod tests {
         assert!(!root.join("nodir").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn canvasfs_attach_refuses_traversal_absolute_hidden_and_symlinks() {
         let (root, out) = fresh("attach-esc");

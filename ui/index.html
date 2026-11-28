@@ -9,6 +9,8 @@
 -->
 <html><head><meta charset="utf-8"><title>Opensidian</title>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="menu.css">
+<link rel="stylesheet" href="tables.css">
 <link rel="stylesheet" href="plugins/plugins.css"></head>
 <body>
 <!-- R33 frameless window: the window ships with decorations:false, so THIS is the
@@ -60,8 +62,8 @@
     <div id="bmbar" class="hbar"><button id="bmaddbtn" title="Bookmark the active tab..."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/><path d="M12 7v6M9 10h6"/></svg></button><button id="bmgrpbtn" title="New group"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6M9 14h6"/></svg></button><button id="bmcabtn" class="cabtn" title="Collapse all"></button><button id="bmfltbtn" aria-disabled="true" title="Show search filter (not available yet: the bookmarks pane has no filter)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button></div>
     <div id="bmlist"></div>
   </div>
-  <!-- settings-gear (#29): the vault bar = the vault switcher + a Settings gear on its right (lucide "settings" glyph). The name flexes and ellipsizes; the gear never moves or shrinks. -->
-  <div id="vbar"><div id="vswitch" title="switch vault"></div><button id="sgear" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+  <!-- settings-gear (#29): the vault bar = the vault switcher + a Settings gear on its right (lucide "settings" glyph, drawn by main.js svgIcon — #130 one source). The name flexes and ellipsizes; the gear never moves or shrinks. -->
+  <div id="vbar"><div id="vswitch" title="switch vault"></div><button id="sgear" title="Settings" aria-label="Settings"></button></div>
 </div>
 <div id="ldiv"></div>
 <div id="main"><!-- split tree rendered here: .split nodes, .pane leaves (M6) --></div>
@@ -72,21 +74,23 @@
     <button id="rtab-out" class="stab" title="Outgoing links"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/><path d="M17 17l4 4M21 17v4h-4"/></svg></button>
     <button id="rtab-tags" class="stab" title="Tags"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12V4h8l9 9-8 8z"/><circle cx="7.5" cy="8.5" r="1.5"/></svg></button>
     <button id="rtab-toc" class="stab" title="Outline"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg></button>
+    <button id="rtab-props" class="stab" title="All properties" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h4M4 12h4M4 18h4M11 6h9M11 12h9M11 18h9"/></svg></button>
     <button id="rtoggle" title="Expand right sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
   </div>
   <div id="rpane-bl" class="spane" hidden><div class="rhead" id="blhead"></div><div id="bllist" class="rlist"></div></div>
   <div id="rpane-out" class="spane" hidden><div class="rhead" id="outhead"></div><div id="outlist" class="rlist"></div></div>
   <div id="rpane-tags" class="spane" hidden><div class="rhead" id="tagshead"></div><div id="taglist" class="rlist"></div></div>
   <div id="rpane-toc" class="spane" hidden><div id="toclist" class="rlist"></div></div>
+  <div id="rpane-props" class="spane" hidden><div class="rhead" id="propshead"></div><div id="propslist" class="rlist"></div></div>
 </div>
 <div id="picker" hidden>
-  <div id="pcard">
+  <div id="pcard" class="modal">
     <button id="p-close" title="Close" hidden><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg></button>
     <div id="ptitle"><img id="plogo" data-src="logo.svg" alt="" width="36" height="36"><span id="ptname">Opensidian</span></div>
     <div id="p-actions">
       <div class="prow">
         <div class="ptext"><b>Create new vault</b><span>Create a new vault under a folder.</span></div>
-        <button id="p-create">Create</button>
+        <button id="p-create" class="mod-cta">Create</button>
       </div>
       <div class="prow">
         <div class="ptext"><b>Open folder as vault</b><span>Choose an existing folder of Markdown files.</span></div>
@@ -111,7 +115,7 @@
 <div id="dropmsg" hidden></div><!-- R31.5: a refused drop says WHY; a drop that does nothing silently is a bug report -->
 <div id="anew" hidden><input id="apath" placeholder="path to an image file" spellcheck="false"></div><!-- R31.7 "Insert attachment": the same attach path a drop takes, for people (and probes) with no pointer -->
 <div id="modal" hidden><div id="mbox">
-  <input id="minput" spellcheck="false" autocomplete="off">
+  <input id="minput" class="prompt-input" spellcheck="false" autocomplete="off">
   <div id="mlist"></div>
   <div id="mfoot" hidden></div>
 </div></div>
@@ -119,14 +123,14 @@
   <div id="shead"><span>Settings</span><button id="sclose" title="Close"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg></button></div>
   <div id="sbody"><div id="snav"></div><div id="spage"></div></div>
 </div></div>
-<div id="rnbox" hidden><input id="rninput" spellcheck="false" autocomplete="off" placeholder="new name"></div>
+<div class="rnmc"><div id="rnbox" class="modal" hidden><input id="rninput" spellcheck="false" autocomplete="off" placeholder="new name"></div></div><!-- #59 slice 3: .rnmc is display:contents, the box stays position:fixed; .modal-container is set only while a dialog is open (main.js dlgContainer) -->
 <!-- R34.4-R34.7 "Update links": the PROMPT that sits BETWEEN the rename and the
      link rewrite. The wording follows Obsidian's prompt: the title is
      "Update links", the body is a question, and #ulsay states the counted blast
      radius ("This will affect 4 links in 1 file.") which is computed BEFORE the
      prompt (move_note returns it). Three buttons, "Always update" first and
      focused — measured in PIXELS on D2/D3/D4, not OCR'd. -->
-<div id="ulbox" hidden><div id="ulcard">
+<div id="ulbox" hidden><div id="ulcard" class="modal">
   <div id="ultitle">Update links</div>
   <div id="ulq">Do you want to update internal links that link to this file?</div>
   <div id="ulsay"></div>
@@ -143,13 +147,13 @@
      notes link to it. That last number is here because of R24.8: those links
      are NOT rewritten, they go faded (R24.9), and this dialog is the only
      place the user is told before the fact. -->
-<div id="delbox" hidden><div id="delcard">
+<div id="delbox" hidden><div id="delcard" class="modal">
   <div id="deltitle">Delete file</div>
   <div id="delq"></div>
   <div id="delsay"></div>
   <div id="delbtns">
-    <button id="del-no">Cancel</button>
-    <button id="del-yes">Delete</button>
+    <button id="del-no" class="mod-cancel">Cancel</button>
+    <button id="del-yes" class="mod-cta mod-destructive">Delete</button>
   </div>
 </div></div>
 <!-- R4X.7 "Edit bookmark" — Obsidian's route for moving a bookmark BETWEEN groups
@@ -170,16 +174,36 @@
     <button id="bme-yes">Save</button>
   </div>
 </div></div>
+<!-- #94: "Manage workspace layouts" (core Workspaces parity). Name + Save on top, then one row per saved layout:
+     click the name to load it, the pencil renames in place, the bin deletes. Built by wsmRender (ui/main.js). -->
+<div id="wsmbox" hidden><div id="wsmcard">
+  <button id="wsmx" aria-label="Close">×</button>
+  <div id="wsmtitle">Manage workspace layouts</div>
+  <div id="wsmsaverow"><input id="wsmname" spellcheck="false" autocomplete="off" placeholder="Name of workspace layout"><button id="wsmsave">Save</button></div>
+  <div id="wsmlist"></div>
+  <div id="wsmempty" hidden></div>
+</div></div>
 <!-- R34.12/R34.13: a refusal is VISIBLE. Obsidian puts a notice on screen and
      renames nothing; a refusal nobody can see is indistinguishable from a
      rename that silently did nothing. -->
 <div id="notice" hidden></div>
 </div>
+<script src="vendor/fluent/fluent-bundle.js"></script>
+<script src="i18n.js"></script>
+<script src="icons.js"></script>
 <script src="census.js"></script>
+<script src="menu.js"></script>
+<script src="edmenu.js"></script>
 <script src="otel.js"></script>
 <script src="graph-gl.js"></script>
+<script src="graph-phys.js"></script>
 <script src="vendor/codemirror/cm6.js"></script>
 <script src="editor.js"></script>
+<script src="mermaid.js"></script>
+<script src="codehl.js"></script>
+<script src="mathview.js"></script>
+<script src="props-model.js"></script>
+<script src="props.js"></script>
 <script src="plugins/editor-api.js"></script>
 <script src="plugins/node-leaves.js"></script>
 <script src="plugins/loader.js"></script>
@@ -207,6 +231,7 @@
 <script src="plugins/canvas-files.js"></script>
 <script src="plugins/canvas-media.js"></script>
 <script src="plugins/canvas-perf.js"></script>
+<script src="security.js"></script>
 <script src="keychain.js"></script>
 <script src="main.js"></script>
 </body></html>

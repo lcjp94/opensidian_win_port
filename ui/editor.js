@@ -85,6 +85,10 @@ const Ed = {
     const ind = s.match(/^[ \t]*/)[0], t = s.slice(ind.length);
     const h = /^(#{1,6}) /.exec(t);
     if (h && !ind) {
+      // #319: a top-level heading LINE carries stock 1.13.7's line classes (DOM: "cm-line HyperMD-header
+      // HyperMD-header-N"), so theme rules keyed on them (Minimal .cm-s-obsidian .cm-line.HyperMD-header) reach it.
+      // d > 0 (a heading inside a quote): `row` is the quote box, not the line -> no line class.
+      if (d === 0) row.classList.add("HyperMD-header", "HyperMD-header-" + h[1].length);
       const box = Ed.el("span", "h h" + h[1].length);
       const m0 = Ed.mk(h[1]), m1 = Ed.mk(" ");
       box.appendChild(m0);
@@ -122,14 +126,29 @@ const Ed = {
     const lm = /^([-*+]|\d+\.) /.exec(t);
     if (lm) {
       const rest = t.slice(lm[0].length);
-      if (ind) row.appendChild(Ed.t(ind));
+      // #272: the item is TWO boxes, span.lpre (indent + marker [+ checkbox + "[ ] "]) and
+      // span.lbody (the text). style.css lays a row holding both side by side (flex), so a
+      // wrapped continuation line starts under the item TEXT (hanging indent), as stock does;
+      // without the split every wrapped line restarted at the row's left edge. Wrapping
+      // changes no textContent (token ranges, caret mapping and the census are per character).
+      const pre = Ed.el("span", "lpre");
+      if (ind) pre.appendChild(Ed.t(ind));
       // the marker glyphs and their trailing space are SEPARATE hidden spans:
       // R15.10 gives .lim a fixed marker advance as a box (bullet drawn
       // inside it), and the space must not sit in that box or a wide "10."
       // would push the text right by its width. textContent is unchanged.
       const li0 = Ed.mk(lm[1], "lim"), li1 = Ed.mk(" ", "lisp");
-      row.appendChild(li0);
-      row.appendChild(li1);
+      pre.appendChild(li0);
+      pre.appendChild(li1);
+      row.appendChild(pre);
+      // the body box; a body that renders no text (an embed-only item) stays unwrapped: a
+      // text-less span would become a CM6 widget leaf (lpParse), so that row keeps today's flow
+      const body = s => {
+        const b = Ed.el("span", "lbody");
+        Ed.inline(g, b, s);
+        if (b.textContent.length) row.appendChild(b);
+        else while (b.firstChild) row.appendChild(b.firstChild);
+      };
       row.classList.add("li");
       if (/\d/.test(lm[1])) row.classList.add("ord");
       // deep-tasks: any one status character is a task (Obsidian Tasks "[/]" "[-]" ...); only a BULLET
@@ -144,16 +163,33 @@ const Ed = {
         cb.type = "checkbox"; cb.checked = task[1] !== " ";
         cb.contentEditable = "false";
         Ed.taskBox(cb);
-        row.appendChild(cb);
+        pre.appendChild(cb);
         const tm = Ed.mk("[" + task[1] + "] ", "task");
-        row.appendChild(tm);
+        pre.appendChild(tm);
         // R17.6 lists "- [ ] " as ONE token: the bullet marker and the
         // checkbox are the same widget, so they reveal together.
         Ed.tok([li0, li1, cb, tm], [li0, li1, tm], "task");
-        Ed.inline(g, row, rest.slice(4));
+        // #45: the done strike is drawn on the TEXT (span.tkt), not the row: a row-level
+        // text-decoration also struck the literal indent of a nested item, a dash left of
+        // the box. Empty text gets no span (a text-less element would become a widget leaf).
+        // gh #75: a BLANK task (no body) instead gets exactly such a leaf on purpose, span.tcar:
+        // a zero-width inline-block caret anchor after the checkbox (lpParse -> widget at
+        // ln.from + t.e, side 1). Without it the caret at the marker end (#46 keeps the box
+        // there) only maps into the hidden "[ ] " marker, which has no box, and WebKit paints
+        // it at the row start, LEFT of the checkbox.
+        const tb = rest.slice(4);
+        if (tb) {
+          // #272: the strike span IS the body box (one element, not two marks over the
+          // same range, whose nesting CM6 would be free to pick); text-less: plain tkt
+          const tt = Ed.el("span", "tkt");
+          Ed.inline(g, tt, tb);
+          if (tt.textContent.length) tt.classList.add("lbody");
+          row.appendChild(tt);
+        }
+        else row.appendChild(Ed.el("span", "tcar"));
       } else {
         Ed.tok([li0, li1], [li0, li1], "li");
-        Ed.inline(g, row, rest);
+        body(rest);
       }
       return;
     }
@@ -228,7 +264,11 @@ const Ed = {
         flush();
         const a = Ed.el("a", "tag");
         a.href = "#"; a.dataset.tag = s.slice(tg[0] + 1, tg[1]);
-        a.appendChild(Ed.t(s.slice(tg[0], tg[1])));
+        // stock live preview splits a tag into .cm-hashtag-begin ('#') + .cm-hashtag-end (name):
+        // themes style those classes (Solarized squares them), so the pill box lives on them
+        const hb = Ed.el("span", "cm-hashtag cm-hashtag-begin"), he = Ed.el("span", "cm-hashtag cm-hashtag-end");
+        hb.appendChild(Ed.t(s.slice(tg[0], tg[0] + 1))); a.appendChild(hb);
+        if (tg[1] > tg[0] + 1) { he.appendChild(Ed.t(s.slice(tg[0] + 1, tg[1]))); a.appendChild(he); }
         a.addEventListener("mousedown", e => {
           e.preventDefault(); e.stopPropagation();
           if (typeof tagSearch === "function") tagSearch(a.dataset.tag);
@@ -264,7 +304,9 @@ const Ed = {
           eadd(Ed.mk("![["), true);
           eadd(Ed.mk(raw, "img"), true);                          // the whole inner text, folded
           eadd(Ed.mk("]]"), true);
-          eadd(Ed.imgEl(target, bar >= 0 ? label : target), false);  // alias is the alt (image_html)
+          // CodeAnt #262: image_html decides remote by url_scheme FIRST, so ![[https://h/x.svg]] is the
+          // remote banner in reading view; pass the same flag, or live preview looked it up locally
+          eadd(Ed.imgEl(target, bar >= 0 ? label : target, /^https?:/i.test(target)), false);  // alias is the alt (image_html)
           Ed.tok(em, emk, "img");
           i += wl[0].length; continue;
         }
@@ -278,6 +320,18 @@ const Ed = {
           eadd(Ed.mk("]]"), true);
           const note = hash >= 0 ? target.slice(0, hash) : target;
           eadd(Ed.pdfEl(note, hash >= 0 ? target.slice(hash) : "", bar >= 0 ? label : note), false);
+          Ed.tok(em, emk, "img");
+          i += wl[0].length; continue;
+        }
+        // #116 `![[Recording 20261115.webm]]`: an AUDIO embed -> an <audio> player (Ed.audioEl). Bang present,
+        // no anchor, an audio extension (Ed.AUDIO_EXTS); the reading view's linkify takes the same branch (main.rs)
+        if (wl[1] === "!" && hash < 0 && Ed.isAudio(target)) {
+          const em = [], emk = [];
+          const eadd = (el, isMk) => { em.push(el); if (isMk) emk.push(el); box.appendChild(el); };
+          eadd(Ed.mk("![["), true);
+          eadd(Ed.mk(raw, "img"), true);
+          eadd(Ed.mk("]]"), true);
+          eadd(Ed.audioEl(target, bar >= 0 ? label : target), false);
           Ed.tok(em, emk, "img");
           i += wl[0].length; continue;
         }
@@ -301,7 +355,7 @@ const Ed = {
         const add = (el, isMk) => { parts.push(el); if (isMk) mks.push(el); box.appendChild(el); };
         add(Ed.mk(wl[1] + "[["), true);
         if (bar >= 0) add(Ed.mk(target + "|", "wl"), true);
-        const a = Ed.el("a", "wiki wl");
+        const a = Ed.el("a", "wiki wl cm-hmd-internal-link");   // #339: stock LP link class (AnuPpuccin scopes --link-decoration: none to it)
         a.href = "#";
         const note = hash >= 0 ? target.slice(0, hash) : target;
         if (note) a.dataset.note = note;
@@ -333,6 +387,7 @@ const Ed = {
           add(Ed.mk("](" + im[2] + ")", "img"), true);
           const ph = im[2].indexOf("#"), pp = ph >= 0 ? im[2].slice(0, ph) : im[2];
           add(!rem && Ed.isPdf(pp) ? Ed.pdfEl(pp, ph >= 0 ? im[2].slice(ph) : "", im[1])   // image_html's pdf split
+                                   : !rem && ph < 0 && Ed.isAudio(pp) ? Ed.audioEl(pp, im[1])   // #116 image_html's audio split
                                    : Ed.imgEl(im[2], im[1], rem), false);
           Ed.tok(parts, mks, "img");
           i += 1 + im[0].length; continue;
@@ -368,7 +423,7 @@ const Ed = {
       }
       let done = false;
       for (const [open, cls, tag] of [["***", "bi", "strong"], ["**", "b", "strong"],
-                                      ["~~", "s", "span"], ["==", "hl", "mark"],
+                                      ["~~", "s", "span"], ["==", "hl", "span"],
                                       ["*", "i", "em"], ["_", "i", "em"]]) {
         if (!rest.startsWith(open)) continue;
         if (open === "_" && i > 0 && !/\s/.test(s[i - 1])) break;  // intraword _ is plain
@@ -380,6 +435,7 @@ const Ed = {
           const m0 = Ed.mk(open);
           box.appendChild(m0);
           const e = Ed.el(tag, cls);
+          if (cls === "hl") e.classList.add("cm-highlight");   // #335: stock LP highlight is span.cm-highlight, so theme rules for it (Solarized .cm-s-obsidian span.cm-highlight, Gruvbox .cm-highlight) reach it
           Ed.inline(g, e, s.slice(a0, j));
           box.appendChild(e);
           const m1 = Ed.mk(open);
@@ -442,7 +498,7 @@ const Ed = {
      R29.7: reading view (Rust/pulldown-cmark) and live preview are separate
      engines, so every decision below mirrors ONE named function in
      src-tauri/src/main.rs and nothing else:
-       Ed.isImg     <- is_img_target        (index::IMG_EXTS, 5 extensions)
+       Ed.isImg     <- is_img_target        (index::IMG_EXTS, 6 extensions)
        Ed.pctDec    <- pct_decode           (strict: %XX or nothing)
        Ed.pctEnc    <- pct_encode           (unreserved + '/' survive)
        Ed.imgRel    <- index::resolve       (exact, else basename suffix)
@@ -452,7 +508,7 @@ const Ed = {
      non-symlinked vault members, so a traversal target resolves to nothing
      and gets no URL at all (the byte server re-checks containment anyway).
      An unresolved target is R29.4's banner in both engines. */
-  IMG_EXTS: ["png", "jpg", "jpeg", "gif", "webp"],
+  IMG_EXTS: ["png", "jpg", "jpeg", "gif", "webp", "svg"],
   IMG_SCHEME: "opensidian-img",
   isImg(t) {                                   // is this target an IMAGE embed, not a note embed?
     const i = t.lastIndexOf(".");
@@ -495,7 +551,9 @@ const Ed = {
   },
   imgSrc(target) {
     const rel = Ed.imgRel(target);
-    return rel === null ? null : Ed.IMG_SCHEME + "://localhost/" + Ed.pctEnc(rel);
+    return rel === null ? null : (typeof window.__osCustomSchemeUrl === "function"
+      ? window.__osCustomSchemeUrl(Ed.IMG_SCHEME, Ed.pctEnc(rel))
+      : Ed.IMG_SCHEME + "://localhost/" + Ed.pctEnc(rel));
   },
   // the ONE widget both syntaxes paint. Carries no TEXT node in either branch:
   // the row's textContent must stay === its source line (the token map walks
@@ -504,14 +562,74 @@ const Ed = {
   // banner a missing local target takes, labelled with the constant
   // "remote image" (main.rs REMOTE_IMG_LABEL), never the URL. The renderer
   // refusing to mint the src is layer 1; the CSP's img-src is the backstop.
+  // #144 toggle 1 (Load external resources) mirrors main.rs image_html / remote_html:
+  // an https target mints its element ONLY while this page's CSP carries https:
+  // (security_get pageRemote, ui/security.js); otherwise the banner, and data-why
+  // names the setting that is the cause (CSS paints it after the R29.4 sentence).
+  remoteOn() {
+    const s = window.__osSecurity && window.__osSecurity.get();
+    return !!(s && s.pageRemote === true);
+  },
+  // #144 toggle 4 (Render media) mirrors main.rs media_off_html: while THIS page's CSP lacks
+  // opensidian-img: / blob: (security_get pageMedia === false, ui/security.js) a resolved vault
+  // image / PDF / audio embed is ONE placeholder — no src, no data-pdf, no media_read. No text
+  // node (the LP row's textContent stays its source line): CSS paints data-name + data-why.
+  mediaOn() {
+    const s = window.__osSecurity && window.__osSecurity.get();
+    return !(s && s.pageMedia === false);
+  },
+  MEDIA_WHY: "(Settings › Security › Render media)",
+  mediaOffEl(rel) {
+    const s = Ed.el("span", "imgmiss secmedia");
+    s.dataset.name = String(rel).split("/").pop();
+    s.dataset.sec = "vaultMedia";
+    s.dataset.why = Ed.MEDIA_WHY;
+    s.contentEditable = "false";
+    return s;
+  },
+  remoteEl(url, alt) {
+    const ext = (url.split(/[?#]/)[0].match(/\.([^./]+)$/) || ["", ""])[1].toLowerCase();
+    const kind = ["mp4", "m4v", "mov", "ogv"].includes(ext) ? "video" : Ed.isAudio("x." + ext) ? "audio" : "img";
+    const e = Ed.el(kind, kind === "img" ? "rimg" : "rmedia");
+    if (kind === "img") {
+      e.setAttribute("loading", "lazy");        // before src, as for vault images (audit #10)
+      e.setAttribute("referrerpolicy", "no-referrer");
+      e.setAttribute("alt", alt || "");
+      e.draggable = false;
+    } else {
+      e.setAttribute("controls", ""); e.setAttribute("preload", "none");
+      e.setAttribute("title", alt || "");
+    }
+    e.setAttribute("src", url);
+    e.contentEditable = "false";
+    return e;
+  },
   imgEl(target, alt, remote) {
-    const src = remote ? null : Ed.imgSrc(target);
-    if (src === null) {
+    if (remote) {
+      const on = Ed.remoteOn();
+      if (on && /^https:\/\//i.test(target)) return Ed.remoteEl(target, alt);
       const s = Ed.el("span", "imgmiss");
-      s.dataset.miss = remote ? "remote image" : target;  // CSS: “<label>” could not be found.
+      s.dataset.miss = "remote image";
+      s.dataset.sec = "remoteMedia";
+      s.dataset.why = on ? "(Settings › Security › Load external resources: only https:// addresses load)"
+                         : "(Settings › Security › Load external resources is off)";
       s.contentEditable = "false";
       return s;
     }
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(target)) {   // image_html: any other url_scheme -> "remote image" could not be found
+      const s = Ed.el("span", "imgmiss");
+      s.dataset.miss = "remote image";
+      s.contentEditable = "false";
+      return s;
+    }
+    const src = Ed.imgSrc(target);
+    if (src === null) {
+      const s = Ed.el("span", "imgmiss");
+      s.dataset.miss = target;  // CSS: “<label>” could not be found.
+      s.contentEditable = "false";
+      return s;
+    }
+    if (!Ed.mediaOn()) return Ed.mediaOffEl(Ed.imgRel(target));   // #144 toggle 4 off
     const im = Ed.el("img", "vimg");
     // audit #10: fetch on approach, not at render. Every opensidian-img request is
     // answered on the UI process's main loop, so 20k eager embeds queued 20k
@@ -567,6 +685,7 @@ const Ed = {
       s.contentEditable = "false";
       return s;
     }
+    if (!Ed.mediaOn()) return Ed.mediaOffEl(rel);   // #144 toggle 4 off: no frame, no pdf_info
     const f = Ed.pdfFrag(frag || "");
     const s = Ed.el("span", "internal-embed pdf-embed");
     s.dataset.pdf = Ed.pctEnc(rel);
@@ -582,12 +701,221 @@ const Ed = {
     Ed.pdfFill(s);
     return s;
   },
+  /* ---------- #116 AUDIO EMBEDS (both engines) ----------
+     `![[x.webm]]` / `![](x.mp3)` -> span.internal-embed.media-embed.audio-embed holding ONE <audio controls>.
+     The path is resolved against the vault's MEDIA list (main.js mediaCache = canvas_io "media": real,
+     non-hidden, non-symlinked vault members, the list the explorer and canvas cards use), never the note's
+     target, so a traversal target gets no player at all. The bytes come from media_read (vault-confined,
+     MEDIA_TYPES whitelist, no-follow, 256 MiB cap) as a blob: URL — WebKitGTK's player reads no custom
+     scheme — loaded once the embed is on screen (or on play) on a TRUSTED page; on a RESTRICTED page only after
+     the user presses Play (#139 click-to-play; both pages CSP media-src 'self' blob:, main.rs csp_by_trust).
+     No text node (the row's textContent stays its source line): messages are CSS from data-*.
+     Reading view: main.rs audio_html emits the same span with data-target; Ed.audioFill resolves it. */
+  AUDIO_EXTS: ["mp3", "webm", "wav", "m4a", "ogg", "3gp", "flac"],
+  AUDIO_MIME: { mp3: "audio/mpeg", webm: "audio/webm", wav: "audio/wav", m4a: "audio/mp4", ogg: "audio/ogg", "3gp": "audio/3gpp", flac: "audio/flac" },
+  AUDIO_MAX: 256 * 1024 * 1024,
+  _aud: { live: new Map(), reads: 0, timer: 0, trust: null },
+  isAudio(t) {
+    const i = t.lastIndexOf(".");
+    return i > 0 && Ed.AUDIO_EXTS.includes(t.slice(i + 1).toLowerCase());
+  },
+  audioRel(target) {                           // vault-relative path from the media list, or null (imgRel's rule)
+    const dec = Ed.pctDec(target) ?? target;
+    const L = typeof mediaCache !== "undefined" && Array.isArray(mediaCache) ? mediaCache : [];
+    if (!dec) return null;
+    return L.find(x => x === dec) || L.find(x => x.endsWith("/" + dec)) || null;
+  },
+  audioEl(target, alt) {
+    // #144 toggle 4 off: the placeholder (the note's target name; nothing resolved, no media_read)
+    if (!Ed.mediaOn()) return Ed.mediaOffEl(Ed.pctDec(target) ?? target);
+    const s = Ed.el("span", "internal-embed media-embed audio-embed");
+    s.dataset.target = target;
+    s.dataset.alt = alt || "";
+    s.contentEditable = "false";
+    Ed.audioFill(s);
+    return s;
+  },
+  // the trust of THIS page (its CSP is fixed at load): plugins_state.pageEval, asked once
+  audioTrusted() {
+    const A = Ed._aud;
+    return A.trust || (A.trust = Promise.resolve().then(() => inv("plugins_state")).then(s => !!(s && s.pageEval), () => false));
+  },
+  async audioBlob(p) {
+    const parts = []; let off = 0, size = 0;
+    do {
+      Ed._aud.reads++;
+      const buf = await inv("media_read", { path: p, offset: off });
+      size = Number(new DataView(buf, 0, 8).getBigUint64(0));
+      if (size > Ed.AUDIO_MAX) throw new Error("too large");
+      const c = buf.slice(8);
+      if (!c.byteLength && off < size) throw new Error("short read");
+      parts.push(c); off += c.byteLength;
+    } while (off < size);
+    const ext = p.slice(p.lastIndexOf(".") + 1).toLowerCase();
+    return new Blob(parts, { type: Ed.AUDIO_MIME[ext] || "" });
+  },
+  /* #197: the player's spinner and "--:--". WebKit's native controls (public WebKit source,
+     Modules/modern-media-controls/media/status-support.js) paint the activity indicator in place of the
+     elapsed time, and NaN as the duration, while
+       !media.played.length && media.readyState !== HAVE_ENOUGH_DATA && media.networkState === NETWORK_LOADING.
+     WebKitGTK's GStreamer player turns its download buffering OFF for every blob: URL
+     (MediaPlayerPrivateGStreamer::updateDownloadBufferingFlag, "Blob URI detected"), so a plain blob: player
+     never learns its download finished: it rests at HAVE_FUTURE_DATA (3) with networkState LOADING, i.e.
+     spinner + "--:--" until the first play, whatever Duration the file carries. A Media Source
+     (W3C Media Source Extensions) holding the whole file is different: after endOfStream() every byte is
+     buffered, the duration is the buffered end, and the element reaches HAVE_ENOUGH_DATA. So a WebM the engine's
+     MSE accepts (the recorder writes audio/webm;codecs=opus) plays from a MediaSource; anything else, or any MSE
+     refusal (no MediaSource, type unsupported, addSourceBuffer / appendBuffer / decode error), plays from the
+     plain blob: URL exactly as before. Both are blob: URLs (media-src 'self' blob:, csp_by_trust); the bytes are
+     the same media_read bytes, read at the same moment (after the press on a restricted page). */
+  AUDIO_MSE: { webm: ['audio/webm; codecs="opus"', 'audio/webm; codecs="vorbis"'] },
+  audioUrl(b, rel, a, s, play) {
+    const A = Ed._aud, MS = typeof window !== "undefined" ? window.MediaSource : undefined;
+    const ext = rel.slice(rel.lastIndexOf(".") + 1).toLowerCase();
+    const t = MS && typeof MS.isTypeSupported === "function" ? (Ed.AUDIO_MSE[ext] || []).find(x => MS.isTypeSupported(x)) : undefined;
+    if (!t) return URL.createObjectURL(b);
+    let keep = b, ms, u;                         // keep: the fallback's bytes, dropped once the Media Source holds them all
+    try { ms = new MS(); u = URL.createObjectURL(ms); } catch (_) { return URL.createObjectURL(b); }
+    const back = () => {
+      if (!keep || !A.live.has(u) || a.getAttribute("src") !== u) return;
+      const p = URL.createObjectURL(keep); keep = null;
+      URL.revokeObjectURL(u); A.live.delete(u); A.live.set(p, s);
+      a.src = p;
+      if (play) { const r = a.play(); if (r && r.catch) r.catch(() => {}); }
+      if (typeof updateTitle === "function") updateTitle();
+    };
+    a.addEventListener("error", back, { once: true });
+    ms.addEventListener("sourceopen", () => {
+      let sb;
+      try { sb = ms.addSourceBuffer(t); } catch (_) { back(); return; }
+      sb.addEventListener("error", back, { once: true });
+      sb.addEventListener("updateend", () => {
+        try { if (ms.readyState === "open") ms.endOfStream(); keep = null; } catch (_) { back(); }
+      }, { once: true });
+      keep.arrayBuffer().then(buf => { try { sb.appendBuffer(buf); } catch (_) { back(); } }, back);
+    }, { once: true });
+    return u;
+  },
+  // object URLs of embeds no longer in the document are revoked (a re-render, a closed tab); so are those of an
+  // embed that has been OFF SCREEN (a view a mode left stays connected) and paused for AUDIO_IDLE — it reloads when
+  // it is on screen again (codeant M2 on #124: no blob, up to 256 MiB, is held by a view nobody sees)
+  AUDIO_IDLE: 60000,
+  audioSweep() {
+    const A = Ed._aud, now = Date.now();
+    for (const [u, s] of A.live) {
+      const a = s.querySelector("audio");
+      if (!s.isConnected) {
+        URL.revokeObjectURL(u); A.live.delete(u);
+        if (s._io) { s._io.disconnect(); s._io = null; }
+      } else if (s._io && !s._vis && s._hid && now - s._hid > Ed.AUDIO_IDLE && (!a || a.paused)) {
+        URL.revokeObjectURL(u); A.live.delete(u);
+        if (a) { a.removeAttribute("src"); a.load(); }
+        s.dataset.st = "";
+        if (s._c2p) { s.dataset.c2p = "1"; if (a) a.preload = "none"; }   // #139 restricted: back to click-to-play, never a reload on screen
+      }
+    }
+    if (!A.live.size && A.timer) { clearInterval(A.timer); A.timer = 0; }
+  },
+  /* #139 (operator 2026-11-16): a RESTRICTED page plays audio too, but CLICK-TO-PLAY. The risk is GStreamer
+     demuxing untrusted bytes, so nothing is parsed without a user act: preload="none", no load on visibility
+     (the observer only feeds audioSweep's off-screen revoke), and media_read + the blob: URL happen only after
+     the user presses the embed's Play button (or the player's own play). The restricted CSP names
+     media-src 'self' blob: for this (main.rs csp_by_trust) and nothing else. A TRUSTED page is unchanged:
+     preload="metadata", loaded ~150 ms after the embed is on screen (or on play). */
+  audioFill(s) {
+    if (s._af) return;
+    s._af = true;
+    const rel = Ed.audioRel(s.dataset.target || "");
+    if (rel === null) {                        // unresolved: R29.4's banner, as an image / PDF
+      s.className = "imgmiss audiomiss";
+      s.dataset.miss = Ed.pctDec(s.dataset.target || "") ?? s.dataset.target;
+      return;
+    }
+    s.dataset.audio = rel;
+    let a = s.querySelector("audio");
+    if (!a) { a = document.createElement("audio"); s.appendChild(a); }
+    a.controls = true; a.preload = "metadata"; // as before #139; no src (so no load) until go(); restricted flips it to none below
+    a.setAttribute("aria-label", s.dataset.alt || rel);
+    // #140: the census ([aud:] / [audv:]) carries the player's readyState; nothing else republishes the window
+    // title when a load lands or fails (the audio view has no editor around it), so these do
+    ["loadedmetadata", "error", "emptied"].forEach(n => a.addEventListener(n, () => { if (typeof updateTitle === "function") updateTitle(); }));
+    const go = play => {
+      if (s.dataset.st) return;
+      s.dataset.st = "loading";
+      Ed.audioBlob(rel).then(b => {
+        if (!s.isConnected) { s.dataset.st = ""; return; }
+        const A = Ed._aud, u = Ed.audioUrl(b, rel, a, s, play);   // #197: a MediaSource for a WebM, else a plain blob: URL
+        A.live.set(u, s);
+        if (!A.timer) A.timer = setInterval(Ed.audioSweep, 2000);
+        if (a.preload !== "metadata") a.preload = "metadata";   // restricted: only now, after the user pressed play
+        a.src = u; s.dataset.st = "ready"; delete s.dataset.c2p;
+        if (play) { const p = a.play(); if (p && p.catch) p.catch(() => {}); }   // the user pressed play: start it
+        if (typeof updateTitle === "function") updateTitle();
+      }, e => {
+        const why = String(e && e.message || e);
+        s.dataset.st = "error"; delete s.dataset.c2p;
+        s.dataset.err = /too large/.test(why) ? "Cannot play: the file is larger than 256 MB." : "Cannot play this file.";
+        if (typeof updateTitle === "function") updateTitle();
+      });
+    };
+    const observe = load => {
+      if (typeof IntersectionObserver !== "function") { if (load) setTimeout(go, 0); return; }
+      // kept for the embed's life: _vis/_hid feed audioSweep's off-screen revoke; trusted: back on screen -> go() reloads
+      s._io = new IntersectionObserver(en => {
+        const e = en[en.length - 1]; s._vis = e.isIntersecting;
+        if (e.isIntersecting) { if (load) setTimeout(go, 150); } else s._hid = Date.now();
+      });
+      s._io.observe(s);
+    };
+    Ed.audioTrusted().then(ok => {
+      if (ok) {
+        a.addEventListener("play", () => go(false));
+        observe(true);
+        return;
+      }
+      s._c2p = true; s.dataset.c2p = "1"; a.preload = "none";   // click-to-play: nothing parsed before the press
+      let b = s.querySelector("button.audio-c2p");
+      if (!b) {
+        b = document.createElement("button");
+        b.type = "button"; b.className = "audio-c2p";
+        b.title = "Play (restricted vault: the file is read when you press play)";
+        b.setAttribute("aria-label", "Play " + (s.dataset.alt || rel));
+        s.insertBefore(b, a);
+      }
+      b.addEventListener("mousedown", ev => ev.preventDefault());   // keep the editor's caret where it is
+      b.addEventListener("click", ev => { ev.preventDefault(); ev.stopPropagation(); go(true); });
+      a.addEventListener("play", () => { if (!s.dataset.st) { a.pause(); go(true); } });
+      observe(false);
+      if (typeof updateTitle === "function") updateTitle();
+    });
+  },
+  // census [aud:<n>|<path>:<state>:<readyState>:<duration s>@x,y|...] the painted audio embeds (lp + reading view)
+  audTok() {
+    // #139: [audrd:<media_read calls by audio embeds>|play=<embeds playing>|pre=<preload of each painted player>]
+    const all = [...document.querySelectorAll("#main span.audio-embed audio")];
+    const rd = !all.length && !Ed._aud.reads ? "" : " [audrd:" + Ed._aud.reads + "|play=" + all.filter(a => !a.paused).length + "|pre=" + (all.map(a => a.preload).join(",") || "-") + "]";
+    const ss = [...document.querySelectorAll("#main span.audio-embed, #main span.audiomiss")].filter(e => e.getClientRects().length > 0);
+    if (!ss.length) return rd;
+    const esc = v => String(v).replace(/[[\]|@:\s]/g, "_");
+    return " [aud:" + ss.length + "|" + ss.slice(0, 8).map(s => {
+      let r = s.getBoundingClientRect();
+      const a = s.querySelector("audio");
+      const k = s.closest(".preview") ? "rv" : "lp";
+      if (!a) return k + ":" + esc(s.dataset.miss || "") + ":miss:0:0@" + Math.round(r.x + r.width / 2) + "," + Math.round(r.y + r.height / 2);
+      const d = isFinite(a.duration) ? a.duration.toFixed(2) : a.duration === Infinity ? "inf" : "0";
+      // #139 restricted, not yet pressed: state c2p, the point is the Play button's centre
+      const b = s.dataset.c2p && !s.dataset.st ? s.querySelector("button.audio-c2p") : null;
+      if (b && b.getClientRects().length) r = b.getBoundingClientRect();
+      const stt = s.dataset.st || (b ? "c2p" : "idle");
+      return k + ":" + esc(s.dataset.audio) + ":" + stt + ":" + a.readyState + ":" + d + "@" + Math.round(r.x + r.width / 2) + "," + Math.round(r.y + r.height / 2);
+    }).join("|") + "]" + rd;
+  },
   PDF_TOOLBAR: 39, PDF_STOCK_AR: 792 / 612,
   // stock (recon README "Default frame size"): frame = w x aspect(page 1) + 20,
   // #height=N -> N + 38 (LP #page=&height=N -> N, stock quirk). Broken -> 800, like stock.
   pdfSize(s) {
     const w = s.clientWidth;
-    if (!w) return;
+    if (!w || s.dataset.full) return;     // issue #44: the PDF view's frame fills its pane (CSS .pdf-view)
     const h = s.dataset.height ? +s.dataset.height + (s.dataset.lpflat ? 0 : 38)
       : s.classList.contains("mod-broken") ? 800
       : Math.round(w * (s._pdfAr || Ed.PDF_STOCK_AR) + 20);
@@ -651,7 +979,9 @@ const Ed = {
             s.classList.add("is-loaded");
             if (typeof xiAgain === "function") xiAgain();
           };
-          im.setAttribute("src", Ed.IMG_SCHEME + "://localhost/" + s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px);
+          im.setAttribute("src", (typeof window.__osCustomSchemeUrl === "function"
+            ? window.__osCustomSchemeUrl(Ed.IMG_SCHEME, s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px)
+            : Ed.IMG_SCHEME + "://localhost/" + s.dataset.pdf + "?page=" + im.dataset.n + "&w=" + px));
         }
       }, { root: box, rootMargin: "100% 0px" });
       for (let i = 0; i < n; i++) {
@@ -695,7 +1025,8 @@ const Ed = {
     let c = 0, n;
     while ((n = w.nextNode())) {
       const m = n.parentElement.closest(".mk");
-      out.push({ n, c, len: n.nodeValue.length, hid: !!m && !m.classList.contains("rv") });
+      // #278: source mode (.lp.src) reveals every marker without the .rv class (Ed.lpMk)
+      out.push({ n, c, len: n.nodeValue.length, hid: !!m && !m.classList.contains("rv") && !(m.closest && m.closest(".lp.src")) });
       c += n.nodeValue.length;
     }
     return out;
@@ -735,15 +1066,100 @@ const Ed = {
     const m = /^(\s*(?:> )*(?:[-*+] \[[ xX]\] |[-*+] |\d+\. ))/.exec(t) || /^(\s*(?:> )+)/.exec(t);
     return m ? m[0].length : 0;
   },
-  // one RAW column left/right, crossing the line edge (R17.5 M69-M71). Pure:
-  // covered by Ed.selfTest. null = the document edge, leave it to the browser.
+  /* #274: the next USER-PERCEIVED character boundary in line text t from column c
+     (a UTF-16 index), going back or forward. One step crosses a whole grapheme
+     cluster — a ZWJ emoji sequence (🤦‍♂️ is 5 code units), a flag (two regional
+     indicators), a skin-tone modifier, a base + combining marks — as stock 1.13.7
+     does. Intl.Segmenter (UAX #29) when the engine has it; otherwise one CODE
+     POINT, never half a surrogate pair. seg === null forces that fallback (selfTest).
+     Returns c itself only at the text edge. Pure. */
+  _gseg: undefined,
+  gseg() {
+    if (Ed._gseg === undefined) {
+      try { Ed._gseg = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null; }
+      catch (_) { Ed._gseg = null; }
+    }
+    return Ed._gseg;
+  },
+  cluster(t, c, back, seg) {
+    t = String(t || "");
+    const n = t.length;
+    c = Math.max(0, Math.min(c, n));
+    if (back ? c === 0 : c === n) return c;
+    const S = seg === undefined ? Ed.gseg() : seg;
+    if (S) {
+      try {
+        // #274 review: ask for the LOW half when the index is the high half of a pair (same code
+        // point, so the same segment by UAX #29). JSC's containing(i) for a high surrogate i
+        // reports the PREVIOUS cluster's start (box census [edt:fail3:inside:2:7]): a caret just
+        // after the high half then stepped back past the cluster and Backspace split it.
+        let q = back ? c - 1 : c;
+        const u0 = t.charCodeAt(q), u1 = t.charCodeAt(q + 1);
+        if (u0 >= 0xd800 && u0 <= 0xdbff && u1 >= 0xdc00 && u1 <= 0xdfff) q++;
+        const cur = S.segment(t).containing(q);
+        if (cur) {
+          const k = back ? cur.index : cur.index + cur.segment.length;
+          if (back ? k < c : k > c) return k;
+        }
+      } catch (_) { /* fall through to code points */ }
+    }
+    const hi = u => u >= 0xd800 && u <= 0xdbff, lo = u => u >= 0xdc00 && u <= 0xdfff;
+    if (back) return c >= 2 && lo(t.charCodeAt(c - 1)) && hi(t.charCodeAt(c - 2)) ? c - 2 : c - 1;
+    return c + 1 < n && hi(t.charCodeAt(c)) && lo(t.charCodeAt(c + 1)) ? c + 2 : c + 1;
+  },
+  /* #274: where ONE Backspace at column c stops. Stock 1.13.7 (black-box, goal
+     fix-274 evidence logs stock-1/4/5): the cluster goes whole (🤦‍♂️, family, flag,
+     ❤️, 🏳️‍🌈, 😀) UNLESS it carries a "stop" extender after its first code point — a
+     combining/enclosing mark (U+0301, keycap U+20E3) or a skin-tone modifier
+     (U+1F3FB..1F3FF); then Backspace removes from the LAST such extender to c
+     (é -> e, 👍🏽 -> 👍, 🤦🏽‍♂️ -> 🤦, 1️⃣ -> 1️). Variation selectors (U+FE00..FE0F)
+     and the joiner are not stops. Delete / arrows / Shift+arrows still take the
+     whole cluster (Ed.cluster). Never splits a surrogate pair. Pure. */
+  _mark: undefined,
+  isStop(u) {
+    if (u >= 0x1f3fb && u <= 0x1f3ff) return true;            // skin-tone modifier
+    if (u >= 0xfe00 && u <= 0xfe0f) return false;             // variation selector: never a stop
+    if (Ed._mark === undefined) {
+      try { Ed._mark = new RegExp("^\\p{M}$", "u"); } catch (_) { Ed._mark = null; }
+    }
+    if (Ed._mark) return Ed._mark.test(String.fromCodePoint(u));
+    return (u >= 0x300 && u <= 0x36f) || (u >= 0x1ab0 && u <= 0x1aff) || (u >= 0x1dc0 && u <= 0x1dff) ||
+           (u >= 0x20d0 && u <= 0x20ff) || (u >= 0xfe20 && u <= 0xfe2f);   // engines without \p{}: the common mark blocks
+  },
+  backDel(t, c, seg) {
+    t = String(t || "");
+    c = Math.max(0, Math.min(c, t.length));
+    const k = Ed.cluster(t, c, true, seg);
+    if (k >= c) return k;
+    let stop = -1;
+    for (let i = k, first = true; i < c; first = false) {
+      const u = t.codePointAt(i), w = u > 0xffff ? 2 : 1;
+      if (!first && Ed.isStop(u)) stop = i;
+      i += w;
+    }
+    return stop > k ? stop : k;
+  },
+  /* #274 review (CodeAnt 4654882322): a caret the editor API placed INSIDE a
+     cluster (setCursor accepts any UTF-16 ch). Returns [s, e] of the cluster that
+     strictly contains c (s < c < e), else null. Backspace and Delete then remove
+     that whole cluster instead of a part of it. Same segmenter / code-point
+     fallback as Ed.cluster, so the fallback only reports a split surrogate pair. Pure. */
+  inside(t, c, seg) {
+    t = String(t || "");
+    if (c <= 0 || c >= t.length) return null;
+    const s = Ed.cluster(t, c, true, seg), e = Ed.cluster(t, s, false, seg);
+    return s < c && e > c ? [s, e] : null;
+  },
+  // one CHARACTER left/right (a grapheme cluster, #274), crossing the line edge
+  // (R17.5 M69-M71). Pure: covered by Ed.selfTest. null = the document edge,
+  // leave it to the browser.
   step(g, l, c, back) {
-    const L = Ed.lines(g);
+    const L = Ed.lines(g), t = L[l] || "";
     if (back) {
-      if (c > 0) return { l, c: c - 1 };
+      if (c > 0) return { l, c: Ed.cluster(t, c, true) };
       return l > 0 ? { l: l - 1, c: L[l - 1].length } : null;
     }
-    if (c < (L[l] || "").length) return { l, c: c + 1 };
+    if (c < t.length) return { l, c: Ed.cluster(t, c, false) };
     return l < L.length - 1 ? { l: l + 1, c: 0 } : null;
   },
   /* R17.6 / R17.7 REVEAL — PER TOKEN, not per row.
@@ -798,7 +1214,9 @@ const Ed = {
   // nothing. A non-empty range needs real overlap, so selecting up to a token's
   // first column does not open it. Unit-asserted in Ed.selfTest.
   tokAt(toks, lo, hi) {
-    const touch = lo === hi ? (t => lo >= t.s && lo <= t.e) : (t => lo < t.e && hi > t.s);
+    // gh #46: a task marker "- [ ] " stays a checkbox with the caret at its END (the task text
+    // start, stock 1.13.7); only a caret strictly inside it reveals the raw marker.
+    const touch = lo === hi ? (t => lo >= t.s && (t.kind === "task" ? lo < t.e : lo <= t.e)) : (t => lo < t.e && hi > t.s);
     return toks.filter(touch);
   },
   mark(g, l) {                                   // census + autocomplete state
@@ -837,11 +1255,15 @@ const Ed = {
     };
   },
   // the prefix a NEW item after this one carries: same indent + quote, the
-  // ordered number stepped (M4), a task always UNCHECKED (M8)
+  // ordered number stepped (M4), a task always UNCHECKED (M8). #154: BOTH at
+  // once for an ordered task ("1. [x] a" -> "2. [ ] ", stock 1.13.7) — the
+  // task branch used to win and repeat the number.
+  // the marker minus its "N. " head, by the digits actually typed: "01. [ ] "
+  // must not slice by String(1).length and keep a stray space (codeant #235)
+  mkTail(it) { return it.mk.replace(/^\d+\. /, ""); },
   contOf(it) {
-    const mk = it.task ? it.mk.replace(/\[[xX]\]/, "[ ]")
-      : it.num !== null ? (it.num + 1) + ". " + it.mk.slice(String(it.num).length + 2)
-        : it.mk;
+    let mk = it.num !== null ? (it.num + 1) + ". " + Ed.mkTail(it) : it.mk;
+    if (it.task) mk = mk.replace(/\[[xX]\]/, "[ ]");
     return it.ind + it.qt + mk;
   },
   // M24: Enter on an item's CONTINUATION line starts a new item of the item
@@ -863,7 +1285,7 @@ const Ed = {
     for (let l = from; l < L.length; l++) {
       const it = Ed.info(L[l]);
       if (it.num !== null && it.ind + it.qt === pre) {
-        L[l] = pre + next + ". " + it.mk.slice(String(it.num).length + 2) + L[l].slice(it.pre.length);
+        L[l] = pre + next + ". " + Ed.mkTail(it) + L[l].slice(it.pre.length);
         next++;
       } else if (it.ind.length > ref.ind.length) continue;  // nested / continuation
       else break;
@@ -924,9 +1346,11 @@ const Ed = {
   del(g, s, forward, word) {                     // Backspace / Delete
     if (!s.empty) return Ed.replace(g, s, "", "del");
     const L = Ed.lines(g), { l, c } = s.a;
+    const ins = word ? null : Ed.inside(L[l], c);       // #274 review: never leave part of a cluster
+    if (ins) return Ed.replace(g, { a: { l, c: ins[0] }, b: { l, c: ins[1] }, empty: false }, "", "del");
     if (!forward) {
       if (c > 0) {
-        let k = c - 1;
+        let k = Ed.backDel(L[l], c);                      // #274: a whole character, not one code unit
         if (word) { k = c; while (k > 0 && /\s/.test(L[l][k - 1])) k--; while (k > 0 && !/\s/.test(L[l][k - 1])) k--; }
         return Ed.replace(g, { a: { l, c: k }, b: { l, c }, empty: false }, "", "del");
       }
@@ -934,7 +1358,7 @@ const Ed = {
       return Ed.replace(g, { a: { l: l - 1, c: L[l - 1].length }, b: { l, c: 0 }, empty: false }, "", "del");
     }
     if (c < L[l].length) {
-      let k = c + 1;
+      let k = Ed.cluster(L[l], c, false);                 // #274
       if (word) { k = c; while (k < L[l].length && /\s/.test(L[l][k])) k++; while (k < L[l].length && !/\s/.test(L[l][k])) k++; }
       return Ed.replace(g, { a: { l, c }, b: { l, c: k }, empty: false }, "", "del");
     }
@@ -962,12 +1386,12 @@ const Ed = {
       }
     }
     Ed.snap(g, "indent");
-    let dc = 0;
+    let dc = 0, da = 0;                                      // column shift on the to / the from line
     for (let l = first; l <= last; l++) {
       if (out) {
         const m = /^(\t| {1,4})/.exec(L[l]);
-        if (m) { L[l] = L[l].slice(m[0].length); if (l === s.b.l) dc = -m[0].length; }
-      } else { L[l] = "\t" + L[l]; if (l === s.b.l) dc = 1; }
+        if (m) { L[l] = L[l].slice(m[0].length); if (l === s.b.l) dc = -m[0].length; if (l === s.a.l) da = -m[0].length; }
+      } else { L[l] = "\t" + L[l]; if (l === s.b.l) dc = 1; if (l === s.a.l) da = 1; }
     }
     // M32: an ordered item that changes level RESTARTS the run it joins, and
     // the run it LEFT closes up over the hole ("3. c" -> "2. c").
@@ -976,7 +1400,17 @@ const Ed = {
       if (it.num !== null) Ed.renumber(L, first, it, Ed.startNum(L, first, it));
       Ed.renumber(L, last + 1, old, Ed.startNum(L, last + 1, old));
     }
-    Ed.after(g, s.b.l, Math.max(0, s.b.c + dc));
+    if (s.empty) { Ed.after(g, s.b.l, Math.max(0, s.b.c + dc)); return; }
+    // #161: a real selection stays selected, both ends shifted with their line's indent and the
+    // direction kept (stock 1.13.7: 0:0-2:3 -> Tab 0:1-2:4 -> Tab 0:2-2:5), so the next Tab /
+    // Shift+Tab moves the same lines again
+    const cm = Ed.cm(g), back = !!cm && cm.state.selection.main.anchor > cm.state.selection.main.head;
+    Ed.commit(g);
+    const from = Ed.off(g, s.a.l, Math.max(0, s.a.c + da)), to = Ed.off(g, s.b.l, Math.max(0, s.b.c + dc));
+    if (!cm) return;
+    cm.dispatch({ selection: { anchor: back ? to : from, head: back ? from : to } });
+    if (!cm.hasFocus) cm.focus();
+    Ed.mark(g, Ed.focusPos(g).l);
   },
   /* R17.4 M46-M51 Ctrl+L "Toggle checkbox status" (in 1.13.7 this is the task
      toggle — Ctrl+Enter is NOT, see M45/M92): a task flips [ ] <-> [x] in
@@ -984,19 +1418,48 @@ const Ed = {
      paragraph gains a whole "- [ ] ". The caret keeps its offset in the TEXT,
      so it shifts by exactly the bytes inserted before it. */
   toggleCheck(g, s) {
+    if (s.a.l !== s.b.l) return Ed.toggleCheckLines(g, s);   // #155
     const L = Ed.lines(g), l = s.b.l, line = L[l];
     if (line === undefined) return;
     const it = Ed.info(line);
     Ed.snap(g, "task");
     let dc = 0;
-    if (it.task) L[l] = Ed.flipTask(line);
+    // #153: ANY status char is a task ("- [/] a", "- [-] a", "- [>] a"): stock 1.13.7
+    // resets it to "[ ]" in place (Ed.flipTask), it never wraps a second "[ ] " in front.
+    // Ed.info only knows " xX", so the gate is the task shape itself: "[?]" + space or EOL
+    // (a bullet that starts with a link, "- [a](u)", stays a bullet).
+    if (it.task || Ed.taskRe.test(line)) L[l] = Ed.flipTask(line);
     else if (it.mk) { L[l] = it.pre + "[ ] " + line.slice(it.pre.length); dc = 4; }
     else { L[l] = it.ind + it.qt + "- [ ] " + line.slice(it.pre.length); dc = 6; }
     Ed.after(g, l, s.b.c >= it.pre.length ? s.b.c + dc : s.b.c);
   },
+  /* #155: Ctrl+L over a SELECTION that spans lines acts on EVERY line it touches
+     (stock 1.13.7: "alpha\nbravo\ncharlie" all selected -> each line "- [ ] ").
+     Each line gets the single-line rule on its own (task flips, list item gains
+     "[ ] ", paragraph gains "- [ ] "); blank lines are left alone (UNMEASURED,
+     same call as listToggle [Q7]). ONE undo step; the selection keeps its text. */
+  toggleCheckLines(g, s) {
+    const L = Ed.lines(g), first = s.a.l, last = Math.min(s.b.l, L.length - 1);
+    const ch = [], dc = [];                              // ch = [line, new text]; dc[l] = [col, bytes inserted there]
+    for (let l = first; l <= last; l++) {
+      const line = L[l];
+      if (line === undefined || !String(line).trim()) continue;
+      const it = Ed.info(line);
+      if (it.task) { const f = Ed.flipTask(line); if (f !== null) ch.push([l, f]); dc[l] = [it.pre.length, 0]; }
+      else if (it.mk) { ch.push([l, it.pre + "[ ] " + line.slice(it.pre.length)]); dc[l] = [it.pre.length, 4]; }
+      else { ch.push([l, it.ind + it.qt + "- [ ] " + line.slice(it.pre.length)]); dc[l] = [it.pre.length, 6]; }
+    }
+    if (!dc.some(Boolean)) return;
+    Ed.snap(g, "task");                                  // ONE undo step
+    for (const [l, v] of ch) L[l] = v;                  // in place: no spread of the whole note into splice (arg limit on huge notes)
+    const map = p => { const t = dc[p.l]; return t && p.c >= t[0] ? { l: p.l, c: p.c + t[1] } : p; };
+    const a = map(s.a), b = map(s.b);
+    Ed.after(g, a.l, a.c);
+    Ed.extendTo(g, b.l, b.c);
+  },
   /* listtoggle R1-R5: "Toggle bullet list" / "Toggle numbered list" over a
      SELECTION (Obsidian 1.13.7 measured, docs/recon-listtoggle/README.md; spec
-     §4 frozen). Unlike toggleCheck this acts on EVERY line the selection
+     §4 frozen). Like toggleCheck over a selection (#155) this acts on EVERY line the selection
      touches — a selection ending at column 0 of line N still includes N [Q10].
      Ed.listToggle is PURE (lines + selection in -> lines + selection out, or
      null for a no-op) so the unit table (src-tauri/tests/listtoggle.{tsv,rs}, cargo test) can run
@@ -1086,6 +1549,7 @@ const Ed = {
     Ed.after(g, r.a.l, r.a.c);
     if (r.a.l !== r.b.l || r.a.c !== r.b.c) Ed.extendTo(g, r.b.l, r.b.c);
   },
+  taskRe: /^[ \t]*(?:> ?)*(?:[-*+]|\d+[.)])[ \t]+\[[^\]\n]\](?: |$)/,   // #153 a task item, any status char
   /* rvtask R3 — THE task-status byte op, shared by Ctrl+L (toggleCheck) and the
      reading-view click. Obsidian 1.13.7 (docs/recon-rvtask Q1/Q2): the status char
      of the item's "[?]" flips ' ' -> 'x' and ANYTHING else (x X / - > ?) -> ' '.
@@ -1129,11 +1593,21 @@ const Ed = {
     const s = Ed.sel(g);
     if (!s) return;
     const L = Ed.lines(g), l = s.b.l, line = L[l];
-    const a = line.lastIndexOf("[[", s.b.c);
-    if (a < 0) return;
+    // #162: replace the [[ that was TYPED: the nearest [[ that ends at or before the caret, never
+    // a [[ that starts AT the caret (an existing link right after it); stock replaces [start, caret)
+    if (s.b.c < 2) return;
+    const a = line.lastIndexOf("[[", s.b.c - 2);
+    if (a < 0 || line.slice(a + 2, s.b.c).includes("]]")) return;
+    // #211 review: a context that went stale (caret moved to another [[ while an async heading
+    // read was in flight) must not replace the text between its old opener and the caret
+    if (typeof start === "number" && start >= 0) {
+      const p = Ed.lc(g, start);
+      if (p.l !== l || p.c !== a) return;
+    }
     Ed.replace(g, { a: { l, c: a }, b: { l, c: s.b.c }, empty: false }, "[[" + name + "]]", "ac");
   },
   linkClick(e, a) {
+    if (e.button) return;                  // #37: a right/middle mousedown never follows or creates a link
     if (typeof wikiClick === "function") wikiClick(e, a);
   },
   extClick(e, a) {
@@ -1147,7 +1621,7 @@ const Ed = {
                    "1. numbered ~~s~~ ==hl== end", "```js", "text with https://x.example/z end",
                    // corpus inherited from the deleted scripts/edit-unit.js (it drove a pure
                    // API that no longer exists; the invariants it protected live on here)
-                   "   ", "###### h6", "## **bold** head", "- [x] done", "  - two spaces", "12) twelve",
+                   "   ", "###### h6", "## **bold** head", "- [x] done", "- [ ] ", "\t- [x] ", "  - two spaces", "12) twelve",
                    "> > deep", "> - a", "---", "a **b _c_ d** e", "![[Welcome]]", "a#nottag and #tag/sub",
                    "snake_case_word stays", "`a**b`", "text with <b>&amp;", "unclosed **bold",
                    "- **bold item** with [[Link]]", "\t\t1. deep ordered",
@@ -1216,6 +1690,18 @@ const Ed = {
       const tk = Ed.row(g, s, 0)._tok.map(t => t.s + "-" + t.e + ":" + t.kind).join(",");
       if (tk !== w) fail("tok:" + s + ":" + tk);
     }
+    // gh #75: a BLANK task "- [ ] " keeps its checkbox with the caret at the marker end (#46: a
+    // collapsed caret at t.e reveals nothing)
+    const bt = Ed.row(g, "- [ ] ", 0)._tok, bset = Ed.tokAt(bt, 6, 6).map(t => t.s + "-" + t.e + ":" + t.kind).join(",") || "-";
+    if (bset !== "-") fail("rv75:" + bset);
+    // and that caret has a RENDERED spot right of the checkbox: on a live CM6 view the DOM
+    // selection at col 6 must have a client rect (not a display:none marker node, which WebKit
+    // paints at the row start = LEFT of the box) whose left edge is >= the box's right edge.
+    const c75 = Ed.caret75();
+    if (c75) fail("dom75:" + c75);
+    // theme DOM classes on a live CM6 view (#333 active line ...): "" = every case holds
+    const thd = Ed.themeDom();
+    if (thd) fail("thdom:" + thd);
     // R17.7 link destinations: balanced parens survive whole (CommonMark), a
     // backslash escape stays literal, whitespace is still not a link, an empty
     // destination still is, and a bare URL leaves the enclosing prose's ')' out.
@@ -1238,6 +1724,53 @@ const Ed = {
       const n = Ed.step(sg, l, c, back);
       if ((n ? n.l + "." + n.c : "-") !== want) fail("step:" + l + "." + c + (back ? "<" : ">"));
     }
+    // #274: a step crosses a whole grapheme cluster. [text, col, back, want, seg]:
+    // seg null = the code-point fallback (no Intl.Segmenter), which never splits a
+    // surrogate pair; the cluster rows run only where the engine has a segmenter.
+    const FP = "\u{1F926}‍♂️", FAM = "\u{1F468}‍\u{1F469}‍\u{1F467}";
+    const gc = [["a\u{1F600}b", 3, true, 1, null], ["a\u{1F600}b", 1, false, 3, null],
+                ["a\uD83Db", 2, true, 1, null], ["a\uDE00b", 1, false, 2, null],          // lone surrogates: one unit
+                ["a" + FP + "b", 6, true, 5, null], ["ab", 0, true, 0, null], ["ab", 2, false, 2, null], ["", 0, false, 0, null]];
+    if (Ed.gseg()) gc.push(
+      ["a" + FP + "b", 6, true, 1], ["a" + FP + "b", 1, false, 6], ["a" + FP + "b", 3, true, 1], ["a" + FP + "b", 3, false, 6],
+      ["x" + FAM, 9, true, 1], ["x" + FAM, 1, false, 9],
+      ["\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}", 8, true, 4], ["\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}", 0, false, 4],
+      ["\u{1F44D}\u{1F3FD}", 4, true, 0], ["éx", 0, false, 2], ["éx", 2, true, 0],
+      ["ab", 0, true, 0], ["ab", 2, false, 2], ["ab", 1, false, 2],
+      // #274 review: c - 1 is the HIGH half of a pair (a caret inside it): still that cluster's edge
+      ["a\u{1F600}b", 2, true, 1], ["a" + FP + "b", 2, true, 1], ["x" + FAM, 8, true, 1]);
+    for (const [t, c, back, want, seg] of gc)
+      if (Ed.cluster(t, c, back, seg) !== want) fail("cluster:" + c + (back ? "<" : ">") + (seg === null ? "cp" : "") + ":" + t.length);
+    // #274 Backspace stop [text, col, want, seg] (stock 1.13.7 oracle): a cluster goes whole unless it
+    // carries a mark / skin-tone modifier, then from the last one; a surrogate pair whole on any engine
+    const bd = [["a\u{1F600}b", 3, 1, null], ["a" + FP + "b", 6, 5, null], ["ab", 0, 0, null], ["", 0, 0, null], ["a\uDE00", 2, 1, null]];
+    if (Ed.gseg()) bd.push(["a" + FP + "b", 6, 1], ["x" + FAM, 9, 1], ["a\u{1F1E9}\u{1F1EA}b", 5, 1],
+      ["\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}", 8, 4], ["a\u{1F44D}\u{1F3FD}b", 5, 3], ["a\u{1F44D}\u{1F3FD}b", 3, 1],
+      ["a\u{1F600}b", 3, 1], ["ab", 1, 0],
+      ["a\u2764\uFE0Fb", 3, 1], ["a\u{1F926}\u{1F3FD}\u200D\u2642\uFE0Fb", 8, 3], ["ae\u0301b", 3, 2],
+      ["a1\uFE0F\u20E3b", 4, 3], ["a1\uFE0Fb", 3, 1], ["a\u{1F3F3}\uFE0F\u200D\u{1F308}b", 7, 1], ["ae\u0301\u0323b", 4, 3]);
+    bd.push(["ae\u0301b", 3, 2, null], ["a\u{1F44D}\u{1F3FD}b", 5, 3, null]);   // fallback: one code point
+    for (const [u, want] of [[0x1F3FB, true], [0x1F3FF, true], [0x0301, true], [0x20E3, true], [0xFE0F, false],
+                             [0xFE00, false], [0x200D, false], [0x41, false], [0x1F44D, false]])
+      if (Ed.isStop(u) !== want) fail("isStop:" + u.toString(16));
+    // #274 review: Ed.inside [text, col, want "s,e" | "-", seg] — only a caret strictly inside a cluster
+    const ia = [["a\u{1F600}b", 2, "1,3", null], ["a\u{1F600}b", 1, "-", null], ["a\u{1F600}b", 3, "-", null],
+                ["a\u{1F600}b", 0, "-", null], ["a\u{1F600}b", 4, "-", null], ["", 0, "-", null], ["ab", 1, "-", null]];
+    if (Ed.gseg()) ia.push(["a" + FP + "b", 3, "1,6"], ["a" + FP + "b", 2, "1,6"], ["a" + FP + "b", 5, "1,6"],
+      ["a" + FP + "b", 1, "-"], ["a" + FP + "b", 6, "-"], ["x" + FAM, 4, "1,9"], ["aéb", 2, "1,3"], ["ab", 1, "-"]);
+    for (const [t, c, want, seg] of ia) {
+      const r = Ed.inside(t, c, seg);
+      if ((r ? r.join(",") : "-") !== want) fail("inside:" + c + (seg === null ? "cp" : "") + ":" + t.length);
+    }
+    for (const [t, c, want, seg] of bd)
+      if (Ed.backDel(t, c, seg) !== want) fail("backDel:" + c + (seg === null ? "cp" : "") + ":" + t.length);
+    const eg2 = { view: { lines: ["a" + FP, "b"] } };
+    const sw2 = Ed.gseg() ? [[1, 0, true, "0.6"], [0, 6, true, "0.1"], [0, 1, false, "0.6"], [0, 6, false, "1.0"], [0, 0, true, "-"], [1, 1, false, "-"]]
+                          : [[1, 0, true, "0.6"], [0, 6, false, "1.0"], [0, 0, true, "-"], [1, 1, false, "-"]];
+    for (const [l, c, back, want] of sw2) {
+      const n = Ed.step(eg2, l, c, back);
+      if ((n ? n.l + "." + n.c : "-") !== want) fail("step274:" + l + "." + c + (back ? "<" : ">"));
+    }
     // R17.1 Enter / Shift+Enter, asserted on the MODEL (no DOM, no view): each
     // case is [before, caret l.c, op, after, caret l.c] straight off the MUST
     // list. `enter` is where list semantics live, so it is checked in-app on
@@ -1249,6 +1782,8 @@ const Ed = {
       ["1. one\n2. two\n3. three", 0, 6, 0, "1. one\n2. \n3. two\n4. three", 1, 3],     // M4 renumber
       ["1. one\n2. two", 1, 4, 0, "1. one\n2. t\n3. wo", 2, 3],                          // M6
       ["- [x] done", 0, 10, 0, "- [x] done\n- [ ] ", 1, 6],                              // M8 always unchecked
+      ["1. [ ] a\n2. [ ] b", 0, 8, 0, "1. [ ] a\n2. [ ] \n3. [ ] b", 1, 7],          // #154 ordered task counts up
+      ["01. [ ] a\n02. [ ] b", 0, 9, 0, "01. [ ] a\n2. [ ] \n3. [ ] b", 1, 7],        // #154 leading zero: no stray space
       ["- a\n  - b", 1, 5, 0, "- a\n  - b\n  - ", 2, 4],                                 // M11 indent verbatim
       ["1. a\n\t1. b\n2. c", 1, 5, 0, "1. a\n\t1. b\n\t2. \n2. c", 2, 4],                // M12 nested run
       ["- a\n\t- ", 1, 3, 0, "- a\n- ", 1, 2],                                           // M13 empty nested -> outdent
@@ -1316,6 +1851,28 @@ const Ed = {
         ["para", 0, 4, "ctrl-l", "- [ ] para", 0, 10],                                   // M49
         ["- a\n\t- b", 1, 5, "ctrl-l", "- a\n\t- [ ] b", 1, 8],                          // M50
         ["1. a", 0, 4, "ctrl-l", "1. [ ] a", 0, 8],                                      // M51 ordered marker kept
+        ["- [/] doing", 0, 11, "ctrl-l", "- [ ] doing", 0, 11],                          // #153 custom status resets
+        ["- [>] a", 0, 7, "ctrl-l", "- [ ] a", 0, 7],                                    // #153
+        // #274: Backspace / Delete remove a whole character, never one code unit of it
+        ...(Ed.gseg() ? [
+          ["a\u{1F926}‍♂️b", 0, 6, "bs", "ab", 0, 1],                     // ZWJ + VS16, 5 units
+          ["a\u{1F926}‍♂️b", 0, 1, "del", "ab", 0, 1],
+          ["\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}", 0, 8, "bs", "\u{1F1E9}\u{1F1EA}", 0, 4], // one flag of two
+          ["\u{1F44D}\u{1F3FD}!", 0, 0, "del", "!", 0, 0],                               // skin tone
+          ["a\u{1F44D}\u{1F3FD}b", 0, 5, "bs", "a\u{1F44D}b", 0, 3],                     // Backspace: only the modifier (stock)
+        ] : []),
+        ["a\u{1F600}b", 0, 3, "bs", "ab", 0, 1],                                         // a surrogate pair, any engine
+        ["a\u{1F600}b", 0, 1, "del", "ab", 0, 1],
+        ["a\n\u{1F600}", 1, 0, "bs", "a\u{1F600}", 0, 1],                                // line join unchanged
+        // #274 review (CodeAnt 4654882322): a caret INSIDE a cluster (editor API) removes the whole cluster
+        ["a\u{1F600}b", 0, 2, "bs", "ab", 0, 1],                                         // inside a surrogate pair, any engine
+        ["a\u{1F600}b", 0, 2, "del", "ab", 0, 1],
+        ...(Ed.gseg() ? [
+          ["a\u{1F926}‍♂️b", 0, 3, "bs", "ab", 0, 1],                     // inside the ZWJ sequence
+          ["a\u{1F926}‍♂️b", 0, 3, "del", "ab", 0, 1],
+          ["a\u{1F926}‍♂️b", 0, 5, "bs", "ab", 0, 1],                     // before the VS16
+          ["x\u{1F468}‍\u{1F469}‍\u{1F467}y", 0, 4, "del", "xy", 0, 1],     // family
+        ] : []),
       ];
       for (const [src, l, c, op, want, wl, wc] of kc) {
         const eg = { view: { lines: src.split("\n") }, editor: {} };
@@ -1342,7 +1899,109 @@ const Ed = {
         if (eg.view.lines.join("\n") !== want) fail("sel-tab:" + src);
       }
     } finally { Ed.after = oa; Ed.snap = on; }
+    // #59 callouts: the Live Preview block scanner (which lines become ONE callout widget)
+    // and the fold toggle. Ed.coScan missing = every case fails (develop has no callouts).
+    const cs = [
+      ["> [!note]\n> body", "0-1"], ["> [!NOTE] Title\n> a\n> b\nafter", "0-2"],
+      ["> [!tip]+ open\n> x", "0-1"], ["> [!faq]- shut\n> x\n\n> [!bug]\n> y", "0-1,3-4"],
+      ["> [!custom-type] t", "0-0"], ["> [!note] <img src=x onerror=alert(1)>", "0-0"],
+      ["> plain quote\n> [!note] not a head", "-"], ["text [!note]", "-"], ["> [note]", "-"],
+      ["```\n> [!note] in a fence\n```", "-"], ["> [!info]\n> > [!warning] nested\n> > deep", "0-2"],
+      ["   > [!note] 3 spaces", "0-0"], ["    > [!note] 4 spaces = code", "-"]];
+    for (const [s, w] of cs) {
+      let got;
+      try { got = Ed.coScan(s.split("\n")).map(([a, b]) => a + "-" + b).join(",") || "-"; } catch (_) { got = "throw"; }
+      if (got !== w) fail("co:" + s);
+    }
+    try {
+      const co = document.createElement("div");
+      co.innerHTML = '<div class="callout is-collapsible is-collapsed" data-callout-fold="-"><div class="callout-title"><div class="callout-fold is-collapsed"></div></div><div class="callout-content"></div></div>';
+      const c = co.firstChild, f = c.querySelector(".callout-fold");
+      if (!Ed.coFold(c) || c.classList.contains("is-collapsed") || f.classList.contains("is-collapsed")) fail("co:fold-open");
+      if (!Ed.coFold(c) || !c.classList.contains("is-collapsed") || !f.classList.contains("is-collapsed")) fail("co:fold-shut");
+      c.classList.remove("is-collapsible");
+      if (Ed.coFold(c)) fail("co:fold-nonfoldable");
+    } catch (_) { fail("co:fold-throw"); }
     return bad;
+  },
+  // gh #75 selfTest DOM case: a throwaway live-preview CM6 view holding one blank task, laid out
+  // but invisible (opacity 0, no pointer events), caret put at the marker end (col 6). Reads the
+  // DOM selection back the way the [crt:] census does. "" = the caret has a rect right of the box;
+  // otherwise a short reason (nobox / nosel / hid = rect 0,0,0 / x<box right edge).
+  caret75() {
+    if (typeof CMv === "undefined" || typeof CMs === "undefined" || !document.body) return "nocm";
+    const w = Ed.el("div", "lp");
+    w.style.cssText = "position:fixed;left:0;top:0;width:480px;opacity:0;pointer-events:none;z-index:-1";
+    const v = { lp: w }, g = { view: v, lp: w }, ae = document.activeElement;
+    const cm = new CMv.EditorView({ state: CMs.EditorState.create({ doc: "- [ ] ", extensions: [Ed.lpExt(v, () => g)] }) });
+    w.appendChild(cm.dom);
+    document.body.appendChild(w);
+    try {
+      cm.focus();
+      cm.dispatch({ selection: { anchor: 6 } });
+      const box = cm.contentDOM.querySelector("input.tbox"), s = window.getSelection();
+      if (!box) return "nobox";
+      if (!s || !s.rangeCount || !s.focusNode || !cm.contentDOM.contains(s.focusNode)) return "nosel";
+      const c = Ed.caretRect(s.focusNode, s.focusOffset);
+      const R = Math.round, br = box.getBoundingClientRect().right;
+      if (!c.left && !c.top && !c.height) return "hid";
+      if (c.left < br - 0.5) return "x" + R(c.left) + "<" + R(br);
+      return "";
+    } catch (e) { return "err"; }
+    finally {
+      cm.destroy(); w.remove();
+      if (ae && ae !== document.body && ae.isConnected && ae.focus) ae.focus(); else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    }
+  },
+  // theme DOM selfTest case: a throwaway, invisible live-preview CM6 view; reads back the line classes stock 1.13.7's
+  // DOM carries and theme selectors key on. "" = all hold, else a short token-safe reason.
+  //   #333 the caret line, and ONLY it, is .cm-line.cm-active (stock: "cm-line cm-active"); it follows the caret
+  //   #319 the editor root is .cm-s-obsidian; a top-level "# " line, and only it, is .HyperMD-header + .HyperMD-header-N
+  //   #324 a live-preview callout widget's p/ul/ol/... carry --p-spacing block margins (a list item's p does not)
+  themeDom() {
+    if (typeof CMv === "undefined" || typeof CMs === "undefined" || !document.body) return "nocm";
+    const w = Ed.el("div", "lp");
+    w.style.cssText = "position:fixed;left:0;top:0;width:480px;opacity:0;pointer-events:none;z-index:-1";
+    const v = { lp: w }, g = { view: v, lp: w };
+    const doc = "alpha\nbeta\n# Head\ngamma";
+    const cm = new CMv.EditorView({ state: CMs.EditorState.create({ doc, extensions: [Ed.lpExt(v, () => g)] }) });
+    w.appendChild(cm.dom);
+    document.body.appendChild(w);
+    const lines = () => [...cm.contentDOM.querySelectorAll(":scope > .cm-line")];
+    const act = () => lines().map((e, i) => e.classList.contains("cm-active") ? i : -1).filter(i => i >= 0).join(".") || "none";
+    try {
+      if (lines().length !== 4) return "rows" + lines().length;
+      // #324: a live-preview callout widget (stock DOM div.cm-embed-block.markdown-rendered.cm-callout) spaces its
+      // blocks by --p-spacing like the reading view; a list item's p, a plain LP row and the widget root stay 0
+      const co = Ed.el("div", "cm-embed-block markdown-rendered cm-callout"), pr = Ed.el("div", "");
+      co.innerHTML = '<div class="callout" data-callout="note"><div class="callout-title"><div class="callout-title-inner">N</div></div>' +
+        '<div class="callout-content"><p>a</p><p>b</p><ul><li><p>c</p></li></ul></div></div>';
+      pr.style.marginTop = "var(--p-spacing)";
+      w.appendChild(co); w.appendChild(pr);
+      const mt = e => getComputedStyle(e).marginTop, mb = e => getComputedStyle(e).marginBottom;
+      const ps = mt(pr), cp = co.querySelectorAll("p");
+      if (!ps || ps === "0px") return "cosp:" + ps;
+      if (mt(cp[0]) !== ps || mb(cp[1]) !== ps) return "cop:" + mt(cp[0]) + "-" + ps;
+      if (mt(co.querySelector("ul")) !== ps) return "coul";
+      if (mt(cp[2]) !== "0px") return "colip";                       // negatives
+      if (mt(co) !== "0px" || mt(lines()[0]) !== "0px") return "coneg";
+      // #319: the editor root is .cm-s-obsidian; ONLY the heading line is .HyperMD-header + .HyperMD-header-1
+      if (!cm.dom.classList.contains(Ed.EDITOR_ROOT)) return "root";
+      const hd = lines().map((e, i) => e.classList.contains("HyperMD-header") ? i + ":" + [...e.classList].filter(c => /^HyperMD-header-\d$/.test(c)).join("") : "").filter(Boolean).join(".");
+      if (hd !== "2:HyperMD-header-1") return "hdr:" + (hd || "none");
+      for (const [s, n] of [["###### six", "6"]]) if (!Ed.row(g, s, 0).classList.contains("HyperMD-header-" + n)) return "hdr" + n;
+      for (const s of ["> # quoted", "  # indented", "#nospace", "####### seven", "plain"])   // negatives: not a heading LINE
+        if (/HyperMD-header/.test(Ed.row(g, s, 0).className)) return "hdrneg";
+      cm.dispatch({ selection: { anchor: 8 } });                    // "be|ta" -> line 1
+      if (act() !== "1") return "act1:" + act();
+      if (!lines()[1].classList.contains("cur")) return "cur1";
+      cm.dispatch({ selection: { anchor: doc.length } });           // end of "gamma" -> line 3; line 1 drops it
+      if (act() !== "3") return "act3:" + act();
+      cm.dispatch({ selection: { anchor: 1, head: 8 } });           // a range alpha..beta: the HEAD's line only
+      if (act() !== "1") return "acth:" + act();
+      return "";
+    } catch (e) { return "err"; }
+    finally { cm.destroy(); w.remove(); }
   },
 };
 
@@ -1359,11 +2018,35 @@ Ed.field = function (g) {
     selectionStart: off(s.a), selectionEnd: off(s.b),
     get value() { return f._v; },
     set value(t) { f._v = t; Ed.setAll(g, t); },
-    setSelectionRange(a) { Ed.placeOffset(g, a); },
+    // #160: keep the END too, like a textarea — edEdit/edWrap hand back the wrapped text's range and
+    // stock 1.13.7 leaves it selected (Toggle bold on 'word' -> '**word**', 'word' still selected),
+    // so a second toggle unwraps instead of inserting new markers at a caret
+    setSelectionRange(a, b) {
+      const cm = Ed.cm(g);
+      if (!cm || b == null || b === a) return Ed.placeOffset(g, a);
+      const n = cm.state.doc.length, k = o => Math.max(0, Math.min(o, n));
+      cm.dispatch({ selection: { anchor: k(a), head: k(b) } });
+      if (!cm.hasFocus) cm.focus();
+      Ed.mark(g, Ed.focusPos(g).l);
+    },
     dispatchEvent() { if (typeof scheduleSave === "function") scheduleSave(g); },
     focus() { g.lp.focus({ preventScroll: true }); },
   };
   return f;
+};
+/* #241: re-add the DOM caret range after a user edit (see mount) so WebKitGTK
+   repaints the native caret at its new rect and restarts the blink, as stock does
+   after every edit. Only for a focused, non-composing view with an empty
+   selection whose DOM selection already sits inside this editor. */
+Ed.caretRepaint = function (u) {
+  // a USER edit: CM6 input.* / delete.* and the editor's own keys (os.backspace, os.enter, ...)
+  if (!u.docChanged || !u.transactions.some(t => t.annotation(CMs.Transaction.userEvent) != null)) return;
+  const view = u.view;
+  if (!view.hasFocus || view.composing || !view.state.selection.main.empty) return;
+  const sel = view.root.getSelection ? view.root.getSelection() : document.getSelection();
+  if (!sel || sel.rangeCount !== 1 || !sel.isCollapsed || !view.contentDOM.contains(sel.anchorNode)) return;
+  const r = sel.getRangeAt(0).cloneRange();
+  sel.removeAllRanges(); sel.addRange(r);
 };
 /* The FIRST client rect of selectNodeContents(row).getClientRects(), without
    asking for all the others. A range's rects come in document order — a
@@ -1456,6 +2139,24 @@ Ed.rvTaskTok = () => {
   }
   return " [rvtask:" + bs.length + "/" + bs.filter(b => b.checked).length + "] [rvtaskxy:" + (xy.join("|") || "-") + "] [rvtaskst:" + Math.round(g.preview.scrollTop) + "]";
 };
+/* #128 census -> " [lptaskxy:<line>:<x>,<y>|...] [lpst:<scrollTop>]" for the FOCUSED group's Live Preview:
+   the painted centre of every LP task checkbox inside the editor viewport, keyed by its 0-based source
+   line, first 40 (Ed.geom's [ecb:] stops at 40-row notes; the task_toggle phase clicks boxes of a
+   5000-line note). lpst = scrollTop of the note scroller Ed.scOf(g.lp) = cm.scrollDOM since #148 (.lp.cmown is a
+   layout box that never scrolls, so g.lp.scrollTop read 0 in every view) (a toggle must not move the view). Census only. */
+Ed.lpTaskTok = () => {
+  const g = typeof fg === "function" ? fg() : null, cm = Ed.cm(g);
+  if (!cm || !g.lp || !g.lp.isConnected || (typeof isReading === "function" && isReading(g))) return "";
+  const lb = g.lp.getBoundingClientRect(), xy = [];
+  for (const b of g.lp.querySelectorAll("input.tbox")) {
+    const r = b.getBoundingClientRect();
+    if (!r.width || r.top < lb.top || r.bottom > lb.bottom) continue;
+    let l; try { l = cm.state.doc.lineAt(cm.posAtDOM(b, 0)).number - 1; } catch (_) { continue; }
+    xy.push(l + ":" + Math.round(r.left + r.width / 2) + "," + Math.round(r.top + r.height / 2));
+    if (xy.length >= 40) break;
+  }
+  return " [lptaskxy:" + (xy.join("|") || "-") + "] [lpst:" + Math.round(Ed.scOf(g.lp).scrollTop) + "]";
+};
 /* rvtask R5: [rvtaskxy:]/[rvtaskst:] are geometry, so the census must follow a
    READING-VIEW scroll (nothing else refreshes the title on one — the same
    reason the context menu refreshes it on its own scroll). Debounced: one
@@ -1528,6 +2229,7 @@ Object.assign(Ed, {
     // the mirror must be OF the current doc: after setText (or typing since Ed.lines()) the doc moved
     // on, and diffing a stale mirror dispatched a revert (reloadInPlace -> lpRender undid the reload)
     if (v._Ld !== cm.state.doc) { v._snap = null; return false; }
+    let t = performance.now();                         // #128: Ed._tt sub-timings (task_toggle)
     const oldT = cm.state.doc.toString(), newT = L.join("\n");
     if (oldT === newT) { v._Ld = cm.state.doc; return false; }
     const m = Math.min(oldT.length, newT.length);
@@ -1535,8 +2237,12 @@ Object.assign(Ed, {
     while (p < m && oldT.charCodeAt(p) === newT.charCodeAt(p)) p++;
     while (s < m - p && oldT.charCodeAt(oldT.length - 1 - s) === newT.charCodeAt(newT.length - 1 - s)) s++;
     const kind = v._snap || "edit"; v._snap = null;
-    cm.dispatch({ changes: { from: p, to: oldT.length - s, insert: newT.slice(p, newT.length - s) },
+    if (Ed._tt) { Ed.ttAdd("diff_ms", t); t = performance.now(); }
+    const tr = cm.state.update({ changes: { from: p, to: oldT.length - s, insert: newT.slice(p, newT.length - s) },
                   annotations: [CMc.isolateHistory.of("full"), CMs.Transaction.userEvent.of("os." + kind)] });
+    if (Ed._tt) { void tr.state; Ed.ttAdd("fields_ms", t); t = performance.now(); }   // every StateField's update
+    cm.dispatch(tr);
+    if (Ed._tt) Ed.ttAdd("view_ms", t);                // view update: plugins, DOM, update listeners
     v.lines = L; v._Ld = cm.state.doc;                 // the caller's array IS the doc now
     return true;
   },
@@ -1712,6 +2418,77 @@ Object.assign(Ed, {
       return;
     }
   },
+  /* #51: drop of rich text. Stock 1.13.7 turns a dropped text/html payload into
+     Markdown (**bold**, _it_, [t](url), - li), exactly as its paste does; CM6 alone
+     inserts only text/plain, so links and formatting were flattened. The converter is
+     the plugin API's htmlToMarkdown (inert parse, every text node escaped, unsafe URLs
+     dropped). true = handled; false leaves the drop to CM6 (files, a move inside the
+     editor, no html, no converter, nothing converted). Placed and selected like CM6's
+     own drop, one "input.drop" undo step. A browser LINK drag (<a href> + a remote
+     text/uri-list) reaches here too since src-tauri/src/xdnd.rs stopped claiming remote
+     uri-lists as file drops (#51 "094 still eats links"): it lands as [title](url). */
+  htmlDrop(e, view) {
+    const dt = e && e.dataTransfer;
+    if (!dt || !view || e.defaultPrevented || view.state.readOnly) return false;
+    if (view.inputState && view.inputState.draggedContent) return false;
+    if (dt.files && dt.files.length) return false;
+    // PR #65 review F1: NOT window.__osPluginHost at drop time — the loader's seal() narrows it to
+    // {censusTok} before the first plugin runs; main.js hands the converter over at load (Ed.h2m)
+    const h2m = typeof Ed.h2m === "function" ? Ed.h2m : null;
+    let html = "";
+    try { html = String(dt.getData("text/html") || ""); } catch (_) {}
+    if (!h2m || !html.trim()) return false;
+    let md = "";
+    try { md = String(h2m(html) || ""); } catch (_) { return false; }
+    if (!md) return false;
+    const r = view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
+    e.preventDefault();
+    view.focus();
+    view.dispatch({ changes: { from: r, insert: md }, selection: { anchor: r, head: r + md.length }, userEvent: "input.drop" });
+    return true;
+  },
+  /* #143: paste of rich text. Stock 1.13.7 pastes a clipboard carrying text/html as its
+     Markdown ([t](url), **b**, *i*, # h, - li, code, > quote) — the SAME conversion as its
+     drop (harness docs/issue-51/STOCK.md "paste of the same data: identical result"), so this
+     reuses htmlDrop's converter and guards exactly: Ed.h2m = the plugin API's htmlToMarkdown
+     (inert parse, every text node escaped, javascript:/data: URLs dropped; the html itself
+     never reaches the DOM). Mounted Prec.low, after gh-paste's attachPaste (#19: an image on
+     the clipboard is claimed first) and after the plugin "editor-paste" hooks (their
+     preventDefault wins). true = handled; false leaves the paste to CM6 (plain-only clipboard,
+     no converter, nothing converted). Replaces the selection like CM6's own paste, caret after
+     the inserted text, one "input.paste" undo step (the transactionExtender in mount()). */
+  htmlPaste(e, view) {
+    const dt = e && e.clipboardData;
+    if (!dt || !view || e.defaultPrevented || view.state.readOnly) return false;
+    const h2m = typeof Ed.h2m === "function" ? Ed.h2m : null;
+    let html = "";
+    try { html = String(dt.getData("text/html") || ""); } catch (_) {}
+    if (!h2m || !html.trim()) return false;
+    let md = "";
+    try { md = String(h2m(html) || ""); } catch (_) { return false; }
+    if (!md) return false;
+    e.preventDefault();
+    view.dispatch(view.state.replaceSelection(md), { scrollIntoView: true, userEvent: "input.paste" });
+    return true;
+  },
+  /* #143: Ctrl/Cmd+Shift+V pastes PLAIN text, as stock (Chromium's paste-as-plain-text). Not
+     left to the webview: WebKitGTK's own binding is not a contract, so the key reads the
+     clipboard's text through the same Rust path as the menu's "Paste as plain text"
+     (ui/edmenu.js clipPaste -> clip_text) and inserts it as one "input.paste" step, caret after.
+     clip_text is async (PR #146 review): the text goes where the selection was AT THE KEYPRESS
+     while the document is unchanged (a caret moved in between does not redirect it); if the
+     document was edited meanwhile the old ranges no longer name the same text, so it follows
+     the current selection, as a keystroke would. */
+  plainPaste(view) {
+    if (!view || view.state.readOnly || typeof inv !== "function") return false;
+    const doc0 = view.state.doc, sel0 = view.state.selection;
+    Promise.resolve(inv("clip_text")).then(t => {
+      if (!t || view.state.readOnly) return;
+      const st = view.state.doc === doc0 ? view.state.update({ selection: sel0 }).state : view.state;
+      view.dispatch(st.replaceSelection(String(t)), { scrollIntoView: true, userEvent: "input.paste" });
+    }, err => { console.warn("clip_text:", err); const m = String(err && err.message || err); if (/^EPERM: /.test(m) && typeof say === "function") say(m, "secclip"); });   // #144: the refusal names its toggle
+    return true;
+  },
   mount(v) {
     const G = () => Ed.G(v);
     v._ext = [
@@ -1737,7 +2514,13 @@ Object.assign(Ed, {
       // first and, when its command returns false, ours still runs. A keydown
       // handler here ran ahead of the keymap handler and swallowed Tab/Enter/... for
       // every plugin keymap (Advanced Tables' Tab only indented).
-      CMv.keymap.of([{ any: (view, e) => { Ed.onKey(G(), e); return e.defaultPrevented; } }]),
+      // #143: Ctrl/Cmd+Shift+V = paste as plain text (stock); ahead of Ed.onKey in the same keymap
+      CMv.keymap.of([{ key: "Mod-Shift-v", run: view => Ed.plainPaste(view) },
+                     { any: (view, e) => { Ed.onKey(G(), e); return e.defaultPrevented; } }]),
+      // gh #43: a pair char typed over a selection wraps it, as stock does (Settings > Editor
+      // "Auto pair brackets" / "Auto pair Markdown syntax"): the selection stays on the inner
+      // text, so [ then [ makes [[sel]] and * then * makes **sel** (harness docs/issue-43/STOCK.md)
+      CMv.EditorView.inputHandler.of((view, from, to, text) => Ed.wrapSel(view, text)),
       CMv.EditorView.domEventHandlers({
         beforeinput: (e) => {
           const g = G();
@@ -1750,11 +2533,30 @@ Object.assign(Ed, {
         // embedded, like stock (ui/main.js attachPaste); true = claimed, CM6 does not paste text
         paste: (e) => typeof attachPaste === "function" ? attachPaste(G(), e) : false,
       }),
+      // #51: a drop carrying text/html (a selection dragged from a browser) keeps its
+      // formatting and links as Markdown, like stock 1.13.7 (harness docs/issue-51/STOCK.md);
+      // files, an in-editor move and an html-less drop stay CM6's own drop. Prec.low (PR #65
+      // review F2): after the plugin hooks (editor-api.js hooks(), default precedence), so a
+      // plugin's "editor-drop" sees the drop first and its preventDefault wins, as in stock
+      // #143: a paste carrying text/html pastes its Markdown, like stock (Ed.htmlPaste); same
+      // Prec.low as the drop, so attachPaste (#19, image first) and plugin "editor-paste" go first
+      CMs.Prec.low(CMv.EditorView.domEventHandlers({ drop: (e, view) => Ed.htmlDrop(e, view),
+                                                    paste: (e, view) => Ed.htmlPaste(e, view) })),
       CMv.EditorView.lineWrapping,
       CMv.EditorView.contentAttributes.of({ spellcheck: "false", autocorrect: "off", autocapitalize: "off" }),
-      Ed.viewTheme || (Ed.viewTheme = CMv.EditorView.theme({ "&.cm-focused": { outline: "none" }, ".cm-scroller": { fontFamily: "inherit", lineHeight: "inherit", overflow: "visible" },
+      Ed.viewTheme || (Ed.viewTheme = CMv.EditorView.theme({ "&.cm-focused": { outline: "none" }, ".cm-scroller": { fontFamily: "inherit", lineHeight: "inherit" },
                              ".cm-content": { padding: "0" }, ".cm-line": { padding: "0" } })),
       CMv.EditorView.updateListener.of(u => Ed.onUpdate(G(), v, u)),
+      // #241: this editor paints the NATIVE caret (no drawSelection). When an edit
+      // changes the line's syntax tree (Backspace into `**strong**` / `[[link]]`, the
+      // mark stops parsing), CM6 re-renders the line's inline DOM and re-collapses the
+      // DOM selection into the NEW text node at the same logical offset. WebKitGTK
+      // neither invalidates the old caret rect nor restarts the blink for that
+      // programmatic move: the caret stays drawn at the old x, or invisible, for up
+      // to a blink period. Re-adding the same range is a real selection change for
+      // WebKit (repaint at the new rect + blink restart); CM6 reads it back as equal
+      // to its state, so no transaction follows.
+      CMv.EditorView.updateListener.of(u => Ed.caretRepaint(u)),
       Ed.lpExt ? Ed.lpExt(v, G) : [],
       Ed.hlExt(v),
     ];
@@ -1764,9 +2566,12 @@ Object.assign(Ed, {
     const lp = v.lp;
     v.cm = cm; v._Ld = null;
     lp.textContent = ""; lp.appendChild(cm.dom); lp._cm = cm;
+    // #125/#137: cm.scrollDOM is THE scroller (style.css .lp.cmown); .lp is a layout box
+    lp.classList.add("cmown");
+    if (lp.dataset.title) cm.scrollDOM.dataset.title = lp.dataset.title; else delete cm.scrollDOM.dataset.title;
     // g.lp.focus() (tab switch, palette close, title edit) = focus the editor
     lp.focus = () => { if (!cm.hasFocus) cm.focus(); };
-    Ed.wheelOwn(lp);
+    Ed.wheelOwn(cm.scrollDOM);
     return lp;
   },
   onUpdate(g, v, u) {
@@ -1782,9 +2587,13 @@ Object.assign(Ed, {
         u.changes.iterChanges((fa, ta, fb, tb, ins) => ch.push([fa, ta, ins.length]));
         for (let i = ch.length - 1; i >= 0; i--) scShift(g, ch[i][0], ch[i][1], ch[i][2]);
       }
+      let tt = Ed._tt ? performance.now() : 0;         // #128 sub-timings (task_toggle)
       Ed.sync(g);
+      if (tt) { Ed.ttAdd("sync_ms", tt); tt = performance.now(); }
       if (typeof scheduleSave === "function") scheduleSave(g);
+      if (tt) { Ed.ttAdd("save_ms", tt); tt = performance.now(); }
       if (typeof showAc === "function") showAc(g);
+      if (tt) Ed.ttAdd("ac_ms", tt);
       if (v._sp) { const sp = v._sp; v._sp = null; if (otel.paint) otel.paint(sp); }
       if (typeof perf !== "undefined" && perf.mark) {
         // R18 ed_patch = the JS work after ONE doc change (CM6 redraws only the
@@ -1803,6 +2612,81 @@ Object.assign(Ed, {
   /* keys CM6 does not own: Enter (list continuation), Backspace/Delete (model
      deletes), Tab, Home/End, raw-column arrows, undo/redo, select-all — the
      R17 semantics, now on the CM6 selection */
+  WRAP: { "[": "]", "(": ")", "{": "}", "*": "*", "_": "_", "~": "~", "=": "=", "`": "`", "$": "$", "\"": "\"", "'": "'" },
+  wrapSel(view, text) {
+    const st = view.state, close = Object.prototype.hasOwnProperty.call(Ed.WRAP, text) ? Ed.WRAP[text] : null;
+    if (close == null || view.composing || st.selection.ranges.some(r => r.empty)) return false;
+    const n = text.length;
+    view.dispatch(st.changeByRange(r => ({
+      changes: [{ from: r.from, insert: text }, { from: r.to, insert: close }],
+      range: CMs.EditorSelection.range(r.anchor + n, r.head + n),
+    })), { userEvent: "input.type", scrollIntoView: true });
+    return true;
+  },
+  /* #291: document-navigation keys -> { to, extend } or null (null = not ours: the key goes on).
+     to: "docStart" | "docEnd" | "lineUp" | "lineDown". Measured on stock 1.13.7 (Linux, black box,
+     harness phase navkeysstock, 3200-line note, live preview + source):
+       Ctrl+Home / Ctrl+End    document start / end, scrolled into view   (+Shift: extend)
+       Ctrl+Up / Ctrl+Down     one SOURCE line up / down (not a wrapped row), same column
+                               clamped to the line, scrolled only when it leaves the view
+     macOS (platform convention, cannot run on the Linux box: unit-tested mapping only):
+       Cmd+Up / Cmd+Down       document start / end (+Shift: extend); Cmd+Home/End as before
+       Ctrl+Up / Ctrl+Down     not ours (the system's Mission Control / App windows)
+     PageDown / PageUp       one page down / up, the view scrolls with the caret (stock src: L1 -> L11
+                             -> L32, top L2 -> L13 -> L31), every platform (+Shift: extend); the
+                             native page move walks the rendered DOM as well (ours: L1 -> L2 -> L9)
+     Alt combinations and Ctrl+Shift+Up/Down are not ours (native/plugins, unchanged). */
+  navKey(e, mac) {
+    if (!e || e.altKey || e.isComposing) return null;
+    const k = e.key, ext = !!e.shiftKey, cmd = !!e.metaKey, ctl = !!e.ctrlKey;
+    if (k === "PageDown" || k === "PageUp") return ctl || cmd ? null : { to: k === "PageDown" ? "pageDown" : "pageUp", extend: ext };
+    if (k === "Home" || k === "End") {
+      // as before #291: either modifier is the document start / end, on every platform
+      return ctl || cmd ? { to: k === "End" ? "docEnd" : "docStart", extend: ext } : null;
+    }
+    if (k !== "ArrowUp" && k !== "ArrowDown") return null;
+    const down = k === "ArrowDown";
+    if (mac) return cmd && !ctl ? { to: down ? "docEnd" : "docStart", extend: ext } : null;
+    return ctl && !cmd && !ext ? { to: down ? "lineDown" : "lineUp", extend: false } : null;
+  },
+  isMac() { return typeof navigator !== "undefined" && /Mac/.test(navigator.platform || ""); },
+  /* #291: the target of a navKey result in (line,col), from the caret's head f and the lines L.
+     lo = the first line the caret may stand on (live preview: the line after the Properties block,
+     stock lands Ctrl+Home there; 0 otherwise). goal = the column a run of Ctrl+Up/Down keeps
+     (stock: the column survives a shorter or empty line in between), default f.c. */
+  navTarget(nav, f, L, lo, goal) {
+    const last = L.length - 1, top = Math.max(0, Math.min(last, lo | 0));
+    if (nav.to === "docStart") return { l: top, c: 0 };
+    if (nav.to === "docEnd") return { l: last, c: L[last].length };
+    const l = Math.max(Math.min(top, f.l), Math.min(last, f.l + (nav.to === "lineDown" ? 1 : -1)));
+    if (l === f.l) return { l: f.l, c: f.c };            // first / last line: the caret stays
+    return { l, c: Math.min(goal == null ? f.c : goal, L[l].length) };
+  },
+  // #291: live preview's first caret line = the line after the atomic Properties block (0 = none)
+  navBodyStart(g) {
+    const cm = Ed.cm(g), F = g && g.view && g.view._propsF;
+    if (!cm || !F) return 0;
+    const d = cm.state.field(F, false); if (!d || !d.size) return 0;
+    let end = -1; d.between(0, 0, (a, b) => { end = b; });
+    return end < 0 || end >= cm.state.doc.length ? 0 : cm.state.doc.lineAt(end).number;   // 1-based line of the end = 0-based next line
+  },
+  navRun(g, nav) {
+    const cm = Ed.cm(g); if (!cm) return;
+    if (nav.to === "pageDown" || nav.to === "pageUp") {   // CM6's page commands measure the scroller and scroll it
+      Ed._navGoal = null;
+      const dn = nav.to === "pageDown";
+      (nav.extend ? (dn ? CMc.selectPageDown : CMc.selectPageUp) : (dn ? CMc.cursorPageDown : CMc.cursorPageUp))(cm);
+      return;
+    }
+    const f = Ed.focusPos(g), L = Ed.lines(g), head = cm.state.selection.main.head;
+    const line = nav.to === "lineUp" || nav.to === "lineDown";
+    const G = Ed._navGoal, goal = line && G && G.cm === cm && G.head === head ? G.col : f.c;
+    const t = Ed.navTarget(nav, f, L, Ed.navBodyStart(g), goal);
+    if (nav.extend) Ed.extendTo(g, t.l, t.c); else Ed.place(g, t.l, t.c);
+    Ed._navGoal = line ? { cm, head: cm.state.selection.main.head, col: goal } : null;
+    // the view follows the caret (stock): nearest edge, so a move inside the view does not scroll
+    cm.dispatch({ effects: CMv.EditorView.scrollIntoView(cm.state.selection.main.head, { y: "nearest" }) });
+  },
   onKey(g, e) {
     if (!g || e.isComposing) return;
     if (typeof acKeydown === "function") { acKeydown(g, e); if (e.defaultPrevented) return; }
@@ -1823,10 +2707,15 @@ Object.assign(Ed, {
     if (k === "a" && mod) { e.preventDefault(); return Ed.selectAll(g); }
     if (k === "z" && mod) { e.preventDefault(); return e.shiftKey ? Ed.redo(g) : Ed.undo(g); }
     if (k === "y" && mod) { e.preventDefault(); return Ed.redo(g); }
+    // #291: the document-navigation keys run here, on the document (Ed.navKey), never as the
+    // webview's native caret move: that one only walks the RENDERED DOM, and CM6 renders a
+    // viewport, so on a note longer than it the caret stopped at the viewport edge
+    const nav = Ed.navKey(e, Ed.isMac());
+    if (nav) { e.preventDefault(); Ed.cmStart(); Ed.navRun(g, nav); return Ed.cmEnd(g); }
     if (e.key === "Home" || e.key === "End" || e.key === "ArrowLeft" || e.key === "ArrowRight") Ed.cmStart();
     if (e.key === "Home" || e.key === "End") {
       e.preventDefault();
-      // Ctrl/Cmd+Home/End: document start / end; bare Home/End: the line's (smart) home / end
+      // bare Home/End: the line's (smart) home / end (Ctrl/Cmd+Home/End are Ed.navKey's)
       const f = Ed.focusPos(g) || s.b, L = Ed.lines(g), end = e.key === "End";
       const l = mod ? (end ? L.length - 1 : 0) : f.l;
       const c = mod ? (end ? L[l].length : 0) : end ? L[l].length : (f.c === Ed.homeCol(g, l) ? 0 : Ed.homeCol(g, l));
@@ -1863,7 +2752,7 @@ Ed.geom = function (g) {
   const n = cm.state.doc.lines;
   if (n > 40) return "";
   const b = cm.contentDOM.getBoundingClientRect();   // the text column
-  let ys = "", xs = "", cb = "";
+  let ys = "", xs = "", cb = "", cr = "";   // cr: [ecr:] checkbox RIGHT edge per row (gh #75 caret probes)
   const r = document.createRange();
   for (let i = 0; i < n; i++) {
     const q = Ed.lineBox(g, i), row = Ed.rowAt(g, i);
@@ -1872,12 +2761,13 @@ Ed.geom = function (g) {
     if (box) {
       const bb = box.getBoundingClientRect();
       if (bb.width) cb += (cb ? "," : "") + i + "@" + Math.round(bb.left + bb.width / 2);
+      if (bb.width) cr += (cr ? "," : "") + i + "@" + Math.round(bb.right);
     }
     const r0 = row ? Ed.firstRect(row, r) : null;
     xs += (i ? "," : "") + Math.round(r0 ? r0.left : q.left);
   }
   return " [edx:" + Math.round(b.left) + "] [erx:" + xs + "] [ery:" + ys + "]"
-    + (cb ? " [ecb:" + cb + "]" : "");
+    + (cb ? " [ecb:" + cb + "] [ecr:" + cr + "]" : "");
 };
 /* ---------- KEY BEFORE CLICK (live-preview caret, goal top10-func) ----------
    WebKitGTK hands key and mouse events to the page through separate queues: a
@@ -1930,11 +2820,38 @@ Ed.caretXY = function (g) {               // caret rect relative to the pane box
   const c = cm && cm.coordsAtPos(cm.state.selection.main.head);
   return c ? [c.left - pr.left, c.bottom - pr.top] : [16, 16];
 };
+/* the rect a collapsed DOM caret (node, offset) is painted at. In a text node: the collapsed
+   Range's own rect (zero inside a display:none marker, which WebKit paints at the row start).
+   At an ELEMENT boundary (CM6 parks the selection between child nodes next to a widget, e.g.
+   (div.cm-line, k)) WebKit returns no client rects for the collapsed Range although it paints
+   the caret against the neighbouring box: so take the first following child that has a box
+   (its left edge), else the nearest preceding one (its right edge). Children without a box
+   (display:none) are skipped, so a caret next to only hidden nodes still reads 0,0,0.
+   Shared by the [crt:] census and the gh #75 selfTest DOM case. */
+Ed.caretRect = function (n, o) {
+  const Z = { left: 0, top: 0, height: 0, right: 0 }, r = document.createRange();
+  try { r.setStart(n, o); r.collapse(true); } catch (_) { return Z; }   // a stale offset: no rect
+  const q = r.getClientRects();
+  if (q.length) return q[0];
+  const b = r.getBoundingClientRect();
+  if (b.left || b.top || b.height || n.nodeType !== 1) return b;
+  const box = x => {
+    if (!x) return null;
+    if (x.nodeType === 3) { if (!x.nodeValue) return null; const g = document.createRange(); g.selectNodeContents(x); const t = g.getClientRects(); return t.length ? t[0] : null; }
+    const t = x.getClientRects ? x.getClientRects() : [];
+    return t.length ? t[0] : null;
+  };
+  const k = n.childNodes;
+  for (let i = o; i < k.length; i++) { const c = box(k[i]); if (c) return { left: c.left, top: c.top, height: c.height, right: c.left }; }
+  for (let i = o - 1; i >= 0; i--) { const c = box(k[i]); if (c) return { left: c.right, top: c.top, height: c.height, right: c.right }; }
+  return b;
+};
 Ed.crtTok = function () {
-  const g = typeof fg === "function" ? fg() : null, lp = g && g.lp, cm = Ed.cm(g);
+  const g = typeof fg === "function" ? fg() : null, lp = g && g.lp, cm = Ed.cm(g), sc = cm && cm.scrollDOM;
   if (!lp || !cm || !lp.isConnected || !lp.getClientRects().length) return "";
-  const R = Math.round, s = window.getSelection(), cs = getComputedStyle(lp), b = lp.getBoundingClientRect();
-  const ox = R(b.left + lp.clientLeft + parseFloat(cs.paddingLeft)), oy = R(b.top + lp.clientTop + parseFloat(cs.paddingTop) - lp.scrollTop);
+  // lp= the content origin: the SCROLLER's padding box (cm.scrollDOM owns padding + scrollTop, #125)
+  const R = Math.round, s = window.getSelection(), cs = getComputedStyle(sc), b = sc.getBoundingClientRect();
+  const ox = R(b.left + sc.clientLeft + parseFloat(cs.paddingLeft)), oy = R(b.top + sc.clientTop + parseFloat(cs.paddingTop) - sc.scrollTop);
   let k = "none", x = 0, y = 0, h = 0, lc = "-";
   if (s && s.rangeCount && s.focusNode) {
     const n = s.focusNode;
@@ -1943,9 +2860,7 @@ Ed.crtTok = function () {
       k = n === lp || n === cm.contentDOM || n === cm.dom ? "lp"
         : n.nodeType === 3 ? (n.parentElement && n.parentElement.getClientRects().length ? "txt" : "hid")
         : n.nodeName === "BR" ? "br" : n.classList && n.classList.contains("cm-line") ? "row" : "el";
-      const r = document.createRange();
-      try { r.setStart(n, s.focusOffset); r.collapse(true); } catch (_) { /* a stale offset: no rect */ }
-      const q = r.getClientRects(), c = q.length ? q[0] : r.getBoundingClientRect();
+      const c = Ed.caretRect(n, s.focusOffset);
       x = R(c.left); y = R(c.top); h = R(c.height);
       const p = Ed.pos(g, n, s.focusOffset);
       if (p) lc = p.l + "." + p.c;
@@ -1965,7 +2880,125 @@ Ed.lineAtY = function (g, y) {            // client y -> {l, f}: the line under 
   const cm = Ed.cm(g); if (!cm) return null;
   const b = cm.lineBlockAtHeight(y - cm.documentTop), d = cm.state.doc;
   const f = b.height > 0 ? Math.min(1, Math.max(0, (y - cm.documentTop - b.top) / b.height)) : 0;
-  return { l: d.lineAt(b.from).number - 1, f };
+  // #125: a block that replaces several source lines (lp widget) spreads f over them —
+  // block start + its own fraction put "just above the next line" on the block's FIRST line
+  const a = d.lineAt(b.from).number - 1, n = d.lineAt(b.to).number - a, v = a + Math.min(n - 1e-6, f * n);
+  return { l: Math.floor(v), f: v - Math.floor(v) };
+};
+/* ---------- #125/#137 approach B: CM6 OWNS THE SCROLLER ----------
+   cm.scrollDOM is the note scroller of both edit sub-modes (style.css .lp.cmown);
+   g.lp is a layout box that never scrolls. CM6 then runs its scroll-anchor
+   correction on EVERY measure (it skips it only when its scroll parent is not its
+   own scrollDOM and the editor is unfocused with no wheel < 100 ms old — the
+   whole bug class: an app px write to g.lp.scrollTop that the next measure of
+   estimated lines either undid or never corrected). So nothing below writes a px
+   scrollTop of a CM6 scroller: a position is captured as a LINE plus an offset
+   and given back to CM6 as a scroll effect that it applies INSIDE its measure
+   loop, after the viewport redraw, on its own height map. */
+Ed.sc = g => { const cm = Ed.cm(g); return cm ? cm.scrollDOM : g && g.lp; };   // the element that scrolls the edit view
+Ed.scOf = el => (el && el._cm ? el._cm.scrollDOM : el);                          // g.lp (or any .lp) -> its scroller
+/* off = content-origin offset: documentTop (contentDOM top + padding) minus the
+   scroller's inner top, at scrollTop 0 — the scroller padding + inline title
+   ::before. Layout-stable across a scroll; re-read at every landing because a
+   font change (qfs) re-sizes the title. */
+Ed.scOff = function (cm) {
+  const sc = cm.scrollDOM;
+  return cm.documentTop - (sc.getBoundingClientRect().top + sc.clientTop) + sc.scrollTop;
+};
+/* CM6's own snapshot effect (EditorView.scrollSnapshot builds the same object):
+   inside the measure loop it sets scrollDOM.scrollTop = lineBlockAt(pos).top - ym,
+   on the heights measured that very frame. The constructor is taken from a live
+   snapshot so no private symbol of the vendored bundle is named here. */
+Ed.snapFx = function (cm, pos, ym, xm) {
+  const s = cm.scrollSnapshot(), C = s.value.constructor;
+  const p = Math.min(cm.state.doc.length, Math.max(0, pos));
+  return s.type.of(new C(CMs.EditorSelection.cursor(p), "start", "start", ym, xm == null ? cm.scrollDOM.scrollLeft : xm, true));
+};
+Ed.scrollToTop = function (cm, top) {   // scroller px (plugin API / "top of note") as a CM6 effect
+  if (!cm) return;
+  const y = Math.max(0, top) - Ed.scOff(cm), b = cm.lineBlockAtHeight(Math.max(0, y));
+  cm.dispatch({ effects: Ed.snapFx(cm, b.from, b.top - Math.max(0, top)) });   // scrollTop = blockTop - ym = top
+};
+/* the position of the view = the block at the scroller's top edge: its source line
+   l (0-based), how far (px) its top sits from the edge (c <= 0 when it straddles
+   it) and the fraction f of it scrolled off. Read on CM6's height map, which is
+   in step with the drawn rows for any line inside the viewport. */
+Ed.snapOf = function (cm) {
+  if (!cm || !cm.dom.isConnected || !cm.scrollDOM.getClientRects().length) return null;
+  const sc = cm.scrollDOM, off = Ed.scOff(cm), y = sc.scrollTop - off;
+  if (sc.scrollTop <= 0) return { l: 0, c: off, f: 0, top: true };   // the title + padding in view: land there
+  const b = cm.lineBlockAtHeight(Math.max(0, y)), d = cm.state.doc;
+  // l/f spread over the source lines the block replaces (see Ed.landAt); c stays relative to the block top
+  const fb = b.height > 0 ? Math.min(1, Math.max(0, (y - b.top) / b.height)) : 0;
+  const a = d.lineAt(b.from).number - 1, n = d.lineAt(b.to).number - a, v = a + Math.min(n - 1e-6, fb * n);
+  return { l: Math.floor(v), c: b.top - y, f: v - Math.floor(v) };
+};
+/* where a snapOf position lands: {pos, c} = the height-map block holding line l
+   (pos = its start) and the px its top must sit from the scroller top.
+   byFrac (a re-flowed view — mode switch): fraction f of line l scrolled off; a
+   block that replaces several source lines (lp widget) shares its height among
+   them, so line l inside it lands proportionally, not on the block start. */
+Ed.landAt = function (v, s, byFrac) {
+  const d = v.state.doc, ln = d.line(Math.min(d.lines, Math.max(1, s.l + 1)));
+  if (!byFrac) return { pos: ln.from, c: s.c };
+  const b = v.lineBlockAt(ln.from), a = d.lineAt(b.from).number, n = Math.max(1, d.lineAt(b.to).number - a + 1);
+  return { pos: b.from, c: -((ln.number - a) + (s.f || 0)) / n * b.height };
+};
+Ed.land = function (cm, s, byFrac) {
+  if (!cm || !s) return false;
+  if (s.top) { cm.dispatch({ effects: Ed.snapFx(cm, 0, cm.lineBlockAt(0).top) }); return true; }   // scrollTop 0
+  const t = Ed.landAt(cm, s, byFrac);
+  // scrollTop = blockTop + off - c  ->  ym = blockTop - scrollTop = c - off
+  cm.dispatch({ effects: Ed.snapFx(cm, t.pos, t.c - Ed.scOff(cm)) });
+  Ed.holdLand(cm, s, byFrac);
+  return true;
+};
+/* HOLD a landing until CM6's height map agrees with it. CM6 applies the snapshot in
+   the first measure pass whose viewport is stable, on the heights drawn THAT frame;
+   the scroll then draws rows it had only estimated (a .lp.src restyle, lazy rows,
+   wrapped paragraphs) and its anchor correction holds the block that was at the
+   OLD scroll position, not the landed line (box: mid lp->src off 7, end src->lp off 8).
+   So for a few frames a CM6 measure request reads where line l really sits on the
+   freshly measured map; when it is off by more than HOLD_PX the same landing is
+   given back to CM6 once more (an effect, never a px write). Ends at the first
+   user input on the scroller, at a newer landing, or after HOLD_FR frames. */
+Ed.HOLD_PX = 3; Ed.HOLD_FR = 90;
+Ed.holdLand = function (cm, s, byFrac) {
+  if (!cm || !s || s.top) return;
+  const seq = cm._landSeq = (cm._landSeq || 0) + 1, sc = cm.scrollDOM, evs = ["wheel", "keydown", "pointerdown", "touchstart"];
+  let fr = 0, ok = 0, re = 0, done = false;
+  const end = () => { if (done) return; done = true; for (const e of evs) sc.removeEventListener(e, quit, true); };
+  const quit = () => { if (cm._landSeq === seq) { cm._landSeq++; cm._landUser = cm._landSeq; } end(); };   // _landUser: this bump was user input, not a newer landing
+  for (const e of evs) sc.addEventListener(e, quit, true);
+  const tick = () => {
+    if (done || cm._landSeq !== seq || !cm.dom.isConnected || ++fr > Ed.HOLD_FR) { end(); return; }
+    cm.requestMeasure({
+      key: "ed-hold-land",
+      read(v) {
+        const t = Ed.landAt(v, s, byFrac), want = t.c, cur = v.lineBlockAt(t.pos).top + Ed.scOff(v) - sc.scrollTop;
+        const max = sc.scrollHeight - sc.clientHeight;
+        // clamped at either end of the scroller: the line cannot get any closer
+        const stuck = (cur > want && sc.scrollTop >= max - 1) || (cur < want && sc.scrollTop <= 0);
+        return Math.abs(cur - want) <= Ed.HOLD_PX || stuck;
+      },
+      write(good) {
+        if (done || cm._landSeq !== seq) return;
+        if (good) { if (++ok >= 3 && fr >= 10) { end(); return; } }
+        else {
+          ok = 0;
+          if (++re > 8) { end(); return; }
+          // a dispatch inside CM6's measure loop throws: give the landing back right after it
+          queueMicrotask(() => {
+            if (done || cm._landSeq !== seq) return;
+            const t = Ed.landAt(cm, s, byFrac);
+            cm.dispatch({ effects: Ed.snapFx(cm, t.pos, t.c - Ed.scOff(cm)) });
+          });
+        }
+        requestAnimationFrame(tick);
+      }
+    });
+  };
+  requestAnimationFrame(tick);
 };
 /* the line at the scroller's top edge (+slack px), fractional. DOM FIRST: the
    drawn rows are the truth the user sees. The height map is only as fresh as
@@ -1974,13 +3007,18 @@ Ed.lineAtY = function (g, y) {            // client y -> {l, f}: the line under 
    reading landed on L150). The map answers only when y falls in a gap. */
 Ed.topLine = function (g, slack) {
   const cm = Ed.cm(g); if (!g.lp || !cm) return null;
-  const y = g.lp.getBoundingClientRect().top + (slack == null ? 1 : slack), d = cm.state.doc;
+  const y = cm.scrollDOM.getBoundingClientRect().top + (slack == null ? 1 : slack), d = cm.state.doc;
   for (const el of cm.contentDOM.children) {
     const r = el.getBoundingClientRect();
     if (r.bottom <= y) continue;
     if (r.top > y + 0.5 || r.height <= 0 || el.classList.contains("cm-gap")) break;   // y sits in a gap
     let a, b;
-    try { a = d.lineAt(cm.posAtDOM(el, 0)).number - 1; b = d.lineAt(cm.posAtDOM(el, el.childNodes.length)).number - 1; }
+    try {
+      const p0 = cm.posAtDOM(el, 0);
+      a = d.lineAt(p0).number - 1;
+      // a block widget's DOM can map its end back to its start: the height-map block knows the lines it replaces
+      b = Math.max(d.lineAt(cm.posAtDOM(el, el.childNodes.length)).number, d.lineAt(cm.lineBlockAt(p0).to).number) - 1;
+    }
     catch (e) { break; }
     // one element can span several source lines (a block widget): spread y over them
     const f = Math.min(1, Math.max(0, (y - r.top) / r.height)) * (b - a + 1);
@@ -1989,37 +3027,46 @@ Ed.topLine = function (g, slack) {
   const p = Ed.lineAtY(g, y);
   return p ? p.l + p.f : null;
 };
-Ed.scrollToLine = function (g, line) {    // put the fractional source line at the scroller's top, clamped
-  const cm = Ed.cm(g), lp = g.lp; if (!cm || line == null) return;
+/* #125 scrollsync ss-src-mid-e2r (1/3, off 14 — develop has the same red): the
+   capture (Ctrl+E) reads the drawn rows at the scroller top. A synchronous
+   cm.measure() flush here (ef5ccd2) did NOT clear that red and cost an lp->src->lp
+   end trip (off 2), so the capture reads the DOM as painted, untouched. Ed.tlDiag
+   keeps line:scrollTop:scrollHeight for the [ssa:] census token (red-path diag). */
+Ed.topLineNow = function (g, slack) {
+  const cm = Ed.cm(g); if (!g.lp || !cm) return null;
+  const l = Ed.topLine(g, slack), s = cm.scrollDOM, R = x => (x == null ? "-" : Math.round(x * 100) / 100);
+  Ed.tlDiag = R(l) + ":" + Math.round(s.scrollTop) + ":" + Math.round(s.scrollHeight);
+  return l;
+};
+/* put the fractional source line at the scroller's top: ONE CM6 snapshot effect.
+   The old body wrote g.lp.scrollTop from the height map and re-landed in a
+   requestMeasure write (ROOTCAUSE I1/I2) — the re-land itself raced CM6's next
+   measure. CM6 now resolves lineBlockAt(line) after measuring the viewport it
+   scrolls to, and its anchor correction holds the line through later measures. */
+Ed.scrollToLine = function (g, line) {
+  const cm = Ed.cm(g); if (!cm || line == null) return;
   const d = cm.state.doc, i = Math.min(d.lines - 1, Math.max(0, Math.floor(line))), f = Math.min(1, Math.max(0, line - i));
-  const go = () => {
-    const b = cm.lineBlockAt(d.line(i + 1).from);
-    const dy = cm.documentTop + b.top + f * b.height - lp.getBoundingClientRect().top;
-    const max = Math.max(0, lp.scrollHeight - lp.clientHeight);
-    lp.scrollTop = Math.min(max, Math.max(0, lp.scrollTop + dy));
-  };
-  go();
-  // the height map holds ESTIMATES for lines never drawn: once CM6 has measured
-  // the lines this scroll brought in, land on the real geometry
-  cm.requestMeasure({ key: "osScrollLine", read: () => null, write: () => { if (Ed.cm(g) === cm) go(); } });
+  if (i === 0 && f === 0) { Ed.land(cm, { top: true }); return; }   // line 0 = the top of the note (title in view)
+  Ed.land(cm, { l: i, f }, true);
 };
 /* the editor scroller OWNS its plain vertical wheel. CM6 virtualises: lines it has
    not drawn carry ESTIMATED (or, after the .lp.src restyle, stale) heights, and when
    it measures the lines a scroll brings in it keeps the view still by correcting the
-   scroller (`scrollTop += diff` in its measure loop, applied while a wheel event is
-   < 100 ms old). WebKitGTK runs a wheel burst as ONE smooth-scroll animation and a
-   scrollTop write CANCELS it, so scrolling UP into unmeasured lines lost most of
-   every burst (scrollsync: 80 notches up from L91 in source mode landed on L45, then
-   L20; Chromium/Obsidian composes the two). Here the burst is accumulated and walked
-   in RELATIVE steps per frame, so CM6's corrections add to it instead of killing it.
+   scroller (`scrollTop += diff` in its measure loop). WebKitGTK runs a wheel burst as
+   ONE smooth-scroll animation and a scrollTop write CANCELS it, so scrolling UP into
+   unmeasured lines lost most of every burst (scrollsync: 80 notches up from L91 in
+   source mode landed on L45, then L20; Chromium/Obsidian composes the two). Here the
+   burst is accumulated and walked in RELATIVE steps per frame, so CM6's corrections
+   add to it instead of killing it. This is USER input, relative to wherever CM6 left
+   the scroller — not a position restore. `sc` is cm.scrollDOM (#125: the scroller).
    Left to the browser: Ctrl (fontwheel), Shift / horizontal intent, and any nested
    scroller (pdf frame, wide code/table) that can still move in the wheel's direction. */
-Ed.wheelOwn = function (lp) {
-  if (!lp || lp._osWheel) return;
-  lp._osWheel = { pend: 0, raf: 0 };
-  const W = lp._osWheel;
+Ed.wheelOwn = function (sc) {
+  if (!sc || sc._osWheel) return;
+  sc._osWheel = { pend: 0, raf: 0 };
+  const W = sc._osWheel;
   const nestedTakes = (t, dy) => {
-    for (let el = t && t.nodeType === 1 ? t : t && t.parentElement; el && el !== lp; el = el.parentElement) {
+    for (let el = t && t.nodeType === 1 ? t : t && t.parentElement; el && el !== sc; el = el.parentElement) {
       if (el.scrollHeight <= el.clientHeight + 1) continue;
       const oy = getComputedStyle(el).overflowY;
       if (oy !== "auto" && oy !== "scroll") continue;
@@ -2029,21 +3076,21 @@ Ed.wheelOwn = function (lp) {
   };
   const step = () => {
     W.raf = 0;
-    const max = Math.max(0, lp.scrollHeight - lp.clientHeight), st = lp.scrollTop;
+    const max = Math.max(0, sc.scrollHeight - sc.clientHeight), st = sc.scrollTop;
     // at an edge the rest of the burst has nowhere to go: drop it (no stored push)
     if ((W.pend < 0 && st <= 0) || (W.pend > 0 && st >= max)) { W.pend = 0; return; }
     let d = W.pend / 3;
     if (Math.abs(d) < 8) d = Math.abs(W.pend) < 8 ? W.pend : Math.sign(W.pend) * 8;
     W.pend -= d;
-    lp.scrollTop = Math.min(max, Math.max(0, st + d));   // RELATIVE to wherever CM6 left it
+    sc.scrollTop = Math.min(max, Math.max(0, st + d));   // RELATIVE to wherever CM6 left it
     if (Math.abs(W.pend) >= 0.5) W.raf = requestAnimationFrame(step); else W.pend = 0;
   };
-  lp.addEventListener("wheel", e => {
+  sc.addEventListener("wheel", e => {
     if (e.ctrlKey || e.shiftKey || e.defaultPrevented) return;
-    if (!lp._cm || Math.abs(e.deltaX) > Math.abs(e.deltaY) || !e.deltaY) return;
+    if (!sc.isConnected || Math.abs(e.deltaX) > Math.abs(e.deltaY) || !e.deltaY) return;
     if (nestedTakes(e.target, e.deltaY)) return;
-    const px = e.deltaMode === 1 ? e.deltaY * (parseFloat(getComputedStyle(lp).lineHeight) || 24)
-             : e.deltaMode === 2 ? e.deltaY * lp.clientHeight : e.deltaY;
+    const px = e.deltaMode === 1 ? e.deltaY * (parseFloat(getComputedStyle(sc).lineHeight) || 24)
+             : e.deltaMode === 2 ? e.deltaY * sc.clientHeight : e.deltaY;
     e.preventDefault();
     if (Math.sign(px) !== Math.sign(W.pend)) W.pend = 0;   // a reversal starts fresh
     W.pend += px;
@@ -2059,6 +3106,57 @@ Ed.revealAt = function (g, l, c) {
   const cm = Ed.cm(g); if (!cm || l == null) return false;
   const d = cm.state.doc, i = Math.min(d.lines, Math.max(1, l + 1)), ln = d.line(i);
   cm.dispatch({ effects: CMv.EditorView.scrollIntoView(Math.min(ln.to, ln.from + Math.max(0, c || 0)), { y: "center" }) });
+  return true;
+};
+/* bring source position pos into view the way CM6's own scrollIntoView does
+   (y "nearest" or "center", margin 5, an empty selection's side) — but as CM6's
+   SNAPSHOT effect. Under #148 (cm.scrollDOM is the scroller) a plain
+   scrollIntoView effect was seen not scrolling cm.scrollDOM at all for a heading
+   start (links [nvr:] scrollTop 0 for 13 frames) and for the caret after a block
+   widget (osdrop: caret on the pdf row below the view, scrollTop 0), while the
+   snapshot effect (Ed.land) lands. Geometry is the height-map block of pos, read
+   in a measure READ so it is that frame's; the snapshot then sets
+   scrollTop = blockTop - ym inside CM6's measure loop (never a px write). Held for
+   a few frames while the block re-measures (a heading drawn from an estimate, a
+   pdf frame that grows after its first draw); ends at user input on the
+   scroller, at a newer landing, or after REV_FR frames. */
+Ed.REV_FR = 40;
+Ed.revealPos = function (cm, pos, y) {
+  if (!cm || pos == null) return false;
+  const seq = cm._landSeq = (cm._landSeq || 0) + 1, sc = cm.scrollDOM, evs = ["wheel", "keydown", "pointerdown", "touchstart"];
+  let fr = 0, ok = 0, done = false;
+  const end = () => { if (done) return; done = true; for (const e of evs) sc.removeEventListener(e, quit, true); };
+  const quit = () => { if (cm._landSeq === seq) { cm._landSeq++; cm._landUser = cm._landSeq; } end(); };   // _landUser: this bump was user input, not a newer landing
+  for (const e of evs) sc.addEventListener(e, quit, true);
+  const want = v => {
+    const p = Math.min(v.state.doc.length, Math.max(0, pos)), b = v.lineBlockAt(p), M = 5;
+    const st = sc.scrollTop, H = sc.clientHeight, max = Math.max(0, sc.scrollHeight - H);
+    const top = b.top + Ed.scOff(v), bot = top + b.height;
+    let T = st;
+    if (y === "center") T = b.height <= H ? top + b.height / 2 - H / 2 : bot - H + M;
+    else if (top < st + M) { T = top - M; if (bot > T + H) T = bot - H + M; }
+    else if (bot > st + H - M) T = bot - H + M;
+    T = Math.max(0, Math.min(max, T));
+    return { from: b.from, ym: b.top - T, need: Math.abs(T - st) > 1 };
+  };
+  const tick = () => {
+    if (done || cm._landSeq !== seq || !cm.dom.isConnected || ++fr > Ed.REV_FR) { end(); return; }
+    cm.requestMeasure({
+      key: "ed-reveal-pos",
+      read: want,
+      write(r) {
+        if (done || cm._landSeq !== seq) return;
+        if (!r.need) { if (++ok >= 3 && fr >= 10) { end(); return; } }
+        else {
+          ok = 0;
+          // a dispatch inside CM6's measure loop throws: land right after it
+          queueMicrotask(() => { if (!done && cm._landSeq === seq) cm.dispatch({ effects: Ed.snapFx(cm, r.from, r.ym) }); });
+        }
+        requestAnimationFrame(tick);
+      }
+    });
+  };
+  tick();
   return true;
 };
 /* put source line l at the scroller's top through CM6's own scrollIntoView effect
@@ -2120,11 +3218,14 @@ Ed.lpParse = function (g, text) {
   // (osdrop: six image rows pushed the pdf frame to y=737, below a 700 px window). style.css hides it.
   const BLK = ".vimg, .imgmiss, .pdf-embed";
   const blk = wid.some(w => w.el.matches && (w.el.matches(BLK) || !!w.el.querySelector(BLK)));
+  const keys = [];
   P = { cls: row.className + (blk ? " blk" : ""), toks, wid, els: els.map(x => {
     const sp = spec(x.el), d = CMv.Decoration.mark(sp);
     const isMk = x.el.classList.contains("mk");
+    keys.push({ s: x.s, e: x.e, pe: x.el.parentNode, k: JSON.stringify(sp) });
     return { s: x.s, e: x.e, d, rv: isMk ? CMv.Decoration.mark(Object.assign({}, sp, { class: sp.class + " rv" })) : d };
   }) };
+  P.runs = Ed.lpRuns(keys);   // #278: source-mode span merge (Ed.lpRuns); keys (and their DOM refs) are not kept
   if (Ed._lpc.size > 4000) Ed._lpc.clear();
   Ed._lpc.set(text, P);
   return P;
@@ -2135,6 +3236,52 @@ Ed.lpLeaves = function (row) {            // the text-less leaves of a rendered 
   walk(row);
   return out;
 };
+// a task row's marker prefix as Ed.block reads it: indent, any ">" quote levels (">  - [ ] x" is a
+// quoted list row too), a bullet or "N.", then "[c] ". m[0].length = the task text start (gh #46/#75)
+Ed.TASK_RE = /^[ \t]*(?:>[ \t]*)*(?:[-*+]|\d+\.) \[[^\]\n]\] /;
+/* #278 (selection lag in source mode): the mark decoration of one marker element x (Ed.lpParse els) on a
+   build. Live preview hides a marker (.lp .mk) until the selection touches its token, and shows it through
+   the .rv twin (.lp .mk.rv). In SOURCE mode every marker is already shown (.lp.src .mk, style.css: each
+   .mk.rv rule has an identical .lp.src twin), so the swap paints nothing — but CM6 still tore down and
+   re-created the span of every marker the selection entered or left: on the box (probe/278-sellag,
+   20x Shift+Down on the realistic note) 4-60 span.mk childList mutations per step and a 11-23 ms render
+   per key instead of 5-8 ms. Source mode keeps the plain decoration, so a selection-only rebuild leaves
+   the marker DOM alone. */
+Ed.lpSrc = v => !!(v && v.lp && v.lp.classList && v.lp.classList.contains("src"));
+Ed.lpMk = (x, rev, src) => (rev && !src ? x.rv : x.d);
+/* #278 (Ctrl+A in source mode): CM6 re-uses a mark span only for a range that CONTINUES across a line
+   break, so two ADJACENT element ranges with equal specs (heading "#" + " ", quote ">" + " ") become two
+   sibling spans with identical classes. In source mode nothing tells them apart (no .rv swap there, and
+   style.css gives source-mode markers no ::before/::after content: .lp.src ... ::before { content: none }),
+   so they are drawn as ONE span: fewer inline boxes for WebKit to resolve ::selection on (realistic note,
+   box census: 242 -> 228 elements, 209 -> 195 text nodes; screenshots at rest and after Ctrl+A identical
+   to the unmerged build). Live preview is untouched: there each marker keeps its own span (.rv per token).
+   Ed.lpRuns(keys): keys = [{s, e, pe, k}] in lpParse order (pe = parent element, k = the spec as JSON);
+   returns [{i, j, s, e}] (els i..j-1 drawn as one range s..e): consecutive keys merge only with the same
+   parent, the same spec and touching offsets (keys[n].s === previous e); everything else is its own run. */
+Ed.lpRuns = function (keys) {
+  const out = [];
+  for (let i = 0; i < keys.length;) {
+    const a = keys[i]; let e = a.e, j = i + 1;
+    while (j < keys.length && keys[j].pe === a.pe && keys[j].k === a.k && keys[j].s === e && keys[j].e > keys[j].s) { e = keys[j].e; j++; }
+    out.push({ i, j, s: a.s, e });
+    i = j;
+  }
+  return out;
+};
+/* #278: the lp decorations depend on source mode (Ed.lpMk), but applyMode flips .lp.src without a
+   transaction. Rebuild once when the mode differs from the one the current decorations were built for
+   (v._lpSrc, set by build) — and only then: a tab switch / re-apply in the same mode dispatches nothing. */
+Ed.lpSrcSync = function (g) {
+  const v = g && g.view, cm = v && v.cm;
+  if (!cm || !v._lpFx || v._lpSrc === undefined || v._lpSrc === Ed.lpSrc(v)) return false;
+  cm.dispatch({ effects: v._lpFx.of(null) });
+  return true;
+};
+// the caret line's line-decoration classes: `cur` (ours: geometry/census) + `cm-active` (#333, stock's class)
+Ed.ACTIVE_LINE = "cur cm-active";
+// #319: the class stock carries on the editor root, the ancestor theme line selectors key on
+Ed.EDITOR_ROOT = "cm-s-obsidian";
 Ed.lpExt = function (v, G) {
   const { Decoration, ViewPlugin, WidgetType, EditorView } = CMv;
   const bust = CMs.StateEffect.define();
@@ -2145,8 +3292,9 @@ Ed.lpExt = function (v, G) {
     // the parsed leaf itself (cloned): re-rendering the row here could disagree with the parse
     // except a pdf frame: its loader (Ed.pdfFill) is closures + observers on the ORIGINAL
     // element, so a clone never loads a page (osdrop [pf:1/0|..p1/0-]) — render it fresh
-    toDOM() {
-      if (this.el && this.el.dataset && this.el.dataset.pdf != null) {
+    toDOM(view) {
+      // #116: an audio embed too (its blob loader is the ORIGINAL element's observer + play listener)
+      if (this.el && this.el.dataset && (this.el.dataset.pdf != null || this.el.dataset.audio != null)) {
         const f = Ed.lpLeaves(Ed.row(G(), this.t, 0))[this.k];
         if (f) return f;
       }
@@ -2154,6 +3302,17 @@ Ed.lpExt = function (v, G) {
       // cloneNode drops listeners, and ignoreEvent() keeps CM6's domEventHandlers off
       // widget events — so the task checkbox clone gets its own toggle (R8.6)
       const c = this.el.cloneNode(true);
+      // R1 end drift: a cloned <img> (loading=lazy, opensidian-img fetch) is 0 px until its
+      // bytes land, then ~360 px. CM6's content ResizeObserver DROPS a resize within 75 ms of
+      // its last update, so a late load above the top line pushed the drawn rows down while the
+      // height map kept the old height (box: end src->lp L3118 -> L3116, lp-img-3 at L3111).
+      // Ask CM6 to measure when the bytes land: its anchor correction holds the top line.
+      const ims = c.tagName === "IMG" ? [c] : c.querySelectorAll ? [...c.querySelectorAll("img")] : [];
+      for (const im of ims) if (!im.complete && view) {
+        const m = () => view.requestMeasure();
+        im.addEventListener("load", m, { once: true });
+        im.addEventListener("error", m, { once: true });
+      }
       const cb = c.matches && c.matches("input.tbox") ? c : (c.querySelector ? c.querySelector("input.tbox") : null);
       if (cb) Ed.taskBox(cb);
       return c;
@@ -2161,12 +3320,17 @@ Ed.lpExt = function (v, G) {
     ignoreEvent() { return true; }
   }
   const lineDeco = new Map();
+  let tcrGen = 0, tcrRow = -1;   // gh #75: stale-caret repaint class tcr0/tcr1 parity + the blank task row the caret was on last build (see build)
   const ld = c => { let d = lineDeco.get(c); if (!d) { d = Decoration.line({ class: c }); lineDeco.set(c, d); } return d; };
   const build = view => {
     const g = G(), st = view.state, doc = st.doc, sel = st.selection.main, out = [], labels = [];
+    const src = Ed.lpSrc(v); v._lpSrc = src;   // #278: source mode at this build (Ed.lpMk, Ed.lpSrcSync)
     const cur = doc.lineAt(sel.head).number;
+    const tcrLeft = tcrRow !== cur ? tcrRow : -1, tp = " tcr" + (++tcrGen & 1);   // gh #75: see the tcr comment below
+    let tcrNext = -1;
     // plugin overlay tokens (a Templater command) take no markdown decoration, as in Obsidian
     const opq = Ed.lpOpaque ? Ed.lpOpaque(view) : null;
+    const frs = Ed.lpFenceRows(doc);   // #331: fence rows take the stock line class HyperMD-codeblock
     const hit = (rs, s, e) => { for (const r of rs) if (s < r[1] && e > r[0]) return true; return false; };
     let last = -1;
     for (const { from, to } of view.visibleRanges) {
@@ -2188,11 +3352,34 @@ Ed.lpExt = function (v, G) {
         }
         const fl = g && g._fl && g._fl.l === ln.number - 1 ? (g._fl.fade ? " navflash fade" : " navflash") : "";
         const whole = ors && ln.length > 0 && ors.some(r => r[0] <= 0 && r[1] >= ln.length);
-        out.push(ld((whole ? Ed.lpParse(g, "x").cls : P.cls) + (ln.number === cur ? " cur" : "") + fl).range(ln.from));
-        for (let i = 0; i < P.els.length; i++) {
+        // gh #75 (PR #80, fix-75d): WebKitGTK leaves a STALE caret on a blank task row. Typing then deleting the
+        // body ("Z", BackSpace) removes the text node the caret was painted in, and the row gets span.tcar back;
+        // WebKit erases the OLD caret through that node's renderer, which is gone, so the 1px bar at the old x
+        // (box right + one glyph) stays on screen next to the live caret. Flip a paint-only class (tcr0/tcr1,
+        // style.css: a transparent background-image layer, invisible) on the caret's blank task row on
+        // every rebuild: a style change that needs a repaint makes WebKit repaint the WHOLE line box, which wipes it.
+        // The row the caret just LEFT gets one more flip: its last rebuild was the BackSpace that left the stale bar
+        // (box shots B-click / E-click: bar on the row above), and dropping the class is not always a paint change.
+        const car = ln.number === cur && P.wid.some(w => w.el && w.el.classList && w.el.classList.contains("tcar"));
+        if (car) tcrNext = cur;
+        const tcr = car || ln.number === tcrLeft ? tp : "";
+        // #333: the caret line also carries `cm-active`, the class stock 1.13.7 puts on it (its DOM: "cm-line cm-active"),
+        // so a theme's active-line rule (Gruvbox `.cm-active`, Solarized `body:not(.disable-…)
+        // .cm-active`) has a target. Our own CSS paints nothing on it: with no theme rule the line looks as before.
+        out.push(ld((whole ? Ed.lpParse(g, "x").cls : P.cls) + (frs.has(ln.number) ? " HyperMD-codeblock" : "") + (ln.number === cur ? " " + Ed.ACTIVE_LINE : "") + tcr + fl).range(ln.from));
+        const emit = i => {
           const x = P.els[i];
-          if (x.e > x.s && !(ors && hit(ors, x.s, x.e))) out.push((rv && rv.has(i) ? x.rv : x.d).range(ln.from + x.s, ln.from + x.e));
+          if (x.e > x.s && !(ors && hit(ors, x.s, x.e))) out.push(Ed.lpMk(x, !!(rv && rv.has(i)), src).range(ln.from + x.s, ln.from + x.e));
+        };
+        // #278: source mode draws a merged run (Ed.lpRuns) as one span; a run an overlay touches falls back
+        // to its elements one by one (exactly the unmerged result), live preview always does
+        if (src && P.runs) for (const r of P.runs) {
+          if (r.j - r.i > 1 && r.e > r.s && !(ors && hit(ors, r.s, r.e))) out.push(Ed.lpMk(P.els[r.i], false, true).range(ln.from + r.s, ln.from + r.e));
+          else for (let i = r.i; i < r.j; i++) emit(i);
         }
+        else for (let i = 0; i < P.els.length; i++) emit(i);
+        // leaves: checkbox, image, pdf frame, and the #75 blank-task caret anchor span.tcar (at t.e, side 1:
+        // right of the box, so the caret at the marker end maps to a rendered spot after the checkbox)
         for (const w of P.wid) if (!(ors && ors.some(r => r[0] < w.pos && w.pos < r[1]))) out.push(Decoration.widget({ widget: new Leaf(ln.text, w.k, w.el), side: 1 }).range(ln.from + w.pos));
       }
     }
@@ -2200,17 +3387,24 @@ Ed.lpExt = function (v, G) {
       const sig = labels.join(",");
       if (g.lp._rvsig !== sig) { g.lp._rvs = labels; g.lp._rvsig = sig; }
     }
+    tcrRow = tcrNext;
     return Decoration.set(out, true);
   };
   const plugin = ViewPlugin.fromClass(class {
     constructor(view) { this.decorations = build(view); }
     update(u) {
-      if (u.docChanged || u.selectionSet || u.viewportChanged || u.transactions.some(t => t.reconfigured || t.effects.some(e => e.is(bust))))
+      if (u.docChanged || u.selectionSet || u.viewportChanged || u.transactions.some(t => t.reconfigured || t.effects.some(e => e.is(bust)))) {
+        const tt = Ed._tt ? performance.now() : 0;
         this.decorations = build(u.view);
+        if (tt) Ed.ttAdd("lp_ms", tt);                  // #128 sub-timing: the LP row decorations
+      }
     }
   }, { decorations: p => p.decorations });
   const clicks = EditorView.domEventHandlers({
     mousedown: (e) => {
+      // #37: only the PRIMARY button follows a link/tag. A right-click (button 2) used to navigate to
+      // [[Other]] and, on an unresolved link, CREATE the note; stock opens the context menu instead.
+      if (e.button !== 0) return false;
       const a = e.target && e.target.closest ? e.target.closest("a.tag, a.wl, a.lt, a.url, a.ext") : null;
       if (!a) return false;
       if (a.classList.contains("tag")) {
@@ -2222,7 +3416,60 @@ Ed.lpExt = function (v, G) {
       return e.defaultPrevented;
     },
   });
-  return [plugin, clicks, Ed.cbField(v, G, bust)];
+  // gh #46: Up/Down (native caret moves, read back as userEvent "select") onto ANOTHER line
+  // that lands inside a task marker ("- [ ] ", nested / quoted / [x] too) jumps to the task
+  // text behind it. Home, Left/Right, clicks and plain rows stay stock (docs/issue-46/STOCK.md).
+  const vkeys = EditorView.domEventHandlers({
+    // only an UNMODIFIED key is a vertical move: Cmd+Up/Down (macOS document start/end), Ctrl+Up/Down
+    // (WebKitGTK paragraph backward/forward), Alt+... and Shift (selection) keep their native target (PR #62)
+    keydown: (e) => { v._vmove = /^(ArrowUp|ArrowDown|PageUp|PageDown)$/.test(e.key) && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey ? Date.now() : 0; return false; },
+    // gh #75: a plain click in the empty space RIGHT of a task's checkbox. On a nested blank task
+    // ("\t- [ ] ") WebKit's caretRangeFromPoint skips the box + the zero-width anchor (no text) and
+    // lands in the last visible TEXT node, the indent: col 1, LEFT of the box, so typing puts the
+    // text before the marker. Remember the row here; pointerSnap below moves such a caret to the
+    // marker end. Clicks ON the box never get here (its own mousedown stops propagation).
+    mousedown: (e, view) => {
+      v._psnap = null;
+      if (e.button !== 0 || e.detail > 1 || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return false;
+      const p = view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
+      if (p == null) return false;
+      const ln = view.state.doc.lineAt(p), m = Ed.TASK_RE.exec(ln.text);
+      if (!m) return false;
+      const d = view.domAtPos(ln.from), el = d && d.node && (d.node.nodeType === 1 ? d.node : d.node.parentElement);
+      const row = el && el.closest ? el.closest(".cm-line") : null, box = row && row.querySelector("input.tbox");
+      const br = box ? box.getBoundingClientRect() : null;
+      if (br && br.width && e.clientX >= br.right) v._psnap = { l: ln.number, t: Date.now() };
+      return false;
+    },
+  });
+  const pointerSnap = CMs.EditorState.transactionFilter.of(tr => {
+    const ps = v._psnap;
+    if (!ps || Date.now() - ps.t > 500 || tr.docChanged || !tr.selection || !tr.isUserEvent("select.pointer")) return tr;
+    const s = tr.selection;
+    if (s.ranges.length !== 1 || !s.main.empty) return tr;
+    const ln = tr.newDoc.lineAt(s.main.head);
+    if (ln.number !== ps.l) return tr;
+    const m = Ed.TASK_RE.exec(ln.text);
+    if (!m || s.main.head - ln.from >= m[0].length) return tr;
+    return [tr, { selection: CMs.EditorSelection.cursor(ln.from + m[0].length), sequential: true }];
+  });
+  const taskSnap = CMs.EditorState.transactionFilter.of(tr => {
+    if (!v._vmove || Date.now() - v._vmove > 500 || tr.docChanged || !tr.selection || !tr.isUserEvent("select") || tr.isUserEvent("select.pointer")) return tr;
+    if (v.lp && v.lp.classList.contains("src")) return tr;
+    const s = tr.selection;
+    if (s.ranges.length !== 1 || !s.main.empty) return tr;
+    const doc = tr.newDoc, ln = doc.lineAt(s.main.head);
+    if (ln.number === tr.startState.doc.lineAt(tr.startState.selection.main.head).number) return tr;
+    const m = Ed.TASK_RE.exec(ln.text);
+    if (!m || s.main.head - ln.from >= m[0].length) return tr;
+    return [tr, { selection: CMs.EditorSelection.cursor(ln.from + m[0].length), sequential: true }];
+  });
+  // #319: the editor root is .cm-s-obsidian as in stock (an ancestor of every .cm-line), which theme line rules
+  // (Minimal .cm-s-obsidian .cm-line.HyperMD-header) require; our CSS keys on it only for stock's heading-line spacing (ui/style.css #319)
+  return [EditorView.editorAttributes.of({ class: Ed.EDITOR_ROOT }), plugin, clicks, vkeys, taskSnap, pointerSnap, Ed.cbField(v, G, bust), Ed.coField(v, G, bust), Ed.tblField(v, G, bust),
+          Ed.propsField ? Ed.propsField(v, G, bust) : [],   // #119: the Properties block (ui/props.js)
+          Ed.cbHl ? Ed.cbHl(v, G) : [],   // #186: fence bodies coloured by Prism (ui/codehl.js)
+          Ed.mathField ? Ed.mathField(v, G, bust) : []];   // #185: $..$ / $$..$$ typeset (ui/mathview.js)
 };
 /* ---------- plugin CODE BLOCKS in Live Preview (plug-top5) ----------
    A fenced block whose language a plugin registered a code-block processor for
@@ -2265,6 +3512,25 @@ Ed.cbFences = function (doc) {
   Ed._cbDoc = doc; Ed._cbOut = out;
   return out;
 };
+/* #331: the line numbers (1-based) of every row of every closed fence of doc, delimiters included
+   (with or without a language). Live preview gives those rows the line class HyperMD-codeblock, which
+   style.css paints with --code-background as stock does: Ed.block marks only the ``` delimiter rows
+   (span.fence), the body rows were plain .lprow on the page background. Cached on the doc. */
+Ed.lpFenceRows = function (doc) {
+  if (Ed._frDoc === doc) return Ed._frOut;
+  const out = new Set();
+  let open = null;
+  for (let i = 1; i <= doc.lines; i++) {
+    const m = Ed.CB_FENCE.exec(doc.line(i).text);
+    if (!open) { if (m && !(m[1][0] === "`" && m[3].includes("`"))) open = { ch: m[1][0], n: m[1].length, l0: i }; continue; }
+    if (m && m[1][0] === open.ch && m[1].length >= open.n && !m[2] && !m[3].trim()) {
+      for (let k = open.l0; k <= i; k++) out.add(k);
+      open = null;
+    }
+  }
+  Ed._frDoc = doc; Ed._frOut = out;
+  return out;
+};
 // a processor was (un)registered: every editor rebuilds its code-block widgets
 Ed.cbRefresh = function () {
   if (!Ed.cbFx || !CMv || !CMv.EditorView) return;
@@ -2280,6 +3546,17 @@ Ed.cbRebuild = function (v) {
   v._cbRb = (v._cbRb || 0) + 1;
   try { v.cm.dispatch({ effects: Ed.cbFx.of(null) }); } catch (e) { console.error(e); }
 };
+// a doc that can hold a mermaid fence (native substring search over the rope chunks; cached per doc)
+Ed.cbMm = doc => {
+  if (!window.Merm) return false;
+  if (Ed._cbMmDoc === doc) return Ed._cbMmOut;
+  let hit = false;
+  for (const it = doc.iter(); !it.next().done;) if (it.value.indexOf("mermaid") >= 0) { hit = true; break; }
+  Ed._cbMmDoc = doc; Ed._cbMmOut = hit;
+  return hit;
+};
+// #187: languages the app renders itself in Live Preview (a plugin processor for the same language wins)
+Ed.cbOwn = lang => lang === "mermaid" && !!window.Merm && !(Ed.cbHook && Ed.cbHook.has(lang));
 Ed.cbField = function (v, G, bust) {
   const { Decoration, WidgetType, EditorView } = CMv;
   if (!Ed.cbFx) Ed.cbFx = CMs.StateEffect.define();
@@ -2288,6 +3565,9 @@ Ed.cbField = function (v, G, bust) {
     eq(o) { return o.lang === this.lang && o.src === this.src && o.path === this.path && o.gen === this.gen; }
     toDOM() {
       const w = Ed.el("div", "cm-preview-code-block cm-embed-block markdown-rendered cm-lang-" + this.lang);
+      // #187: the app's own mermaid renderer (ui/mermaid.js) when no plugin processes the language:
+      // the stock shape is div.cm-preview-code-block > div.mermaid-wrapper (guard or diagram)
+      if (Ed.cbOwn(this.lang)) { try { w.appendChild(Merm.block(this.src)); } catch (e) { console.error("[mermaid]", e); } return w; }
       const el = Ed.el("div", "block-language-" + this.lang);
       w.appendChild(el);
       // the widget ignores editor events (ignoreEvent): its wiki links follow here (dataview file links)
@@ -2304,15 +3584,15 @@ Ed.cbField = function (v, G, bust) {
   }
   const build = st => {
     const h = Ed.cbHook;
-    if (!h || !h.any()) return Decoration.none;
+    if ((!h || !h.any()) && !Ed.cbMm(st.doc)) return Decoration.none;   // #187: no plugin processor: only a doc with a mermaid fence is scanned
     const g = G();
     const tb = g && g.view === v && g.active >= 0 ? g.tabs[g.active] : null;   // goal mt-fix: the lp a reading view keeps laid out renders none
     if (!g || (v.lp && v.lp.classList.contains("src")) || (tb && tb.mode === "reading")) return Decoration.none;
     const blocks = Ed.cbFences(st.doc);
     if (!blocks.length) return Decoration.none;
-    const n = typeof curOf === "function" && g.view === v ? curOf(g) : v.note, path = n ? n + ".md" : "", gen = h.gen() + "/" + (v._cbRb || 0), out = [];
+    const n = typeof curOf === "function" && g.view === v ? curOf(g) : v.note, path = n ? n + ".md" : "", gen = (h ? h.gen() : 0) + "/" + (v._cbRb || 0), out = [];
     for (const b of blocks) {
-      if (!h.has(b.lang)) continue;
+      if (!(h && h.has(b.lang)) && !Ed.cbOwn(b.lang)) continue;
       if (st.selection.ranges.some(r => r.from <= b.to && r.to >= b.from)) continue;   // caret in the fence: its source shows
       out.push(Decoration.replace({ widget: new CB(b.lang, b.src, path, gen), block: true }).range(b.from, b.to));
     }
@@ -2321,17 +3601,315 @@ Ed.cbField = function (v, G, bust) {
   const field = CMs.StateField.define({
     create: st => { try { return build(st); } catch (e) { console.error(e); return Decoration.none; } },
     update(d, tr) {
+      if (tr.docChanged && !tr.selection) { const k = Ed.flipKeep(d, tr); if (k) return k; }   // #128: a task flip outside every block
       if (tr.docChanged || tr.selection || tr.effects.some(e => e.is(bust) || e.is(Ed.cbFx)))
-        try { return build(tr.state); } catch (e) { console.error(e); return Decoration.none; }
+        { const tt = Ed._tt ? performance.now() : 0; try { return build(tr.state); } catch (e) { console.error(e); return Decoration.none; } finally { if (tt) Ed.ttAdd("cb_ms", tt); } }   // #128 sub-timing
       return d;
     },
     provide: f => EditorView.decorations.from(f),
   });
   return field;
 };
+/* ---------- CALLOUTS in Live Preview (#59 slice 1) ----------
+   A blockquote whose first line is "> [!type]" (fold "+"/"-", title optional) shows in
+   Live Preview as the reading view's callout: the whole quote (its first line .. the last
+   consecutive ">" line) is ONE block widget, div.cm-embed-block.cm-callout holding the
+   Rust renderer's html for that source (src-tauri/src/callout.rs: the same DOM, the same
+   escaping path as the reading view). A selection touching the block reveals its source,
+   source mode and the reading view's laid-out lp render none — the Ed.cbField pattern.
+   Ed.coScan is pure (lines in, [l0, l1] 0-based inclusive out) and unit-asserted in
+   Ed.selfTest: fenced code is skipped, a ">" line inside a fence is never a callout. */
+Ed.CO_HEAD = /^ {0,3}>[ \t]*\[![^\]\s]+\][+-]?(?:[ \t]|$)/;
+Ed.CO_QUOTE = /^ {0,3}>/;
+Ed.coScan = function (lines) {
+  const out = [];
+  let fence = null;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i], f = /^ {0,3}(`{3,}|~{3,})/.exec(t);
+    if (fence) { if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !t.slice(f[0].length).trim()) fence = null; continue; }
+    if (f) { fence = f[1]; continue; }
+    // a callout head is the FIRST line of a blockquote: "> plain\n> [!note] x" is one plain
+    // quote (Obsidian/the reading view render it so), never a callout from its 2nd line on.
+    if (i > 0 && Ed.CO_QUOTE.test(lines[i - 1])) continue;
+    if (!Ed.CO_HEAD.test(t)) continue;
+    let j = i;
+    while (j + 1 < lines.length && Ed.CO_QUOTE.test(lines[j + 1])) j++;
+    out.push([i, j]);
+    i = j;
+  }
+  return out;
+};
+// every callout block of doc -> [{from, to, src}] (cached on the doc: a caret move re-scans nothing)
+Ed.coBlocks = function (doc) {
+  if (Ed._coDoc === doc) return Ed._coOut;
+  const lines = [];
+  for (let i = 1; i <= doc.lines; i++) lines.push(doc.line(i).text);
+  const out = Ed.coScan(lines).map(([a, b]) => {
+    const la = doc.line(a + 1), lb = doc.line(b + 1);
+    return { from: la.from, to: lb.to, src: doc.sliceString(la.from, lb.to) };
+  });
+  Ed._coDoc = doc; Ed._coOut = out;
+  return out;
+};
+// fold: a click on the title of a foldable callout flips it (reading view, LP widget, embeds,
+// canvas cards, plugin renders: ONE delegated listener). Pure on the element, unit-asserted.
+Ed.coFold = function (co) {
+  if (!co || !co.classList || !co.classList.contains("is-collapsible")) return false;
+  const c = co.classList.toggle("is-collapsed");
+  const f = co.querySelector(":scope > .callout-title > .callout-fold");
+  if (f) f.classList.toggle("is-collapsed", c);
+  return true;
+};
+Ed.coClick = function (e) {
+  const t = e.target && e.target.closest && e.target.closest(".callout-title");
+  if (!t || (e.target.closest("a") && t.contains(e.target.closest("a")))) return;
+  const co = t.parentElement;
+  if (co && co.classList.contains("callout") && Ed.coFold(co)) { e.preventDefault(); e.stopPropagation(); }
+};
+if (typeof document !== "undefined") document.addEventListener("click", Ed.coClick);
+Ed.coField = function (v, G, bust) {
+  const { Decoration, WidgetType, EditorView } = CMv;
+  class CO extends WidgetType {
+    constructor(src, gen) { super(); this.src = src; this.gen = gen; }
+    eq(o) { return o.src === this.src && o.gen === this.gen; }
+    get estimatedHeight() { return 24 * Math.max(1, this.src.split("\n").length); }
+    toDOM(view) {
+      const w = Ed.el("div", "cm-embed-block markdown-rendered cm-callout");
+      const src = this.src;
+      // the widget ignores editor events: links follow here; a click outside the title and
+      // any link puts the caret on the block's first line (its source shows, as in stock)
+      w.addEventListener("click", e => {
+        const a = e.target && e.target.closest && e.target.closest("a.wiki, a.internal-link");
+        if (a && w.contains(a)) { if (typeof wikiClick === "function") wikiClick(e, a); return; }
+        if (e.defaultPrevented || (e.target.closest && (e.target.closest(".callout-title") || e.target.closest("a")))) return;
+        try { const p = view.posAtDOM(w, 0); view.dispatch({ selection: { anchor: p } }); view.focus(); } catch (_) {}
+      });
+      if (typeof inv === "function") inv("render", { content: src }).then(html => {
+        w.innerHTML = html;
+        view.requestMeasure();
+      }).catch(e => console.error("callout render:", e));
+      return w;
+    }
+    ignoreEvent() { return true; }
+  }
+  const build = st => {
+    const g = G();
+    const tb = g && g.view === v && g.active >= 0 ? g.tabs[g.active] : null;
+    if (!g || (v.lp && v.lp.classList.contains("src")) || (tb && tb.mode === "reading")) return Decoration.none;
+    const blocks = Ed.coBlocks(st.doc);
+    if (!blocks.length) return Decoration.none;
+    const gen = typeof notesCache !== "undefined" && notesCache ? notesCache.length : 0, out = [];
+    for (const b of blocks) {
+      if (st.selection.ranges.some(r => r.from <= b.to && r.to >= b.from)) continue;   // caret in the callout: its source shows
+      out.push(Decoration.replace({ widget: new CO(b.src, gen), block: true }).range(b.from, b.to));
+    }
+    return Decoration.set(out, true);
+  };
+  return CMs.StateField.define({
+    create: st => { try { return build(st); } catch (e) { console.error(e); return Decoration.none; } },
+    update(d, tr) {
+      if (tr.docChanged && !tr.selection) { const k = Ed.flipKeep(d, tr); if (k) return k; }   // #128: a task flip outside every block
+      if (tr.docChanged || tr.selection || tr.effects.some(e => e.is(bust)))
+        { const tt = Ed._tt ? performance.now() : 0; try { return build(tr.state); } catch (e) { console.error(e); return Decoration.none; } finally { if (tt) Ed.ttAdd("co_ms", tt); } }   // #128 sub-timing
+      return d;
+    },
+    provide: f => EditorView.decorations.from(f),
+  });
+};
+// census (#59, gate phase callouts): the focused pane's PAINTED callouts, off the live DOM, only while
+// one exists. [co:n|type/fold/state/icon/nest/title,...] state c=collapsed o=open, icon 1 = an svg in
+// .callout-icon, nest = callout ancestors; [coxss:n] elements under any callout carrying an on*
+// attribute, or an img/script/iframe the source did not ask for (the phase's fixture asks for none);
+// [cofold:type@rect] the first foldable callout's title (the phase clicks it);
+// [corc:] / [bqrc:] the first visible callout's and plain blockquote's client rect + computed
+// background composited to the first opaque ancestor (r.g.b) — the phase samples pixels inside them.
+Ed.coTok = function () {
+  const P = document.querySelector("#main .pane.focused") || document.querySelector("#main .pane");
+  if (!P) return "";
+  // a kept view (.vkeep, modeswitch opt6) stays laid out but is moved off the pane: not painted -> not counted
+  const vis = e => !!e && !e.closest(".vkeep") && e.getClientRects().length > 0 && e.getBoundingClientRect().height > 0;
+  const all = [...P.querySelectorAll(".callout")].filter(vis);
+  if (!all.length) return "";
+  const safe = s => String(s || "").replace(/[^\w -]/g, "_").replace(/\s+/g, " ").trim().slice(0, 24);
+  // composited background: every layer from the first opaque ancestor up, painted on a 1x1 canvas (any CSS
+  // colour syntax — color-mix() computes to oklch()/color() — and the element's own mix-blend-mode)
+  const bg = e => { if (window.opensidianCanvasOff) return "-"; const L = [];   /* #144 toggle 6 */ for (let x = e; x && x.nodeType === 1; x = x.parentElement) { const cs = getComputedStyle(x), b = cs.backgroundColor || ""; if (!b || b === "transparent" || /^rgba\([^)]*,\s*0\)$/.test(b)) continue; L.push([b, cs.mixBlendMode]); const k = document.createElement("canvas").getContext("2d"); k.fillStyle = "#000"; k.fillStyle = b; k.fillRect(0, 0, 1, 1); if (k.getImageData(0, 0, 1, 1).data[3] === 255) break; } if (!L.length) return "-"; const cv = document.createElement("canvas"); cv.width = cv.height = 1; const k = cv.getContext("2d"); for (let i = L.length - 1; i >= 0; i--) { k.globalCompositeOperation = L[i][1] && L[i][1] !== "normal" ? L[i][1] : "source-over"; k.fillStyle = L[i][0]; k.fillRect(0, 0, 1, 1); } const d = k.getImageData(0, 0, 1, 1).data; return d[0] + "." + d[1] + "." + d[2]; };
+  const rc = e => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].map(Math.round).join(","); };
+  const nest = e => { let n = 0; for (let x = e.parentElement; x && x !== P; x = x.parentElement) if (x.classList && x.classList.contains("callout")) n++; return n; };
+  const row = c => {
+    const ti = c.querySelector(":scope > .callout-title > .callout-title-inner");
+    return [safe(c.dataset.callout), c.dataset.calloutFold || "", c.classList.contains("is-collapsed") ? "c" : "o",
+            c.querySelector(":scope > .callout-title > .callout-icon svg") ? 1 : 0, nest(c), safe(ti && ti.textContent)].join("/");
+  };
+  let xss = 0;
+  for (const c of all) for (const e of c.querySelectorAll("*")) {
+    if (/^(img|script|iframe|object|embed)$/i.test(e.tagName)) { xss++; continue; }
+    for (const a of e.attributes) if (/^on/i.test(a.name)) { xss++; break; }
+  }
+  const bq = [...P.querySelectorAll("blockquote")].find(b => vis(b) && !b.closest(".callout"));
+  const fo = all.find(c => c.classList.contains("is-collapsible")), ft = fo && fo.querySelector(":scope > .callout-title");
+  return " [co:" + all.length + "|" + all.slice(0, 12).map(row).join(",") + "] [coxss:" + xss + "] [corc:" + rc(all[0]) + ":" + bg(all[0]) + "]" +
+         (bq ? " [bqrc:" + rc(bq) + ":" + bg(bq) + "]" : "") + (ft && vis(ft) ? " [cofold:" + safe(fo.dataset.callout) + "@" + rc(ft) + "]" : "");
+};
 Ed.cbCensus = function () {   // [lpcb:N] rendered plugin code blocks in live-preview editors (only once one exists)
   const n = document.querySelectorAll(".cm-editor .cm-preview-code-block").length;
   return n ? " [lpcb:" + n + "]" : "";
+};
+/* ---------- #37 (C3-6, T2): GFM TABLES in Live Preview ----------
+   A pipe table (header row, delimiter row, body rows) shows in Live Preview as
+   a rendered <table> — one block widget over its source lines, in stock's DOM:
+   div.cm-embed-block.cm-table-widget.markdown-rendered > div.table-wrapper >
+   table.table-editor, th/td carrying align= from the delimiter row, each cell a
+   div.table-cell-wrapper (ui/tables.css styles it like the reading view).
+   A selection touching the table reveals its pipe source (MVP "click -> raw
+   source"; stock's inline cell editor, T4, is deferred): a primary click on a
+   cell puts the caret at that cell's text. Source mode and the reading view
+   never render it. A StateField, like the code blocks (CM6 refuses block
+   decorations from a ViewPlugin). */
+Ed.TBL_DELIM = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/;
+// one table row -> [{s, e}] cell text spans (trimmed, offsets into t); "\|" stays inside a cell
+Ed.tblCells = function (t) {
+  const out = [];
+  let i = 0, n = t.length;
+  while (i < n && (t[i] === " " || t[i] === "\t")) i++;
+  if (t[i] === "|") i++;
+  let a = i, code = false;
+  const push = (s, e) => { while (s < e && /\s/.test(t[s])) s++; while (e > s && /\s/.test(t[e - 1])) e--; out.push({ s, e }); };
+  for (; i < n; i++) {
+    const c = t[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "`") code = !code;
+    else if (c === "|" && !code) { push(a, i); a = i + 1; }
+  }
+  if (t.slice(a).trim()) push(a, n);      // no closing pipe: the last cell runs to the line end
+  return out;
+};
+// every table of doc -> [{from, to, l0, rows: [[{s, e}...]...], al: [left|center|right|""], hdr}] (cached on the doc)
+Ed.tblBlocks = function (doc) {
+  if (Ed._tbDoc === doc) return Ed._tbOut;
+  const out = [];
+  let fence = null;
+  for (let i = 1; i <= doc.lines; i++) {
+    const t = doc.line(i).text, fm = /^ {0,3}(`{3,}|~{3,})/.exec(t);
+    if (fence) { if (fm && fm[1][0] === fence[0] && fm[1].length >= fence.length && !t.slice(fm[0].length).trim()) fence = null; continue; }
+    if (fm) { fence = fm[1]; continue; }
+    if (i >= doc.lines || !t.includes("|") || !/^ {0,3}\S/.test(t)) continue;
+    const d = doc.line(i + 1).text;
+    if (!d.includes("-") || !Ed.TBL_DELIM.test(d)) continue;
+    const hc = Ed.tblCells(t), dc = Ed.tblCells(d);
+    if (!hc.length || hc.length !== dc.length) continue;
+    const al = dc.map(c => { const x = d.slice(c.s, c.e), l = x[0] === ":", r = x[x.length - 1] === ":"; return l && r ? "center" : r ? "right" : l ? "left" : ""; });
+    const rows = [hc], lines = [i];
+    let j = i + 2;
+    for (; j <= doc.lines; j++) {
+      const b = doc.line(j).text;
+      if (!b.trim() || !b.includes("|") || /^ {0,3}(`{3,}|~{3,}|>|#)/.test(b)) break;
+      rows.push(Ed.tblCells(b)); lines.push(j);
+    }
+    out.push({ from: doc.line(i).from, to: doc.line(j - 1).to, l0: i, rows, lines, al, cols: hc.length });
+    i = j - 1;
+  }
+  Ed._tbDoc = doc; Ed._tbOut = out;
+  return out;
+};
+Ed.tblField = function (v, G, bust) {
+  const { Decoration, WidgetType, EditorView } = CMv;
+  class TB extends WidgetType {
+    constructor(src, tb) { super(); this.src = src; this.tb = tb; }
+    eq(o) { return o.src === this.src; }
+    toDOM(view) {
+      const g = G(), tb = this.tb, src = this.src, L = src.split("\n");
+      const w = Ed.el("div", "cm-embed-block cm-table-widget markdown-rendered");
+      const wr = Ed.el("div", "table-wrapper"), table = Ed.el("table", "table-editor");
+      w.appendChild(wr); wr.appendChild(table);
+      // line k of the table source (0 = header, 1 = delimiter, 2.. = body) -> its offset in src
+      const off = []; { let o = 0; for (const s of L) { off.push(o); o += s.length + 1; } }
+      const rowEl = (cells, li, tag) => {
+        const tr = Ed.el("tr");
+        for (let c = 0; c < tb.cols; c++) {
+          const x = cells[c], td = Ed.el(tag), cw = Ed.el("div", "table-cell-wrapper");
+          if (tb.al[c]) td.setAttribute("align", tb.al[c]);
+          td.dataset.at = String(off[li] + (x ? x.s : L[li].length));   // the cell's text, relative to the table's start
+          td.dataset.r = String(li ? li - 1 : 0); td.dataset.c = String(c);   // C3-7: the table menu acts on (row, col); row 0 = the header
+          if (x && x.e > x.s) Ed.inline(g, cw, L[li].slice(x.s, x.e).replace(/\\\|/g, "|"));
+          for (const m of cw.querySelectorAll(".mk")) m.remove();         // rendered: no markdown markers
+          td.appendChild(cw); tr.appendChild(td);
+        }
+        return tr;
+      };
+      const th = Ed.el("thead"), bd = Ed.el("tbody");
+      th.appendChild(rowEl(tb.rows[0], 0, "th"));
+      for (let r = 1; r < tb.rows.length; r++) bd.appendChild(rowEl(tb.rows[r], r + 1, "td"));
+      table.appendChild(th); if (tb.rows.length > 1) table.appendChild(bd);
+      w.addEventListener("mousedown", e => {
+        if (e.button !== 0) return;                       // #37: a right-click opens the table menu, it never edits
+        const a = e.target && e.target.closest ? e.target.closest("a.wl, a.url, a.ext, a.tag") : null;
+        if (a && w.contains(a)) {
+          if (a.classList.contains("wl")) Ed.linkClick(e, a);
+          else if (a.classList.contains("tag")) { e.preventDefault(); if (typeof tagSearch === "function") tagSearch(a.dataset.tag); }
+          else Ed.extClick(e, a);
+          if (e.defaultPrevented) return;
+        }
+        e.preventDefault();
+        let p0;
+        try { p0 = view.posAtDOM(w, 0); } catch (_) { return; }
+        const cell = e.target && e.target.closest ? e.target.closest("th, td") : null;
+        const at = cell && w.contains(cell) ? +cell.dataset.at || 0 : 0;
+        view.dispatch({ selection: { anchor: Math.min(view.state.doc.length, p0 + at) }, scrollIntoView: false, userEvent: "select.pointer" });
+        view.focus();
+      });
+      return w;
+    }
+    ignoreEvent() { return true; }
+  }
+  const build = st => {
+    const g = G();
+    const tb = g && g.view === v && g.active >= 0 ? g.tabs[g.active] : null;
+    if (!g || (v.lp && v.lp.classList.contains("src")) || (tb && tb.mode === "reading")) return Decoration.none;
+    const out = [];
+    for (const b of Ed.tblBlocks(st.doc)) {
+      if (st.selection.ranges.some(r => r.from <= b.to && r.to >= b.from)) continue;   // caret in the table: its source shows
+      out.push(Decoration.replace({ widget: new TB(st.doc.sliceString(b.from, b.to), b), block: true }).range(b.from, b.to));
+    }
+    return Decoration.set(out, true);
+  };
+  return CMs.StateField.define({
+    create: st => { try { return build(st); } catch (e) { console.error(e); return Decoration.none; } },
+    update(d, tr) {
+      if (tr.docChanged && !tr.selection) { const k = Ed.flipKeep(d, tr); if (k) return k; }   // #128: a task flip outside every block
+      if (tr.docChanged || tr.selection || tr.effects.some(e => e.is(bust)))
+        { const tt = Ed._tt ? performance.now() : 0; try { return build(tr.state); } catch (e) { console.error(e); return Decoration.none; } finally { if (tt) Ed.ttAdd("tbl_ms", tt); } }   // #128 sub-timing
+      return d;
+    },
+    provide: f => EditorView.decorations.from(f),
+  });
+};
+// [tbl:RxC|RxC...] the rendered Live Preview tables of the FOCUSED editor (rows incl. the header row x columns),
+// each with its alignment string (l c r -), the header's first cell text and @x,y = the first body cell's
+// centre; absent when none is rendered
+Ed.tblCensus = function () {
+  const g = typeof fg === "function" ? fg() : null, root = g && g.pane ? g.pane : document;
+  // only LAID-OUT tables: a background tab in the same pane keeps its widget in the DOM at 0x0 (@0,0)
+  const ws = [...root.querySelectorAll(".cm-editor .cm-table-widget table")].filter(t => t.getClientRects().length);
+  if (!ws.length) return "";
+  return " [tbl:" + [...ws].map(t => {
+    const rs = t.querySelectorAll("tr"), h = rs[0] ? [...rs[0].children] : [];
+    const c1 = t.querySelector("td") || t.querySelector("th"), r = c1 ? c1.getBoundingClientRect() : null;   // a driver clicks what it measured
+    return rs.length + "x" + h.length + ":" + h.map(c => ({ left: "l", center: "c", right: "r" })[c.getAttribute("align")] || "-").join("") +
+      ":" + (h[0] ? h[0].textContent.trim().replace(/[\]|\s]+/g, "_").slice(0, 20) : "") +
+      (r ? "@" + Math.round(r.left + r.width / 2) + "," + Math.round(r.top + r.height / 2) : "");
+  }).join("|") + "]";
+};
+/* #37 [rvth:<border px>,<padding-left px>@<x>,<y>] — the FIRST reading-view th of the focused
+   pane: its COMPUTED top border width and left padding (ui/tables.css) and its centre. Stock
+   themes border their tables; 0 here is the unstyled browser table (origin/develop). */
+Ed.rvthCensus = function () {
+  const g = typeof fg === "function" ? fg() : null;
+  const th = g && g.preview ? g.preview.querySelector("table th") : null;
+  if (!th || !th.getClientRects().length) return "";
+  const s = getComputedStyle(th), r = th.getBoundingClientRect();
+  return " [rvth:" + Math.round(parseFloat(s.borderTopWidth) || 0) + "," + Math.round(parseFloat(s.paddingLeft) || 0) +
+    "@" + Math.round(r.left + r.width / 2) + "," + Math.round(r.top + r.height / 2) + "]";
 };
 /* ---------- MARKS painted by main.js (find bar "fd", search jump "sc") ----------
    A named DecorationSet per view, replaced whole by Ed.hl and mapped through
@@ -2384,18 +3962,77 @@ Ed.hl = function (g, k, ranges) {
 // reveal under the pointer); the toggle runs on click, once the event has bubbled through the
 // editor, so a plugin editor extension's own click handler (Obsidian Tasks: done date, recurrence)
 // takes it with preventDefault as in stock; untaken, Ed.toggleTask flips the line itself
+// #128: interaction span task_toggle = the click event -> the toggled doc's frame committed (otel.paint),
+// with the click's sub-timings as attributes (Ed._tt is the open attribute bag while the toggle runs;
+// the sites that cost per change add their own *_ms to it). A plugin that takes the click: no span.
+Ed.ttMs = (t0) => Math.round((performance.now() - t0) * 100) / 100;
+Ed.ttAdd = (k, t0) => { const T = Ed._tt; if (T) T[k] = Math.round(((T[k] || 0) + performance.now() - t0) * 100) / 100; };
 Ed.taskBox = function (cb) {
   cb.addEventListener("mousedown", e => { e.preventDefault(); e.stopPropagation(); });
-  cb.addEventListener("click", e => setTimeout(() => { if (!e.defaultPrevented) Ed.toggleTask(e); }, 0));
+  cb.addEventListener("click", e => {
+    const sp = typeof otel !== "undefined" && otel.begin ? otel.begin("task_toggle", {}) : null, tq = performance.now();
+    // start at the input event itself (its queueing before this handler is part of what is felt)
+    if (sp && e.timeStamp > 0 && e.timeStamp <= sp.t0 && sp.t0 - e.timeStamp < 1000) sp.t0 = e.timeStamp;
+    if (sp) sp.attrs.queue_ms = Math.round((tq - sp.t0) * 100) / 100;
+    setTimeout(() => {
+      if (e.defaultPrevented) { if (sp) otel.cancel(sp); return; }
+      if (sp) sp.attrs.defer_ms = Ed.ttMs(tq);
+      Ed.toggleTask(e, sp);
+    }, 0);
+  });
 };
-// toggle "[ ]" <-> "[x]" on the checkbox's line, one undo step
-Ed.toggleTask = function (e) {
+/* toggle "[ ]" <-> "[x]" on the checkbox's line, one undo step.
+   #128: O(1) in the note size. It used to go through the model mirror (Ed.lines:
+   doc.toJSON of the whole note when stale) and Ed.commit (doc.toString + join +
+   a prefix/suffix scan) to find a 1-char change it already knows. Now it reads
+   ONE line, dispatches that char with the same annotations Ed.commit used (its
+   own undo step, userEvent os.task; the selection maps exactly as before: same
+   from/to/insert) and patches the mirror's one row when it was current. The
+   change carries Ed.TT_FLIP so the block fields (callouts, tables, code fences)
+   can map instead of rescanning the whole doc — see Ed.flipKeep. */
+Ed.TT_FLIP = CMs && CMs.Annotation.define();
+Ed.TT_RE = /^(\s*(?:[-*+]|\d+\.) )\[([^\]\n])\]/;
+Ed.toggleTask = function (e, sp) {
   const box = e.target, pane = box && box.closest ? box.closest(".pane") : null, g = pane ? pane._g : null, cm = Ed.cm(g);
-  if (!cm) return;
-  let l;
-  try { l = cm.state.doc.lineAt(cm.posAtDOM(box, 0)).number - 1; } catch (_) { return; }
-  const L = Ed.lines(g);
-  Ed.snap(g, "task");
-  L[l] = L[l].replace(/^(\s*(?:[-*+]|\d+\.) )\[([^\]\n])\]/, (_, p, ch) => p + (ch === " " ? "[x]" : "[ ]"));
-  Ed.commit(g);
+  const T = sp ? sp.attrs : null, drop = () => { if (sp) otel.cancel(sp); };
+  if (!cm) return drop();
+  let ln, t = performance.now();
+  try { ln = cm.state.doc.lineAt(cm.posAtDOM(box, 0)); } catch (_) { return drop(); }
+  if (T) { T.pos_ms = Ed.ttMs(t); t = performance.now(); T.stale = g.view._Ld !== cm.state.doc ? 1 : 0; }
+  const d0 = cm.state.doc, v = g.view, m = Ed.TT_RE.exec(ln.text);
+  if (T) { T.lines_ms = Ed.ttMs(t); t = performance.now(); }
+  if (!m) return drop();
+  const at = ln.from + m[1].length + 1, ch = m[2] === " " ? "x" : " ";
+  // a box char that could be block syntax (table pipe, quote, fence) takes no shortcut in the fields
+  const safe = !/[|>`~]/.test(m[2]);
+  v._snap = null;
+  if (T) { T.diff_ms = Ed.ttMs(t); t = performance.now(); }
+  Ed._tt = T;
+  try {
+    const tr = cm.state.update({ changes: { from: at, to: at + 1, insert: ch },
+      annotations: [CMc.isolateHistory.of("full"), CMs.Transaction.userEvent.of("os.task")]
+        .concat(safe ? [Ed.TT_FLIP.of({ from: ln.from, to: ln.to })] : []) });
+    if (T) { void tr.state; Ed.ttAdd("fields_ms", t); t = performance.now(); }   // every StateField's update
+    const L = v._Ld === d0 ? v.lines : null;
+    cm.dispatch(tr);
+    if (T) Ed.ttAdd("view_ms", t);
+    // the mirror was OF d0: its one changed row makes it OF the new doc (no toJSON on the next model call)
+    if (L && v._Ld === d0) { L[ln.number - 1] = cm.state.doc.line(ln.number).text; v._Ld = cm.state.doc; }
+  } finally { Ed._tt = null; }
+  if (!sp) return;
+  T.commit_ms = Ed.ttMs(t); T.note_lines = cm.state.doc.lines; T.changed = cm.state.doc !== d0 ? 1 : 0;
+  if (!T.changed) return drop();
+  otel.paint(sp);
+};
+/* #128: a block StateField's update for an Ed.TT_FLIP change. The flip replaces one
+   box char of a list-task line with " "/"x": it cannot start, end or join a callout
+   (">" lines), a table (pipe rows) or a fence, so the blocks are where they were —
+   unless the line sits INSIDE a rendered block, whose widget shows the old text: then
+   null (rebuild). Not a flip, or a selection/effect riding along: null as well. */
+Ed.flipKeep = function (d, tr) {
+  const f = tr.annotation(Ed.TT_FLIP);
+  if (!f || tr.selection || tr.effects.length) return null;
+  let hit = false;
+  d.between(f.from, f.to, () => { hit = true; return false; });
+  return hit ? null : d.map(tr.changes);
 };

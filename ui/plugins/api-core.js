@@ -288,13 +288,15 @@
     const { host, be } = K;
     const { registry } = K;
     const cmdObj = c => c.obs || { id: c.id, name: c.name, callback: c.run };
+    // issue #115: a command of a core plugin that is off (c.coreOff, main.js) is not registered, as in stock
+    const live = () => (typeof CMDS === "undefined" ? [] : CMDS.filter(c => !(c.coreOff && c.coreOff())));
     const commands = {
-      get commands() { const o = {}; if (typeof CMDS !== "undefined") for (const c of CMDS) o[c.id] = cmdObj(c); return o; },
+      get commands() { const o = {}; for (const c of live()) o[c.id] = cmdObj(c); return o; },
       get editorCommands() { return {}; },
-      listCommands() { return typeof CMDS === "undefined" ? [] : CMDS.map(cmdObj); },
-      findCommand(id) { const c = typeof CMDS !== "undefined" && CMDS.find(x => x.id === id); return c ? cmdObj(c) : undefined; },
+      listCommands() { return live().map(cmdObj); },
+      findCommand(id) { const c = live().find(x => x.id === id); return c ? cmdObj(c) : undefined; },
       executeCommandById(id) {
-        const c = typeof CMDS !== "undefined" && CMDS.find(x => x.id === id);
+        const c = live().find(x => x.id === id);
         if (!c) return false;
         try { if (c.when && !c.when()) return false; c.run(); return true; } catch (e) { console.error("[plugin] command " + id + ":", e); return false; }
       },
@@ -505,6 +507,42 @@
     if (K.workspace && !K.workspace.protocolHandler)
       Object.defineProperty(K.workspace, "protocolHandler", { value: { handlers: PROTO }, configurable: true, enumerable: false, writable: false });
 
+    /* Per-plugin settings the host seeds into Plugin.loadData() (the one place plugin-specific defaults live).
+       keys: merged into a plain-object data.json, keys the user saved win.
+       fresh(plugin): when data.json gave null — true ONLY for a pure first install, else null is passed through. */
+    const PLUGIN_SEED = Object.freeze({
+      /* #50: Excalidraw follows opensidian's dark/light mode (its stock defaults leave these off).
+         Its settings manager (2.27+) classifies loadData(): an object = "valid" and skips recovery, so null must
+         reach it whenever data.json exists but is empty/corrupt, or a recovery copy exists (PR #64 review). */
+      "obsidian-excalidraw-plugin": {
+        keys: { matchTheme: true, matchThemeAlways: true, matchThemeTrigger: true },
+        async fresh(p) {
+          const dir = p.manifest && p.manifest.dir, ad = p.app && p.app.vault && p.app.vault.adapter;
+          if (!dir || !ad || typeof ad.stat !== "function") return false;
+          if ((await ad.stat(dir + "/data.json")) !== null) return false;        // present (empty/corrupt): its recovery decides
+          /* its recovery copy: IndexedDB "Excalidraw Settings Recovery <appId>", store settingsRecovery, key lastKnownGood.
+             Only a name databases() lists is opened: open() of a missing name would CREATE an empty db and break its own. */
+          if (typeof indexedDB === "undefined" || typeof indexedDB.databases !== "function") return false;
+          const name = "Excalidraw Settings Recovery " + p.app.appId;
+          if (!(await indexedDB.databases()).some(x => x && x.name === name)) return true;
+          return await new Promise(res => {
+            const rq = indexedDB.open(name);
+            rq.onerror = () => res(false);
+            rq.onblocked = () => res(false);
+            rq.onsuccess = () => {
+              const db = rq.result;
+              try {
+                if (!db.objectStoreNames.contains("settingsRecovery")) { db.close(); return res(true); }
+                const g = db.transaction("settingsRecovery", "readonly").objectStore("settingsRecovery").get("lastKnownGood");
+                g.onsuccess = () => { db.close(); res(g.result == null); };
+                g.onerror = () => { db.close(); res(false); };
+              } catch (_) { db.close(); res(false); }
+            };
+          });
+        },
+      },
+    });
+
     /* ------------------------------------------------------------ Plugin */
     class Plugin extends Component {
       constructor(app_, manifest) { super(); this.app = app_; this.manifest = manifest; }
@@ -543,7 +581,19 @@
         this.register(() => { if (setting.activeTab === tab) setting.closeActiveTab(); setting.removeSettingTab(tab); const r2 = this._rec(); if (r2) r2.tabs.delete(tab); touch(); });
         touch();
       }
-      async loadData() { return be ? be.io(this.manifest.id, "load") : null; }
+      async loadData() {
+        const d = be ? await be.io(this.manifest.id, "load") : null;
+        const seed = PLUGIN_SEED[this.manifest.id];
+        if (!seed) return d;
+        const rec = v => typeof v === "object" && v !== null && !Array.isArray(v);
+        /* null = data.json missing OR unreadable. It stays null (the plugin classifies it and may restore its own
+           recovery copy) unless seed.fresh() proves a pure first install; any doubt -> null (fail closed). */
+        if (d == null) { let f = false; try { f = await seed.fresh(this); } catch (_) {} if (!f) return d; }
+        else if (!rec(d)) return d;
+        const o = d || {};
+        for (const k in seed.keys) if (!(k in o)) o[k] = seed.keys[k];   // keys the user saved win
+        return o;
+      }
       async saveData(data) { if (!be) throw new Error("plugin backend unavailable"); await be.io(this.manifest.id, "save", data === undefined ? null : JSON.parse(JSON.stringify(data))); }
       onExternalSettingsChange() {}
       registerView(type, factory) {   // plugin-views: hosted in the app's tabs / right sidebar (ui/plugins/views.js); unload detaches them
@@ -623,6 +673,8 @@
     async function enable(id) {
       if (registry.has(id)) return { ok: true, id };
       if (!K.st.trusted) return host.fail(id, new Error("restricted mode is on"));
+      // #251: code that is new on disk or changed since the user allowed it is not even requested (Rust refuses it too)
+      if (K.st.pins[id] !== "ok") return host.fail(id, new Error(pinWhy(id)));
       const manifest = K.st.manifests[id];
       if (!manifest) return host.fail(id, new Error("not installed (no manifest.json)"));
       installDom();
@@ -636,7 +688,9 @@
       try {
         const m = Object.assign({ dir: ".obsidian/plugins/" + id }, manifest);
         rec.plugin = new Cls(app, m);
-        const css = await be.io(id, "styles").catch(() => null);
+        // #288 review: a styles.css refused by its pin (or unreadable) stops the load, fail closed;
+        // null = the plugin has no styles.css
+        const css = await be.io(id, "styles");
         if (typeof css === "string" && css) { rec.styleEl = document.createElement("style"); rec.styleEl.dataset.plugin = id; rec.styleEl.textContent = css; document.head.appendChild(rec.styleEl); }
         await rec.plugin.load();
       } catch (e) {
@@ -669,12 +723,43 @@
       touch();
       return { ok: true, id };
     }
-    async function refresh() {
-      const s = await be.state();
+    function takeState(s) {
       K.st.trusted = !!s.trusted;
       K.st.enabledIds = (s.enabled || []).slice();
       K.st.manifests = {};
       for (const p of s.installed || []) if (p && p.id && p.manifest) K.st.manifests[p.id] = p.manifest;
+      const pn = s.pins || {};
+      K.st.pins = Object.assign({}, pn.status || {});
+      K.st.pinChanged = Object.assign({}, pn.changed || {});
+      K.st.pinError = pn.error || null;
+      return s;
+    }
+    /* #251: the plugins that would run but are not allowed as they are on disk (new in the vault, or
+       changed since the user allowed them, or the pin store is damaged) */
+    const unpinned = ids => ids.filter(id => K.st.manifests[id] && K.st.pins[id] !== "ok" && K.st.pins[id] !== "unreadable");
+    function pinWhy(id) {
+      const p = K.st.pins[id];
+      if (p === "changed") return "changed on disk since you allowed it (" + (K.st.pinChanged[id] || []).join(", ") + "): review and allow it in Settings > Community plugins";
+      if (p === "damaged") return "not allowed: " + (K.st.pinError || "the record of allowed plugins is damaged");
+      if (p === "unreadable") return "plugin files unreadable";
+      return "new in this vault, not allowed yet: review and allow it in Settings > Community plugins";
+    }
+    /* #251: ask Rust's native dialog for these ids (one dialog for all of them); the answer is the new state */
+    async function allow(ids) {
+      const want = unpinned(ids);
+      if (!want.length || !K.st.trusted) return null;
+      try { return takeState(await be.ack(want)); } catch (e) { console.error("[plugin] allow:", e); return null; }
+    }
+    /* #251: once per page, the first time the vault reads trusted with enabled plugins that are not
+       allowed as they are on disk (the first start after the upgrade, or code that arrived by sync / git /
+       another program): ONE native question listing all of them. Cancel = they stay off this session. */
+    let askedOnce = false;
+    async function refresh() {
+      let s = takeState(await be.state());
+      if (K.st.trusted && !askedOnce && unpinned(K.st.enabledIds).length) {
+        askedOnce = true;
+        s = (await allow(K.st.enabledIds)) || s;
+      }
       return s;
     }
     /* the user's toggle (settings -> host.setEnabled): a plugin switched on here
@@ -682,8 +767,12 @@
        app.plugins.enablePluginAndSave goes through saveEnabled (no onUserEnable). */
     async function saveEnabled(id, on) {
       await be.set({ id, on: !!on });
+      const asked = askedOnce;
       await refresh();
       if (!K.st.trusted) { touch(); return { ok: true, id }; }   // restricted: the choice is saved, nothing runs
+      // #251: switched on while new / changed on disk: the native question first; #288 review: not a
+      // second time when refresh() just asked (its one question listed every enabled id, this one too)
+      if (on && !registry.has(id) && !(askedOnce && !asked)) await allow([id]);
       return on ? enable(id) : disable(id);
     }
     async function setEnabled(id, on) {
@@ -710,8 +799,18 @@
         K.st.vaultName = String(vaultPathArg || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
         app.appId = String(vaultPathArg || "").split("").reduce((h, c) => (Math.imul(h, 31) + c.charCodeAt(0)) | 0, 7).toString(16);
         await refresh();
-        K.st.layoutReady = true; workspace.layoutReady = true;
-        if (K.st.trusted) for (const id of K.st.enabledIds) await enable(id);
+        /* #277: stock's startup order — every enabled plugin's onload runs with layoutReady false
+           (onLayoutReady callbacks queue); then the restored layout's showing views are built
+           (views.mountHeld: factory, onOpen, setState — never inside a plugin's own onload); then
+           layoutReady and layout-ready. A failing plugin or remount never keeps the layout from
+           going ready (finally). */
+        views.holdRestore();
+        try {
+          if (K.st.trusted) for (const id of K.st.enabledIds) await enable(id);
+        } finally {
+          try { await views.mountHeld(); } catch (e) { console.error("[plugin] restore views:", e); }
+          K.st.layoutReady = true; workspace.layoutReady = true;
+        }
         workspace.trigger("layout-ready");
       } catch (e) { console.error("[plugin] boot:", e); }
       touch();
@@ -882,6 +981,6 @@
     Object.defineProperty(app, "customCss", { value: new CustomCss(), enumerable: true, configurable: true, writable: true });
     Object.defineProperty(app, "hotkeyManager", { value: K.hotkeyManager, enumerable: true, configurable: true, writable: true });
 
-    Object.assign(K, { boot, censusTick, censusTok, disable, enable, refresh, saveEnabled, setEnabled, setRestricted });
+    Object.assign(K, { allow, boot, censusTick, censusTok, disable, enable, refresh, saveEnabled, setEnabled, setRestricted });
   });
 })();

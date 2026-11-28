@@ -61,12 +61,8 @@ pub fn parse_path(path: &str) -> Option<&str> {
 /// the vault's enabled list: .obsidian/community-plugins.json, a JSON array of ids
 /// (Obsidian's format). Unreadable / malformed = nothing enabled.
 pub fn enabled_ids(root: &Path) -> Vec<String> {
-    let p = root.join(".obsidian").join("community-plugins.json");
-    let Ok(m) = fs::symlink_metadata(&p) else { return Vec::new() };
-    if !m.is_file() || m.len() > 1024 * 1024 {
-        return Vec::new();
-    }
-    fs::read_to_string(&p)
+    // #250: the vaultfs fd read (no symlink at any component, regular file by fstat, 1 MiB on the fd)
+    crate::vaultfs::read_string(root, Path::new(ENABLED_FILE), 1024 * 1024)
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
         .map(|v| v.iter().filter_map(|x| x.as_str()).filter(|s| valid_id(s)).map(str::to_string).collect())
@@ -84,6 +80,32 @@ pub fn plugin_dir_in(root: &Path, id: &str) -> Option<PathBuf> {
     (got == want && got.starts_with(&croot) && got.is_dir()).then_some(got)
 }
 
+/// #288 review: read a file plugin_file_in accepted, checking the OPEN file again:
+/// O_NOFOLLOW (a symlink swapped in after the check is refused), fstat on the fd
+/// (regular file, <= cap) and a read bounded by cap. A file replaced or grown
+/// between plugin_file_in's stat and this read can never make it allocate more
+/// than cap + 1 bytes, nor block on a FIFO / device.
+/// #250 (merged with #251): the open and the read go through the vaultfs fd walk from the vault
+/// root (O_NOFOLLOW on every component, not just the leaf; regular file by fstat; cap on the fd),
+/// so a plugin folder swapped for a symlink after the check is refused as well.
+pub fn read_checked(root: &Path, p: &Path, cap: u64) -> Result<Vec<u8>, &'static str> {
+    let rel = crate::vaultfs::rel_of(root, p).map_err(|_| "unreadable")?;
+    crate::vaultfs::read(root, &rel, cap).map_err(|e| {
+        // the walk refuses a symlinked component itself (PermissionDenied "refused: symlink in vault path") or the kernel does (ELOOP)
+        #[cfg(unix)]
+        let eloop = e.raw_os_error() == Some(libc::ELOOP);
+        #[cfg(not(unix))]
+        let eloop = false; // Windows: a reparse point is refused by vaultfs with "symlink" in the message
+        if eloop || e.to_string().contains("symlink") {
+            "symlinked file"
+        } else if e.kind() == std::io::ErrorKind::FileTooLarge {
+            "too big"
+        } else {
+            "unreadable"
+        }
+    })
+}
+
 /// rule 5: a file inside a confined plugin dir. Ok(None) = absent, Err = refuse
 pub fn plugin_file_in(root: &Path, id: &str, file: &str, cap: u64) -> Result<Option<PathBuf>, &'static str> {
     let dir = plugin_dir_in(root, id).ok_or("plugin dir not confined")?;
@@ -97,6 +119,25 @@ pub fn plugin_file_in(root: &Path, id: &str, file: &str, cap: u64) -> Result<Opt
         Ok(m) if !m.is_file() => Err("not a file"),
         Ok(m) if m.len() > cap => Err("too big"),
         Ok(_) => Ok(Some(p)),
+    }
+}
+
+/// #250 (audit F-47): rule 5 AND the read. `plugin_file_in` decides (same
+/// refusals as ever), then the bytes come from `vaultfs::read`: the openat
+/// walk from the vault fd (O_NOFOLLOW per component and on the leaf,
+/// O_NONBLOCK, regular file by fstat, `cap` on the fd). A file or folder
+/// swapped for a symlink after the check is refused, never followed.
+/// Ok(None) = absent.
+pub fn plugin_read_in(root: &Path, id: &str, file: &str, cap: u64) -> Result<Option<Vec<u8>>, &'static str> {
+    if plugin_file_in(root, id, file, cap)?.is_none() {
+        return Ok(None);
+    }
+    let rel = Path::new(".obsidian").join("plugins").join(id).join(file);
+    match crate::vaultfs::read(root, &rel, cap) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => Err("too big"),
+        Err(_) => Err("not a regular file in the vault"),
     }
 }
 
@@ -116,34 +157,226 @@ pub fn wrap_cjs(id: &str, src: &str) -> String {
     )
 }
 
+/// #251: what the scheme handler serves — rules 1-5 (serve), THEN rule 6: the plugin's main.js,
+/// manifest.json and styles.css match the pin the user created for this vault folder
+/// (plugin_pins.rs, outside the vault). The bytes sent are the bytes that were hashed (read once).
+/// `vault` = the vault folder identity (plugins::TrustKey.id); `cfg` = ~/.opensidian.json.
+pub fn serve_pinned(root: Option<&Path>, path: &str, trusted: bool, cfg: &serde_json::Value, vault: Option<&str>) -> Served {
+    // rules 1-5 first; main.js is then read ONCE, by verify, and the bytes it hashed are served
+    let (root, id) = match gate(root, path, trusted) {
+        Err(s) => return s,
+        Ok((r, i, _)) => (r, i),
+    };
+    match crate::plugin_pins::verify(cfg, vault, root, id) {
+        Ok(f) => Served::Js(wrap_cjs(id, &String::from_utf8_lossy(&f.main)).into_bytes()),
+        Err(why) => Served::Refused(why),
+    }
+}
+
+/// #251: a plugin's styles.css through the snippet sanitizer, only while the plugin matches its pin
+/// (the css applied is the css that was hashed). None = no styles.css, or css the sanitizer refuses;
+/// Err = the pin refuses the plugin (the load stops, api-core.js enable).
+pub fn read_styles_pinned(root: &Path, id: &str, cfg: &serde_json::Value, vault: Option<&str>) -> Result<Option<String>, String> {
+    if !valid_id(id) {
+        return Err("bad plugin id".into());
+    }
+    let f = crate::plugin_pins::verify(cfg, vault, root, id).map_err(|e| format!("{id}/styles.css: {e}"))?;
+    match f.styles {
+        None => Ok(None),
+        Some(b) => {
+            // #288 review: an error here is the PIN's (it stops the load in api-core.js, fail
+            // closed); css the sanitizer refuses is not applied and the plugin still runs, as before
+            let css = String::from_utf8(b).map_err(|e| e.to_string()).and_then(|src| crate::themefs::sanitize_css(&src).map(|s| s.css));
+            match css {
+                Ok(c) => Ok(Some(c)),
+                Err(e) => {
+                    eprintln!("[plugin] {id}/styles.css not applied: {e}");
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
 /// the whole decision for one request (rules 1-5), unit-testable without tauri
 pub fn serve(root: Option<&Path>, path: &str, trusted: bool) -> Served {
-    let Some(id) = parse_path(path) else { return Served::Refused("bad path") };
-    let Some(root) = root else { return Served::Refused("no vault") };
+    match gate(root, path, trusted) {
+        Err(s) => s,
+        Ok((root, id, p)) => match read_checked(root, &p, MAX_MAIN_JS) {
+            Ok(b) => Served::Js(wrap_cjs(id, &String::from_utf8_lossy(&b)).into_bytes()),
+            Err("unreadable") => Served::Missing,
+            Err(why) => Served::Refused(why),
+        },
+    }
+}
+
+/// rules 1-5 without reading main.js: Ok = (vault root, plugin id, main.js path)
+fn gate<'a>(root: Option<&'a Path>, path: &'a str, trusted: bool) -> Result<(&'a Path, &'a str, PathBuf), Served> {
+    let Some(id) = parse_path(path) else { return Err(Served::Refused("bad path")) };
+    let Some(root) = root else { return Err(Served::Refused("no vault")) };
     if !trusted {
-        return Served::Refused("restricted mode");
+        return Err(Served::Refused("restricted mode"));
     }
     if !enabled_ids(root).iter().any(|e| e == id) {
-        return Served::Refused("not enabled");
+        return Err(Served::Refused("not enabled"));
     }
     match plugin_file_in(root, id, "main.js", MAX_MAIN_JS) {
-        Err(why) => Served::Refused(why),
-        Ok(None) => Served::Missing,
-        Ok(Some(p)) => match fs::read(&p) {
-            Ok(b) => Served::Js(wrap_cjs(id, &String::from_utf8_lossy(&b)).into_bytes()),
-            Err(_) => Served::Missing,
-        },
+        Err(why) => Err(Served::Refused(why)),
+        Ok(None) => Err(Served::Missing),
+        Ok(Some(p)) => Ok((root, id, p)),
     }
 }
 
 /// trust is keyed by the CANONICAL vault path in ~/.opensidian.json
 /// ("plugins_trusted": { "<canon path>": true }); absent = restricted.
-pub fn trust_key(root: &Path) -> String {
-    fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()).display().to_string()
+/// #127: the entry is BOUND to the directory it was given for — "plugins_trust_id":
+/// { "<canon path>": "<inode>:<birth time ns>" } of the canonical root, recorded with the flag (plugins_set)
+/// or, for an entry from before the binding, on the first boot that finds it (plugins_state, bind_legacy).
+/// A directory removed and replaced at a trusted path (another vault cloned / unpacked / moved there) has
+/// another inode and another birth time: the entry does not apply, the vault opens restricted and turning
+/// trust on asks again. Never read from the vault (a vault file cannot forge its own inode or birth time).
+/// `id` is None when the root cannot be stat'ed or its filesystem keeps no birth time: such a root is
+/// never trusted (a recorded id never matches, a legacy entry is not honoured, ON is refused).
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustKey {
+    pub path: String,
+    pub id: Option<String>,
+}
+
+impl std::ops::Deref for TrustKey {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.path
+    }
+}
+
+impl std::fmt::Display for TrustKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.path)
+    }
+}
+
+impl std::fmt::Debug for TrustKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.path, f)
+    }
+}
+
+/// the ~/.opensidian.json key holding { "<canon vault path>": "<identity>" } (#127)
+pub const TRUST_ID_KEY: &str = "plugins_trust_id";
+
+/// the identity of the directory at `canon` (#127): inode + birth time (statx) in ns. Birth time
+/// separates a reused inode number (rm -rf + mkdir often gets the freed one back); a filesystem
+/// without birth time gives NO identity (review #129: the inode alone is reused). The device number is left out on purpose: it is not
+/// stable across remounts of removable / network disks and the path already names the place.
+#[cfg(unix)]
+pub fn dir_identity(canon: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(canon).ok()?;
+    if !m.is_dir() {
+        return None;
+    }
+    identity_of(m.ino(), m.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()))
+}
+
+/// Windows: the same identity from the open directory — file index (what an inode is here) plus the
+/// creation time (what birth time is): a rm -rf + mkdir gets a new creation time even if NTFS reuses the
+/// index. The volume serial is left out for the reason the device number is.
+#[cfg(windows)]
+pub fn dir_identity(canon: &Path) -> Option<String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Info {
+        attributes: u32,
+        created: [u32; 2],
+        accessed: [u32; 2],
+        written: [u32; 2],
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(h: *mut core::ffi::c_void, info: *mut Info) -> i32;
+    }
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    let f = fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(canon).ok()?;
+    let mut info = std::mem::MaybeUninit::<Info>::zeroed();
+    // SAFETY: the handle is open; the struct is read only when the call succeeded
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle() as *mut core::ffi::c_void, info.as_mut_ptr()) } == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return None;
+    }
+    let index = (info.index_high as u64) << 32 | info.index_low as u64;
+    identity_of(index, f.metadata().ok()?.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()))
+}
+
+/// "<inode>:<birth ns>"; no birth time = no identity (an inode number alone is handed out again)
+pub fn identity_of(ino: u64, birth: Option<std::time::Duration>) -> Option<String> {
+    birth.map(|b| format!("{ino}:{}", b.as_nanos()))
+}
+
+/// a path lookup (canonicalize + stat): callers compute it BEFORE the lifecycle lock (CC1)
+pub fn trust_key(root: &Path) -> TrustKey {
+    let canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let id = dir_identity(&canon);
+    TrustKey { path: canon.display().to_string(), id }
 }
 
 pub fn is_trusted(cfg: &serde_json::Value, root: &Path) -> bool {
-    cfg["plugins_trusted"][trust_key(root).as_str()].as_bool() == Some(true)
+    is_trusted_key(cfg, &trust_key(root))
+}
+
+/// BB1 (PR #42 round 11): the trust check for a key computed earlier (trust_key canonicalizes the
+/// vault root: a path lookup, done before the lifecycle lock by desk_shell). #127: the flag must be
+/// true AND the recorded identity (if any) must be the directory's — a mismatch is restricted.
+/// No recorded identity = an entry from before the binding: honoured only for a root WITH an
+/// identity (bind_legacy records it on that boot); a root without one is restricted (review #129).
+pub fn is_trusted_key(cfg: &serde_json::Value, key: &TrustKey) -> bool {
+    // #144 toggle 12: under the latched lockdown every vault is restricted; the trust
+    // entries are not touched and apply again after lockdown is off and the app restarted
+    if crate::security::trust_blocked() {
+        return false;
+    }
+    if cfg[TRUST_KEY][&key.path].as_bool() != Some(true) {
+        return false;
+    }
+    match &cfg[TRUST_ID_KEY][&key.path] {
+        serde_json::Value::Null => key.id.is_some(),
+        rec => key.id.as_deref().is_some_and(|id| rec.as_str() == Some(id)),
+    }
+}
+
+/// #127: the identity a trust flip of `key` records next to the flag (plugins_set writes both, one
+/// update, the flag line kept in plugins_set where consent-nobypass S3/S6 pin it): ON = the directory's
+/// identity, OFF = none. ON without an identity is refused (review #129): a flag written alone would
+/// read as a legacy entry and carry over to whatever directory is put at the path later.
+pub fn trust_bind(key: &TrustKey, on: bool) -> Result<Option<String>, String> {
+    if !on {
+        return Ok(None);
+    }
+    key.id.clone().map(Some).ok_or_else(|| NO_IDENTITY.to_string())
+}
+
+pub const NO_IDENTITY: &str =
+    "this vault folder cannot be trusted: its filesystem gives no stable folder identity (birth time); plugins stay restricted";
+
+/// #127 migration: an entry trusted before the binding (flag true, no identity) is bound to the
+/// directory found at its path now (the first boot of it after the upgrade). None = nothing to write.
+/// The caller writes it with cfgstore::Op::InsertIn (only if still absent, under the config lock):
+/// a stale snapshot never overwrites an identity a concurrent trust-ON recorded (review #129).
+pub fn bind_legacy(cfg: &serde_json::Value, key: &TrustKey) -> Option<(String, String, serde_json::Value)> {
+    let id = key.id.as_ref()?;
+    (cfg[TRUST_KEY][&key.path].as_bool() == Some(true) && cfg[TRUST_ID_KEY][&key.path].is_null())
+        .then(|| (TRUST_ID_KEY.to_string(), key.path.clone(), serde_json::json!(id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -166,13 +399,14 @@ const MAX_MANIFEST: u64 = 256 * 1024;
 /// own "id" rides along in `manifest` and a mismatch is reported, not fatal.
 pub fn installed(root: &Path) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(root.join(".obsidian").join("plugins")) else { return out };
-    let mut names: Vec<String> =
-        rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).filter(|n| valid_id(n)).collect();
+    // #250: listed from the fd the no-follow walk opened (a symlinked
+    // .obsidian or plugins dir lists nothing; symlinked entries are not listed)
+    let Ok(rd) = crate::vaultfs::Vault::open(root).and_then(|v| v.p_list(Path::new(".obsidian/plugins"))) else { return out };
+    let mut names: Vec<String> = rd.into_iter().filter(|(n, k)| *k == "folder" && valid_id(n)).map(|(n, _)| n).collect();
     names.sort();
     for id in names {
-        let Ok(Some(mp)) = plugin_file_in(root, &id, "manifest.json", MAX_MANIFEST) else { continue };
-        let Some(manifest) = fs::read_to_string(&mp)
+        let Ok(Some(mb)) = plugin_read_in(root, &id, "manifest.json", MAX_MANIFEST) else { continue };
+        let Some(manifest) = String::from_utf8(mb)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .filter(|v| v.is_object())
@@ -197,14 +431,13 @@ pub fn set_enabled(root: &Path, id: &str, on: bool) -> Result<Vec<String>, Strin
     if !valid_id(id) {
         return Err("bad plugin id".into());
     }
-    let p = root.join(ENABLED_FILE);
-    let mut list: Vec<serde_json::Value> = match fs::symlink_metadata(&p) {
-        Err(_) => Vec::new(),
-        Ok(m) if !m.is_file() || m.len() > 1024 * 1024 => return Err(format!("{ENABLED_FILE}: not a plain file")),
-        Ok(_) => {
-            let s = fs::read_to_string(&p).map_err(|e| format!("{ENABLED_FILE}: {e}"))?;
-            serde_json::from_str(&s).map_err(|_| format!("{ENABLED_FILE}: not a JSON array, left untouched"))?
-        }
+    // #250: read by the vaultfs fd walk; absent = empty, anything not a plain
+    // in-vault file (symlink at any component, FIFO, over 1 MiB) is refused
+    let mut list: Vec<serde_json::Value> = match crate::vaultfs::read_string(root, Path::new(ENABLED_FILE), 1024 * 1024) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Err(format!("{ENABLED_FILE}: {e}")),
+        Err(_) => return Err(format!("{ENABLED_FILE}: not a plain file")),
+        Ok(s) => serde_json::from_str(&s).map_err(|_| format!("{ENABLED_FILE}: not a JSON array, left untouched"))?,
     };
     let present = list.iter().any(|v| v.as_str() == Some(id));
     if on && !present {
@@ -229,13 +462,10 @@ fn rel_in(root: &Path, id: &str, file: &str) -> Result<PathBuf, String> {
 /// Plugin.loadData(): data.json parsed, or Null when absent or not valid JSON (Obsidian resolves null for both, so a
 /// plugin falls back to its defaults; the file is left as is)
 pub fn read_data(root: &Path, id: &str) -> Result<serde_json::Value, String> {
-    match plugin_file_in(root, id, "data.json", MAX_DATA_JSON)? {
+    match plugin_read_in(root, id, "data.json", MAX_DATA_JSON)? {
         None => Ok(serde_json::Value::Null),
-        Some(p) => {
-            // bytes, not a String: a file cut inside a multi-byte character is invalid JSON (null), not a read error
-            let b = fs::read(&p).map_err(|e| format!("{id}/data.json: {e}"))?;
-            Ok(serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null))
-        }
+        // bytes, not a String: a file cut inside a multi-byte character is invalid JSON (null), not a read error
+        Some(b) => Ok(serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null)),
     }
 }
 
@@ -244,8 +474,7 @@ pub fn read_data(root: &Path, id: &str) -> Result<serde_json::Value, String> {
 /// does not destroy the settings the user's broken edit still holds
 pub fn write_data(root: &Path, id: &str, data: &serde_json::Value) -> Result<(), String> {
     // a symlinked data.json refuses
-    if let Some(p) = plugin_file_in(root, id, "data.json", MAX_DATA_JSON)? {
-        let old = fs::read(&p).map_err(|e| format!("{id}/data.json: {e}"))?;
+    if let Some(old) = plugin_read_in(root, id, "data.json", MAX_DATA_JSON)? {
         if serde_json::from_slice::<serde_json::Value>(&old).is_err() {
             crate::vaultfs::write_atomic(root, &rel_in(root, id, "data.json.invalid")?, &old)
                 .map_err(|e| format!("{id}/data.json.invalid: {e}"))?;
@@ -262,10 +491,10 @@ pub fn write_data(root: &Path, id: &str, data: &serde_json::Value) -> Result<(),
 
 /// a plugin's styles.css through the snippet sanitizer; None = no styles.css
 pub fn read_styles(root: &Path, id: &str) -> Result<Option<String>, String> {
-    match plugin_file_in(root, id, "styles.css", MAX_STYLES)? {
+    match plugin_read_in(root, id, "styles.css", MAX_STYLES)? {
         None => Ok(None),
-        Some(p) => {
-            let src = fs::read_to_string(&p).map_err(|e| format!("{id}/styles.css: {e}"))?;
+        Some(b) => {
+            let src = String::from_utf8(b).map_err(|e| format!("{id}/styles.css: {e}"))?;
             crate::themefs::sanitize_css(&src).map(|s| Some(s.css)).map_err(|e| format!("{id}/styles.css: {e}"))
         }
     }
@@ -283,6 +512,16 @@ mod tests {
         fs::write(root.join(".obsidian/community-plugins.json"), r#"["good","gone","sneaky","linkdir"]"#).unwrap();
         fs::write(root.join("secret.md"), "SECRET").unwrap();
         root
+    }
+
+    /// what main.rs plugins_set writes for a trust flip (flag, + the identity on ON), applied to `cfg`
+    fn flip(cfg: &mut serde_json::Value, key: &TrustKey, on: bool) -> Result<(), String> {
+        let bind = trust_bind(key, on)?;
+        cfg[TRUST_KEY][&key.path] = serde_json::json!(on);
+        if let Some(id) = bind {
+            cfg[TRUST_ID_KEY][&key.path] = serde_json::json!(id);
+        }
+        Ok(())
     }
 
     fn js(s: Served) -> String {
@@ -388,9 +627,112 @@ mod tests {
     fn trust_lives_outside_the_vault_and_defaults_off() {
         let r = vault("trust");
         assert!(!is_trusted(&serde_json::json!({}), &r));
-        let cfg = serde_json::json!({"plugins_trusted": {trust_key(&r): true}});
+        let cfg = serde_json::json!({"plugins_trusted": {trust_key(&r).path: true}});
         assert!(is_trusted(&cfg, &r));
-        assert!(!is_trusted(&serde_json::json!({"plugins_trusted": {trust_key(&r): "yes"}}), &r));
+        assert!(!is_trusted(&serde_json::json!({"plugins_trusted": {trust_key(&r).path: "yes"}}), &r));
+    }
+
+    /* #127 case c: a trusted path whose directory is removed and replaced by another vault (cloned,
+       unpacked, moved there) does not inherit the entry: the identity recorded with the flag is the
+       old directory's. The vault's own files never enter the decision. */
+    #[test]
+    fn trust_is_bound_to_the_directory_not_only_the_path() {
+        let r = vault("bound");
+        let k = trust_key(&r);
+        assert!(k.id.is_some(), "a vault dir has an identity");
+        let mut cfg = serde_json::json!({});
+        flip(&mut cfg, &k, true).unwrap();
+        assert_eq!(cfg[TRUST_ID_KEY][&k.path].as_str(), k.id.as_deref());
+        assert!(is_trusted(&cfg, &r), "the directory it was given for");
+        assert!(is_trusted_key(&cfg, &trust_key(&r)), "a recomputed key of the same directory");
+        // a new file inside the vault changes nothing (mtime/ctime are not part of the identity)
+        fs::write(r.join("new.md"), "x").unwrap();
+        assert!(is_trusted(&cfg, &r));
+        // the directory replaced at the same path: restricted, even though the path entry is still true
+        fs::remove_dir_all(&r).unwrap();
+        fs::create_dir_all(r.join(".obsidian/plugins/good")).unwrap();
+        fs::write(r.join(".obsidian/community-plugins.json"), r#"["good"]"#).unwrap();
+        assert_eq!(cfg[TRUST_KEY][&k.path].as_bool(), Some(true));
+        assert_ne!(trust_key(&r).id, k.id, "a replaced directory has another identity");
+        assert!(!is_trusted(&cfg, &r), "the replaced directory inherited trust");
+        // a directory moved onto the path (rename keeps the inode of the moved dir) is just as foreign
+        let other = vault("bound-other");
+        fs::remove_dir_all(&r).unwrap();
+        fs::rename(&other, &r).unwrap();
+        assert!(!is_trusted(&cfg, &r));
+        // trusting again (the asked flip) binds the new directory
+        flip(&mut cfg, &trust_key(&r), true).unwrap();
+        assert!(is_trusted(&cfg, &r));
+        // OFF writes only the flag
+        let mut off = serde_json::json!({});
+        flip(&mut off, &trust_key(&r), false).unwrap();
+        assert_eq!(off, serde_json::json!({"plugins_trusted": {trust_key(&r).path: false}}));
+        // a root that cannot be stat'ed never matches a recorded identity
+        let gone = TrustKey { path: k.path.clone(), id: None };
+        assert!(!is_trusted_key(&cfg, &gone));
+        // a forged identity of the wrong type is no match either
+        cfg[TRUST_ID_KEY][&k.path] = serde_json::json!(true);
+        assert!(!is_trusted(&cfg, &r));
+    }
+
+    #[test]
+    fn a_legacy_entry_is_honoured_once_then_bound() {
+        let r = vault("legacy");
+        let k = trust_key(&r);
+        let mut cfg = serde_json::json!({"plugins_trusted": {k.path.clone(): true}});
+        assert!(is_trusted(&cfg, &r), "an entry from before the binding still applies");
+        let (p, key, v) = bind_legacy(&cfg, &k).expect("the first boot binds it");
+        cfg[p][key] = v;
+        assert!(bind_legacy(&cfg, &k).is_none(), "bound once");
+        assert!(is_trusted(&cfg, &r));
+        fs::remove_dir_all(&r).unwrap();
+        fs::create_dir_all(r.join(".obsidian")).unwrap();
+        assert!(!is_trusted(&cfg, &r), "after the binding a replaced directory is restricted");
+        // nothing to bind for an untrusted or OFF entry
+        assert!(bind_legacy(&serde_json::json!({}), &k).is_none());
+        assert!(bind_legacy(&serde_json::json!({"plugins_trusted": {k.path.clone(): false}}), &k).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_shares_the_identity_of_its_target() {
+        let r = vault("symid");
+        // the link lives inside the test's own vault dir (no fixed name in the shared temp dir)
+        let l = r.join("self-link");
+        std::os::unix::fs::symlink(&r, &l).unwrap();
+        assert_eq!(trust_key(&l), trust_key(&r));
+        let _ = fs::remove_file(&l);
+    }
+
+    /* review #129: a root without an identity (no birth time, or not stat-able) is never trusted:
+       the inode alone is reused, and a flag written without an identity would read as legacy. */
+    #[test]
+    fn no_identity_no_trust() {
+        assert_eq!(identity_of(7, None), None, "the inode alone is no identity");
+        assert_eq!(identity_of(7, Some(std::time::Duration::from_nanos(42))).as_deref(), Some("7:42"));
+        let r = vault("noid");
+        let bare = TrustKey { path: trust_key(&r).path, id: None };
+        assert_eq!(trust_bind(&bare, true), Err(NO_IDENTITY.to_string()), "ON without an identity is refused");
+        assert_eq!(trust_bind(&bare, false), Ok(None), "OFF is always possible");
+        let legacy = serde_json::json!({"plugins_trusted": {bare.path.clone(): true}});
+        assert!(!is_trusted_key(&legacy, &bare), "a legacy entry is not honoured where it cannot be bound");
+        assert!(bind_legacy(&legacy, &bare).is_none());
+    }
+
+    /* review #129: the boot's late binding uses InsertIn — a trust-ON that recorded the identity of a
+       new directory in the meantime is never overwritten by the stale snapshot's identity */
+    #[test]
+    fn a_late_legacy_binding_never_overwrites_a_newer_identity() {
+        let r = vault("race");
+        let k = trust_key(&r);
+        let stale = serde_json::json!({"plugins_trusted": {k.path.clone(): true}});
+        let old = TrustKey { path: k.path.clone(), id: Some("1:1".into()) };
+        let (p, key, id) = bind_legacy(&stale, &old).expect("legacy");
+        let mut disk = serde_json::json!({});
+        flip(&mut disk, &k, true).unwrap();
+        crate::cfgstore::apply(&mut disk, &[crate::cfgstore::Op::InsertIn(p, key, id)]);
+        assert_eq!(disk[TRUST_ID_KEY][&k.path].as_str(), k.id.as_deref(), "the newer identity stays");
+        assert!(is_trusted_key(&disk, &k));
     }
 
     #[test]
@@ -463,5 +805,63 @@ mod tests {
         symlink(&outside, r.join(".obsidian/plugins/linkdir")).unwrap();
         assert!(write_data(&r, "linkdir", &serde_json::json!({"x": 1})).is_err());
         assert!(!outside.join("data.json").exists());
+    }
+
+    /* #251 rule 6: in a trusted vault, main.js is served only while the plugin matches the pin the
+       user created (store install / native acknowledgement), and the styles only then too */
+    #[test]
+    fn serve_pinned_serves_only_what_was_allowed() {
+        let r = vault("pin");
+        fs::write(r.join(".obsidian/plugins/good/manifest.json"), r#"{"id":"good","version":"1.0.0"}"#).unwrap();
+        fs::write(r.join(".obsidian/plugins/good/styles.css"), ".x{color:red}").unwrap();
+        let vid = trust_key(&r).id;
+        let v = vid.as_deref();
+        let none = serde_json::json!({});
+        // not pinned: refused, even though rules 1-5 allow it
+        assert_eq!(serve(Some(&r), "/good/main.js", true), js_ok(&r));
+        assert_eq!(serve_pinned(Some(&r), "/good/main.js", true, &none, v), Served::Refused("not allowed: new plugin, not acknowledged"));
+        assert!(read_styles_pinned(&r, "good", &none, v).is_err());
+        // pinned: served, byte-identical to the unpinned answer; styles applied
+        let mut cfg = serde_json::json!({});
+        let p = crate::plugin_pins::pin_of(&crate::plugin_pins::read_files(&r, "good").unwrap(), "ack", 1);
+        crate::plugin_pins::apply_set(&mut cfg, v.unwrap(), "good", &p);
+        assert_eq!(serve_pinned(Some(&r), "/good/main.js", true, &cfg, v), js_ok(&r));
+        assert_eq!(read_styles_pinned(&r, "good", &cfg, v).unwrap().as_deref(), Some(".x{color:red}"));
+        // rules 1-5 still come first: restricted mode / not enabled / bad path are refused as before
+        assert_eq!(serve_pinned(Some(&r), "/good/main.js", false, &cfg, v), Served::Refused("restricted mode"));
+        assert_eq!(serve_pinned(Some(&r), "/good/manifest.json", true, &cfg, v), Served::Refused("bad path"));
+        assert_eq!(serve_pinned(None, "/good/main.js", true, &cfg, v), Served::Refused("no vault"));
+        // main.js rewritten on disk (sync, git, another plugin): refused, styles too
+        fs::write(r.join(".obsidian/plugins/good/main.js"), "\"use strict\";module.exports=2;//end").unwrap();
+        assert_eq!(serve_pinned(Some(&r), "/good/main.js", true, &cfg, v), Served::Refused("not allowed: changed on disk since it was allowed"));
+        assert!(read_styles_pinned(&r, "good", &cfg, v).is_err());
+        // another folder identity (a vault replaced at the path) has no pins
+        assert!(matches!(serve_pinned(Some(&r), "/good/main.js", true, &cfg, Some("1:1")), Served::Refused(_)));
+        assert!(matches!(serve_pinned(Some(&r), "/good/main.js", true, &cfg, None), Served::Refused(_)));
+        // a damaged store: nothing
+        assert_eq!(serve_pinned(Some(&r), "/good/main.js", true, &serde_json::json!({"pluginPins": 1}), v), Served::Refused("not allowed: plugin pin store damaged"));
+    }
+
+    /* #288 review (CodeAnt nitpick api-core.js:677): the styles answer is Err ONLY when the pin
+       refuses (api-core.js then stops the load); css the sanitizer refuses is not applied and is
+       not a reason to stop a plugin that matches its pin. */
+    #[test]
+    fn styles_pinned_err_means_the_pin_refused() {
+        let r = vault("pincss");
+        fs::write(r.join(".obsidian/plugins/good/manifest.json"), r#"{"id":"good","version":"1.0.0"}"#).unwrap();
+        fs::write(r.join(".obsidian/plugins/good/styles.css"), ".x{color:red} /* unclosed").unwrap();
+        let vid = trust_key(&r).id;
+        let v = vid.as_deref();
+        let mut cfg = serde_json::json!({});
+        let p = crate::plugin_pins::pin_of(&crate::plugin_pins::read_files(&r, "good").unwrap(), "ack", 1);
+        crate::plugin_pins::apply_set(&mut cfg, v.unwrap(), "good", &p);
+        assert_eq!(read_styles_pinned(&r, "good", &cfg, v), Ok(None), "refused css: not applied, not an error");
+        fs::write(r.join(".obsidian/plugins/good/styles.css"), ".x{color:blue}").unwrap();
+        assert!(read_styles_pinned(&r, "good", &cfg, v).is_err(), "changed css: the pin refuses");
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    fn js_ok(r: &Path) -> Served {
+        Served::Js(wrap_cjs("good", &fs::read_to_string(r.join(".obsidian/plugins/good/main.js")).unwrap()).into_bytes())
     }
 }

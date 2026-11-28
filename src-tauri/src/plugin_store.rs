@@ -62,9 +62,9 @@ macro_rules! compat_app_version {
 pub const COMPAT_APP_VERSION: &str = compat_app_version!();
 /// what install writes next to the plugin: where each file came from + its sha256
 pub const SIDECAR: &str = "opensidian-install.json";
-const MAX_REDIRECTS: usize = 5;
-const IO_TIMEOUT_S: u32 = 20;
-const DEADLINE: Duration = Duration::from_secs(180);
+pub(crate) const MAX_REDIRECTS: usize = 5;
+pub(crate) const IO_TIMEOUT_S: u32 = 20;
+pub(crate) const DEADLINE: Duration = Duration::from_secs(180);
 const MAX_LIST: u64 = 32 * 1024 * 1024;
 const MAX_API_JSON: u64 = 2 * 1024 * 1024;
 const MAX_README: u64 = 1024 * 1024;
@@ -96,7 +96,7 @@ pub fn check_url(u: &str) -> Result<url::Url, String> {
 }
 
 /// the loopback fixture mirror, if the env names a valid one
-fn mirror_base() -> Option<url::Url> {
+pub(crate) fn mirror_base() -> Option<url::Url> {
     let raw = std::env::var(BASE_ENV).ok().filter(|s| !s.is_empty())?;
     match parse_mirror(&raw) {
         Some(u) => Some(u),
@@ -143,6 +143,7 @@ pub fn next_hop(cur: &url::Url, loc: &str, base: Option<&url::Url>) -> Result<ur
 pub fn http_get(logical: &str, cap: u64, what: &str) -> Result<Vec<u8>, String> {
     use soup::glib::translate::IntoGlib;
     use soup::prelude::*;
+    crate::net_allowed(what)?; // #144 toggle 3: the choke point, before any session exists
     let base = mirror_base();
     let mut cur = check_url(logical)?;
     let sess = soup::Session::new();
@@ -205,8 +206,163 @@ pub fn http_get(logical: &str, cap: u64, what: &str) -> Result<Vec<u8>, String> 
     Err(format!("{what}: more than {MAX_REDIRECTS} redirects"))
 }
 
-#[cfg(not(target_os = "linux"))]
+/// the status code, Location and Content-Length of one HTTP response head (the bytes before the
+/// blank line, as `curl -i` prints them); None when it is not an HTTP status line
+#[cfg(any(test, target_os = "macos"))]
+pub fn parse_head(head: &[u8]) -> Option<(u32, Option<String>, Option<u64>)> {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n").flat_map(|l| l.split('\n'));
+    let status = lines.next()?;
+    let mut parts = status.split_whitespace();
+    if !parts.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    let code: u32 = parts.next()?.parse().ok()?;
+    let (mut loc, mut len) = (None, None);
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "location" => loc = Some(v.trim().to_string()),
+                "content-length" => len = v.trim().parse().ok(),
+                _ => {}
+            }
+        }
+    }
+    Some((code, loc, len))
+}
+
+/// macOS: libsoup does not exist here, so each hop is one run of Apple's /usr/bin/curl (SIP-protected,
+/// absolute path, fixed arguments, no new crate). The egress rules are unchanged and stay in Rust:
+/// check_url on every hop; curl follows NO redirect (--max-redirs 0, no -L), next_hop re-checks each
+/// Location; --proto limits the scheme (http only for the loopback mirror); -q skips ~/.curlrc.
+/// Like the libsoup client, the response HEAD is read first (`-i`): a redirect is followed without
+/// reading its body, a non-200 is an error, a declared length over the cap is refused, and the cap
+/// is enforced again while the body is read. curl must exit 0: a transfer cut short is an error,
+/// never a truncated success. Anonymous: no cookies, no auth.
+#[cfg(target_os = "macos")]
+pub fn http_get(logical: &str, cap: u64, what: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    const MAX_HEAD: usize = 64 * 1024;
+    crate::net_allowed(what)?; // #144 toggle 3: the choke point, before any request exists
+    let base = mirror_base();
+    let mut cur = check_url(logical)?;
+    let deadline = Instant::now() + DEADLINE;
+    let io = IO_TIMEOUT_S.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("{what}: timed out"));
+        }
+        let wire = wire_url(&cur, base.as_ref());
+        let mut c = Command::new("/usr/bin/curl");
+        c.arg("-q") // must be first: no ~/.curlrc
+            .args(["--silent", "--show-error", "--globoff", "--max-redirs", "0", "--include", "--suppress-connect-headers"])
+            .args(["--proto", if base.is_some() { "=http,https" } else { "=https" }])
+            .args(["--connect-timeout", &io, "--speed-limit", "1", "--speed-time", &io])
+            .args(["--max-time", &format!("{:.0}", left.as_secs_f64().ceil())])
+            .args(["--user-agent", concat!("opensidian/", env!("CARGO_PKG_VERSION"), " plugin-browser")]);
+        if cur.host_str() == Some("api.github.com") {
+            c.args(["--header", "Accept: application/vnd.github+json"]);
+        }
+        c.arg("--url").arg(&wire).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = c.spawn().map_err(|e| format!("{what}: cannot run /usr/bin/curl: {e}"))?;
+        let mut stdout = child.stdout.take().expect("piped");
+        let host = cur.host_str().unwrap_or("?").to_string();
+        let stop = |child: &mut std::process::Child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        let curl_err = |child: &mut std::process::Child| {
+            let mut e = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut e);
+            }
+            e.lines().find(|l| !l.trim().is_empty()).unwrap_or("no response").trim().to_string()
+        };
+        // 1. the head
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        let split = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            if buf.len() > MAX_HEAD {
+                stop(&mut child);
+                return Err(format!("{what}: {host}: response head over {MAX_HEAD} bytes"));
+            }
+            let n = stdout.read(&mut chunk).map_err(|e| format!("{what}: read: {e}"))?;
+            if n == 0 {
+                let msg = curl_err(&mut child);
+                let _ = child.wait();
+                return Err(format!("{what}: {host} — {msg}"));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let Some((code, loc, len)) = parse_head(&buf[..split]) else {
+            stop(&mut child);
+            return Err(format!("{what}: {host}: not an HTTP response"));
+        };
+        // 2. a redirect: its body is never read
+        if (300..400).contains(&code) && code != 304 {
+            stop(&mut child);
+            let loc = loc.filter(|l| !l.is_empty()).ok_or_else(|| format!("{what}: HTTP {code} without a Location"))?;
+            cur = next_hop(&cur, &loc, base.as_ref()).map_err(|e| format!("{what}: redirect {e}"))?;
+            continue;
+        }
+        if code != 200 {
+            stop(&mut child);
+            let hint = if (code == 403 || code == 429) && cur.host_str() == Some("api.github.com") {
+                " (GitHub's anonymous API rate limit; try again later)"
+            } else {
+                ""
+            };
+            return Err(format!("{what}: HTTP {code} from {host}{hint}"));
+        }
+        if len.is_some_and(|l| l > cap) {
+            stop(&mut child);
+            return Err(format!("refused: {what} is {} bytes, over the {cap}-byte cap", len.unwrap_or(0)));
+        }
+        // 3. the body, capped while it is read
+        let mut out = buf.split_off(split);
+        loop {
+            if out.len() as u64 > cap {
+                stop(&mut child);
+                return Err(format!("refused: {what} is larger than the {cap}-byte cap"));
+            }
+            let n = stdout.read(&mut chunk).map_err(|e| format!("{what}: read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        // 4. curl itself must report success: a transfer cut short is not a body
+        let status = child.wait().map_err(|e| format!("{what}: curl: {e}"))?;
+        if !status.success() {
+            return Err(format!("{what}: {host}: transfer failed (curl exit {}) — {}", status.code().unwrap_or(-1), curl_err(&mut child)));
+        }
+        if len.is_some_and(|l| l != out.len() as u64) {
+            return Err(format!("{what}: {host}: got {} of {} bytes", out.len(), len.unwrap_or(0)));
+        }
+        return Ok(out);
+    }
+    Err(format!("{what}: more than {MAX_REDIRECTS} redirects"))
+}
+
+/// Windows: WinHTTP (http_win.rs) — what the system already ships, as libsoup is on Linux: TLS
+/// by Schannel, the system's trust store and proxy, no TLS stack in the binary. Same egress rules
+/// as the libsoup client: check_url on every hop, NO automatic redirect (next_hop re-checks each
+/// Location), per-I/O timeout, a whole-request deadline, the byte cap enforced again while the
+/// body is read. Anonymous: no cookies, no automatic authentication.
+#[cfg(windows)]
+pub fn http_get(logical: &str, cap: u64, what: &str) -> Result<Vec<u8>, String> {
+    crate::net_allowed(what)?; // #144 toggle 3: the choke point, before any client exists
+    crate::http_win::get(logical, cap, what)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn http_get(logical: &str, _cap: u64, what: &str) -> Result<Vec<u8>, String> {
+    crate::net_allowed(what)?; // #144 toggle 3
     check_url(logical)?;
     Err(format!("{what}: the plugin browser has no network client on this platform"))
 }
@@ -387,24 +543,21 @@ fn sha256_hex(b: &[u8]) -> String {
 /* ------------------------------------------------- install / uninstall */
 
 fn installed_manifest(root: &Path, id: &str) -> Option<Value> {
-    let p = plugins::plugin_file_in(root, id, "manifest.json", MAX_MANIFEST).ok().flatten()?;
-    serde_json::from_slice::<Value>(&fs::read(p).ok()?).ok().filter(Value::is_object)
+    // #250: rule 5 + the fd read (plugins::plugin_read_in)
+    let b = plugins::plugin_read_in(root, id, "manifest.json", MAX_MANIFEST).ok().flatten()?;
+    serde_json::from_slice::<Value>(&b).ok().filter(Value::is_object)
 }
 
 /// the sidecar, plus whether each recorded file still hashes to its record
 fn audit(root: &Path, id: &str) -> Value {
-    let Some(dir) = plugins::plugin_dir_in(root, id) else { return Value::Null };
-    let p = dir.join(SIDECAR);
-    match fs::symlink_metadata(&p) {
-        Ok(m) if m.is_file() && m.len() <= MAX_MANIFEST => {}
-        _ => return Value::Null,
-    }
-    let Some(mut rec) = fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return Value::Null };
+    // #250: every file is read by plugins::plugin_read_in (fd walk, cap on the fd)
+    let Ok(Some(b)) = plugins::plugin_read_in(root, id, SIDECAR, MAX_MANIFEST) else { return Value::Null };
+    let Some(mut rec) = serde_json::from_slice::<Value>(&b).ok() else { return Value::Null };
     let mut intact = true;
     if let Some(files) = rec["files"].as_object() {
         for (name, f) in files {
             let cap = if name == "main.js" { plugins::MAX_MAIN_JS } else { plugins::MAX_STYLES.max(MAX_MANIFEST) };
-            let now = plugins::plugin_file_in(root, id, name, cap).ok().flatten().and_then(|p| fs::read(p).ok()).map(|b| sha256_hex(&b));
+            let now = plugins::plugin_read_in(root, id, name, cap).ok().flatten().map(|b| sha256_hex(&b));
             intact &= now.as_deref() == f["sha256"].as_str();
         }
     }
@@ -448,6 +601,13 @@ fn html_esc(t: &str) -> String {
 /// install or update <id> from its store release (see release()). Nothing is written
 /// until every asset URL passed the allowlist and every file passed its check.
 pub fn install(fetch: Fetch, root: &Path, id: &str) -> Result<Value, String> {
+    install_pinned(fetch, root, id).map(|(rec, _)| rec)
+}
+
+/// #251: install / update and the pin of exactly the bytes fetched and written (main.js,
+/// manifest.json, styles.css or none). The caller (store_install, an explicit user action) writes
+/// the pin outside the vault (cfgstore Op::PluginPinSet); the sidecar in the vault is a record only.
+pub fn install_pinned(fetch: Fetch, root: &Path, id: &str) -> Result<(Value, crate::plugin_pins::Pin), String> {
     let e = entry(fetch, id)?;
     let repo = s(&e, "repo");
     let r = release(fetch, &repo)?;
@@ -497,7 +657,8 @@ pub fn install(fetch: Fetch, root: &Path, id: &str) -> Result<Value, String> {
     let body = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
     crate::vaultfs::write_atomic(root, &rel.join(SIDECAR), body.as_bytes()).map_err(|e| format!("{id}/{SIDECAR}: {e}"))?;
     eprintln!("[plugin-store] installed {id} {} from {repo}", s(&m, "version"));
-    Ok(rec)
+    let files = crate::plugin_pins::Files { main, manifest: man, styles };
+    Ok((rec, crate::plugin_pins::pin_of(&files, "store", at)))
 }
 
 /// remove <id>: off the enabled list first, then its (confined) folder
@@ -507,6 +668,24 @@ pub fn uninstall(root: &Path, id: &str) -> Result<(), String> {
     fs::remove_dir_all(&dir).map_err(|e| format!("{id}: remove: {e}"))?;
     eprintln!("[plugin-store] uninstalled {id}");
     Ok(())
+}
+
+/// #288 review (fail closed): forget this vault's pin of <id> FIRST, then remove the folder. A
+/// pin that could not be forgotten refuses the uninstall: otherwise the pin (the user's
+/// acknowledgement of exactly these bytes) would outlive the folder, and an identical copy put
+/// back later would load without being asked again. `vault` = the folder identity (None = no
+/// pin can exist for this vault, nothing to forget).
+pub fn uninstall_forgetting(
+    root: &Path,
+    id: &str,
+    vault: Option<String>,
+    forget: &dyn Fn(String, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    plugins::plugin_dir_in(root, id).ok_or_else(|| format!("{id}: not installed, or its folder is not confined"))?;
+    if let Some(vault) = vault {
+        forget(vault, id).map_err(|e| format!("{id}: not uninstalled: its pin could not be forgotten: {e}"))?;
+    }
+    uninstall(root, id)
 }
 
 /* ------------------------------------------------------------- commands
@@ -534,17 +713,45 @@ pub(crate) async fn store_detail(v: tauri::State<'_, crate::Vault>, id: String) 
 #[tauri::command]
 pub(crate) async fn store_install(v: tauri::State<'_, crate::Vault>, id: String) -> Result<Value, String> {
     let root = crate::cur_vault(&v).ok_or("no vault open")?;
-    blocking(move || install(&live, &root, &id)).await
+    blocking(move || {
+        let (rec, pin) = install_pinned(&live, &root, &id)?;
+        // #251: the user installed / updated THIS release: pin its bytes for this vault folder
+        // (no folder identity = no pin: such a vault is never trusted, nothing would load)
+        match plugins::trust_key(&root).id {
+            Some(vault) => crate::cfg_update(&[crate::cfgstore::Op::PluginPinSet { vault, plugin: id.clone(), pin }]),
+            None => eprintln!("[plugin-store] {id}: not pinned: {}", crate::plugin_pins::NO_IDENTITY),
+        }
+        Ok(rec)
+    })
+    .await
 }
 
 #[tauri::command]
 pub(crate) async fn store_uninstall(v: tauri::State<'_, crate::Vault>, id: String) -> Result<(), String> {
     let root = crate::cur_vault(&v).ok_or("no vault open")?;
-    crate::span_timed!("store_uninstall", blocking(move || uninstall(&root, &id)).await)
+    crate::span_timed!("store_uninstall", blocking(move || {
+        // #251: a later folder of the same id is new again; #288 review: the pin goes first,
+        // and a pin that cannot be forgotten keeps the plugin installed (fail closed)
+        let vault = plugins::trust_key(&root).id;
+        uninstall_forgetting(&root, &id, vault, &|vault: String, plugin: &str| {
+            crate::cfg_try_update(&[crate::cfgstore::Op::PluginPinDrop { vault, plugin: plugin.to_string() }])
+        })
+    }).await)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_head_reads_status_location_and_length() {
+        let h = b"HTTP/2 302 \r\nlocation: https://release-assets.githubusercontent.com/x?y=1\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(parse_head(h), Some((302, Some("https://release-assets.githubusercontent.com/x?y=1".into()), Some(0))));
+        let h = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\n\r\n";
+        assert_eq!(parse_head(h), Some((200, None, Some(42))));
+        assert_eq!(parse_head(b"HTTP/1.1 404 Not Found\r\n\r\n"), Some((404, None, None)));
+        assert_eq!(parse_head(b"garbage\r\n\r\n"), None);
+        assert_eq!(parse_head(b""), None);
+    }
+
     use super::*;
     use std::path::PathBuf;
 
@@ -611,6 +818,188 @@ mod tests {
         assert!(js.contains(&format!("const API_VERSION = \"{COMPAT_APP_VERSION}\";")), "api-core.js API_VERSION drifted from COMPAT_APP_VERSION");
         let nd = include_str!("../../ui/plugins/node-desktop.js");
         assert!(nd.contains(&format!("const appVersion = () => \"{COMPAT_APP_VERSION}\";")), "node-desktop.js appVersion drifted from COMPAT_APP_VERSION");
+    }
+
+    /* #288 review (CodeAnt nitpicks api-core.js:677 and :770), checked on the shipped source:
+       (1) enable() does not swallow the styles answer: a pin refusal stops the load (teardown);
+       (2) saveEnabled() does not ask a second time for the id refresh() just asked about. */
+    #[test]
+    fn api_core_styles_refusal_stops_the_load_and_cancel_is_not_asked_twice() {
+        let js = include_str!("../../ui/plugins/api-core.js");
+        let en = &js[js.find("async function enable(id)").expect("enable")..];
+        let en = &en[..en.find("\n    }\n").expect("enable end")];
+        let st = en.find("be.io(id, \"styles\")").expect("enable reads the styles");
+        assert!(!en[st..].starts_with("be.io(id, \"styles\").catch"), "the styles refusal is swallowed");
+        let tr = st + en[st..].find("} catch (e) {").expect("the catch after the styles read");
+        assert!(en[tr..].contains("teardown(id)"), "a styles error must reach the teardown");
+        let se = &js[js.find("async function saveEnabled(id, on)").expect("saveEnabled")..];
+        let se = &se[..se.find("\n    }\n").expect("saveEnabled end")];
+        let snap = se.find("const asked = askedOnce;").expect("askedOnce read before refresh()");
+        let rf = se.find("await refresh();").expect("refresh");
+        let al = se.find("await allow([id])").expect("allow");
+        assert!(snap < rf && rf < al, "order: snapshot, refresh, allow");
+        assert!(se[..al].contains("!(askedOnce && !asked)"), "allow([id]) must be skipped when refresh() just asked");
+    }
+
+    /// the body of `async function <name>(` in js, up to the next line that closes it at the same indent
+    fn js_fn<'a>(js: &'a str, name: &str) -> &'a str {
+        let head = format!("async function {name}(");
+        let at = js.find(&head).unwrap_or_else(|| panic!("{name} not found"));
+        let line0 = js[..at].rfind('\n').map_or(0, |n| n + 1);
+        let indent = &js[line0..at];
+        let close = format!("\n{indent}}}\n");
+        let end = js[at..].find(&close).unwrap_or_else(|| panic!("{name}: no closing brace")) + at;
+        &js[at..end]
+    }
+    fn pos(body: &str, needle: &str) -> usize {
+        body.find(needle).unwrap_or_else(|| panic!("missing {needle:?}"))
+    }
+
+    /// #277: stock's startup order. The restored layout's showing plugin views are built only after
+    /// every enabled plugin's onload (never inside it), with layoutReady false while plugins load,
+    /// and layout-ready fires after those views exist.
+    #[test]
+    fn boot_builds_restored_views_after_plugin_onloads_then_layout_ready() {
+        let js = include_str!("../../ui/plugins/api-core.js");
+        let b = js_fn(js, "boot");
+        let hold = pos(b, "views.holdRestore();");
+        let load = pos(b, "for (const id of K.st.enabledIds) await enable(id);");
+        let mount = pos(b, "await views.mountHeld();");
+        let ready = pos(b, "K.st.layoutReady = true; workspace.layoutReady = true;");
+        let fire = pos(b, "workspace.trigger(\"layout-ready\");");
+        assert!(hold < load, "the remount hold must be on before any plugin loads");
+        assert!(load < mount, "restored views are built after every plugin's onload");
+        assert!(mount < ready, "layoutReady stays false until the restored views are built");
+        assert!(ready < fire, "layout-ready fires once layoutReady is true");
+        // negative: layoutReady is never set before the plugins load, and only once in the file
+        assert!(!b[..load].contains("layoutReady = true"), "layoutReady set true before plugin onloads (#277)");
+        assert_eq!(js.matches("K.st.layoutReady = true").count(), 1, "one place readies the layout");
+        assert_eq!(js.matches("workspace.layoutReady = true").count(), 1);
+        // fail closed: a throwing plugin load still lifts the hold and readies the layout
+        let fin = pos(b, "} finally {");
+        assert!(load < fin && fin < mount && mount < ready, "mountHeld + layoutReady must sit in the finally");
+    }
+
+    /// #277: views.js side of the hold. While held, registerView does not mount a showing restored tab
+    /// (the plugin's onload is still running); mountHeld lifts the hold FIRST (a type registered after
+    /// boot remounts at once, as before), mounts only showing restored tabs of a registered type, awaits
+    /// each view's onOpen/setState, survives a throwing remount, and is a no-op without a hold.
+    #[test]
+    fn views_hold_restored_remount_during_startup_load() {
+        let js = include_str!("../../ui/plugins/views.js");
+        let add = &js[pos(js, "function addView(pid, type, factory) {")..pos(js, "function dropView(type) {")];
+        assert!(add.contains("if (!holdMount) for (const g of M().groups())"), "addView must not remount while held");
+        assert!(add.contains("safe(\"remount \" + type, () => loadActive(g))"), "post-boot registerView still remounts a showing tab");
+        assert!(js.contains("let holdMount = false;"), "no hold unless boot asks for it");
+        let m = js_fn(js, "mountHeld");
+        let early = pos(m, "if (!holdMount) return 0;");
+        let lift = pos(m, "holdMount = false;");
+        let each = pos(m, "for (const g of M().groups())");
+        assert!(early < lift && lift < each, "the hold is lifted before any remount");
+        assert!(m.contains("t.kind === \"unk\" && types.has(t.utype)"), "only showing restored tabs of a registered type mount");
+        let la = pos(m, "try { await loadActive(g); } catch (e)");
+        assert!(m[la..].contains("continue;"), "a throwing remount must not stop the next group");
+        assert!(m.contains("await r.opened;"), "layout-ready waits for the view's onOpen + setState");
+        let host = &js[pos(js, "const host = {")..];
+        assert!(host[..200].contains("holdRestore, mountHeld"), "views host exports the hold");
+    }
+
+    /// #277 review (CodeAnt, api-core.js:768 / views.js:882): the hold covers EVERY way a restored
+    /// view gets built, not only addView's remount. A click on a background restored tab while the
+    /// plugins still load (switchTab -> loadActive -> PV.mount) must not build a view of a type
+    /// registered in that load (it would run inside the plugin's half-done onload): the pane stays
+    /// blank and mountHeld builds the then-showing tab once every onload is done.
+    #[test]
+    fn views_hold_defers_a_tab_shown_during_startup_load() {
+        let js = include_str!("../../ui/plugins/views.js");
+        let mount = &js[pos(js, "mount(g, t) {")..pos(js, "hide(g, t) {")];
+        let defer = pos(mount, "if (!r && holdMount && heldTypes.has(t.utype)) return true;");
+        let build = pos(mount, "r = makeView(t, t.utype");
+        assert!(defer < build, "PV.mount must defer before it builds a view while held");
+        let add = &js[pos(js, "function addView(pid, type, factory) {")..pos(js, "function dropView(type) {")];
+        assert!(add.contains("if (holdMount) heldTypes.add(type);"), "a type registered while held is deferred");
+        let m = js_fn(js, "mountHeld");
+        let lift = pos(m, "holdMount = false;");
+        assert!(lift < pos(m, "heldTypes.clear();") && pos(m, "heldTypes.clear();") < pos(m, "for (const g of M().groups())"),
+            "the deferral ends with the hold, before the held views are built");
+        // a type registered after boot is never deferred: heldTypes only grows under the hold
+        assert_eq!(js.matches("heldTypes.add(").count(), 1);
+    }
+
+    /// #277 review (CodeAnt, views.js:903 + nitpick api-core.js:772): mountHeld awaits each restored
+    /// view's onOpen/setState BEFORE layoutReady. A view whose onOpen awaits workspace.onLayoutReady
+    /// (queued until layout-ready) would hang boot forever. The wait is bounded (one deadline for all
+    /// groups) and ends at once when anything queues an onLayoutReady callback during it; boot then
+    /// readies the layout and the queued callback runs, so that onOpen completes.
+    #[test]
+    fn mount_held_wait_cannot_deadlock_layout_ready() {
+        let js = include_str!("../../ui/plugins/views.js");
+        let m = js_fn(js, "mountHeld");
+        assert!(m.contains("const until = Date.now() + HOLD_OPEN_MS;"), "one deadline for the whole wait");
+        assert!(js.contains("HOLD_OPEN_MS = 10000"), "bounded at 10 s");
+        let race = pos(m, "await Promise.race([");
+        assert!(m[race..].contains("setTimeout("), "the onOpen wait races a timer");
+        assert!(m[race..].contains("lrWake"), "the onOpen wait also ends when an onLayoutReady callback is queued");
+        assert!(!m.contains("try { await r.opened; } catch (_) {} n++;"), "no unbounded await of onOpen before layout-ready");
+        // the wake: onLayoutReady's not-yet-ready branch kicks the wait before it queues on layout-ready
+        let olr = &js[pos(js, "onLayoutReady(cb) {")..];
+        let olr = &olr[..olr.find('\n').unwrap()];
+        assert!(pos(olr, "views.lrKick()") < pos(olr, "this.on(\"layout-ready\", cb)"), "onLayoutReady while not ready wakes mountHeld's wait");
+        let host = &js[pos(js, "const host = {")..];
+        assert!(host[..200].contains("holdRestore, mountHeld, lrKick"), "views host exports the wake");
+        // fail closed: whatever the wait does, boot still readies the layout afterwards (finally, checked in the boot test)
+        assert!(m[pos(m, "for (const g of M().groups())")..].contains("continue;"));
+    }
+
+    /// #277: a note leaf switched (no active) to a view of its own file replaces the note tab, as stock
+    /// (one tab): the leftover note tab was restored as a markdown leaf next start, converted again by
+    /// Excalidraw, and the board on screen was a stale detached view stuck on "waiting". Data safety:
+    /// never a pinned note, a shown one only saved + still clean after the last await, a hidden one only
+    /// if never loaded; a view of another file (or a non-note tab) keeps the note as before.
+    #[test]
+    fn views_own_file_conversion_replaces_note_tab() {
+        let js = include_str!("../../ui/plugins/views.js");
+        let o = js_fn(js, "openTyped");
+        // the note's file is read while the leaf is still the note tab (bindLeaf rebinds it to the new tab)
+        let nf = pos(o, "if (t0 && !t0.kind) try { const ls = d.leafState(leaf); if (ls && ls.type === \"markdown\" && ls.state && typeof ls.state.file === \"string\") noteFile0 = ls.state.file; } catch (_) {}");
+        let bind = pos(o, "if (t0 || leaf._nt || split || !g.tabs.length) bindLeaf(leaf, t);");
+        assert!(nf < bind, "noteFile0 must be read before bindLeaf");
+        let br = &o[pos(o, "else if (t0 && !active && !leaf._nt) {")..pos(o, "else await openTabView(g, t, at, true);")];
+        let own = pos(br, "const own = !t0.kind && !t0.pinned && !!state && typeof state.file === \"string\" && !!state.file && noteFile0 === state.file;");
+        assert!(!br.contains("d.leafState(leaf)"), "the branch runs after bindLeaf: the leaf no longer reads the note");
+        let saved = pos(br, "const saved = own && was ? await noteSaved(g, t0) : false;");
+        let flush = pos(br, "if (was && typeof flushSave === \"function\") try { await flushSave(g); } catch (_) {}");
+        let guard = pos(br, "const drop = own && !t0.pinned && (was");
+        assert!(br.contains("? saved && activeTab(g) === t0 && !(typeof bufDirty === \"function\" && bufDirty(g))"), "a shown note goes only saved and clean");
+        assert!(br.contains(": t0.base === undefined && activeTab(g) !== t0);"), "a hidden note goes only if never loaded");
+        let ins = pos(br, "g.tabs.push(t);");
+        let close = pos(br, "if (drop) { const j = g.tabs.indexOf(t0); if (j >= 0 && typeof closeTab === \"function\") await closeTab(g, j, \"plugin-detach\", \"plugin\", true); }");
+        assert!(own < saved && saved < flush && flush < guard && guard < ins && ins < close, "guard after the last await, before the switch; close last");
+        assert!(!br[guard..ins].contains("await"), "nothing awaits between the dirty guard and the switch");
+        assert_eq!(br.matches("closeTab(").count(), 1, "the note tab is closed only through the guarded drop");
+    }
+
+    /// #277: setViewState({type:"empty"}) on a plugin-view tab replaces its view with the empty view, as
+    /// stock. Excalidraw rebuilds a drawing restored before layout-ready with setViewState empty ->
+    /// excalidraw; ignoring "empty" kept the "waiting for Obsidian" view and the board never painted.
+    #[test]
+    fn views_set_view_state_empty_closes_plugin_view() {
+        let js = include_str!("../../ui/plugins/views.js");
+        let svs_at = pos(js, "async setViewState(vs, eState) {");
+        let svs = &js[svs_at..svs_at + pos(&js[svs_at..], "\n        }\n")];
+        let typed = pos(svs, "if (type && types.has(type)) return openTyped(");
+        let empty = pos(svs, "if (type === \"empty\" && !this._side && this._t && this._t.kind === \"unk\") return emptyTab(this);");
+        let side = pos(svs, "if (this._side && (type === \"empty\" || !type)) return;");
+        assert!(typed < empty && empty < side, "a registered type opens first; side leaves keep their no-op");
+        let e = js_fn(js, "emptyTab");
+        let close = pos(e, "const r = recs.get(t); if (r) closeRec(r);");
+        let ut = pos(e, "t.utype = \"empty\";");
+        assert!(close < ut, "the old view is closed before the tab turns empty");
+        assert!(e.contains("state: { type: \"empty\", state: {}"), "the persisted leaf is stock's empty leaf");
+        assert!(!e.contains("closeTab"), "the leaf keeps its tab");
+        // the next setViewState of a plugin type then builds a fresh view (no rec -> makeView, onOpen, setState)
+        let o = js_fn(js, "openTyped");
+        assert!(o.contains("if (r && r.type === type && !inst) {"), "same type re-sets state only while a view exists");
     }
 
     #[test]
@@ -759,6 +1148,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn uninstall_refuses_a_symlinked_plugin_dir() {
         let root = vault("unsym");
@@ -772,5 +1162,60 @@ mod tests {
         assert!(outside.join("keep.txt").is_file());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    /* #288 review (CodeAnt nitpick plugin_store.rs:710): the pin is forgotten FIRST; a pin that
+       cannot be forgotten refuses the uninstall and leaves the folder, so the pin never outlives
+       it. Before: the folder was removed, then the failed pin drop was only logged. */
+    #[test]
+    fn uninstall_refuses_when_the_pin_cannot_be_forgotten() {
+        let root = vault("unpin288");
+        fs::create_dir_all(root.join(".obsidian/plugins/keep-me")).unwrap();
+        fs::write(root.join(".obsidian/plugins/keep-me/main.js"), "x").unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let failing = |v: String, p: &str| -> Result<(), String> {
+            asked.borrow_mut().push((v, p.to_string()));
+            Err("config locked".into())
+        };
+        let e = uninstall_forgetting(&root, "keep-me", Some("1:2".into()), &failing).unwrap_err();
+        assert!(e.contains("not uninstalled") && e.contains("config locked"), "{e}");
+        assert!(root.join(".obsidian/plugins/keep-me/main.js").is_file(), "the folder stays while its pin does");
+        assert_eq!(*asked.borrow(), vec![("1:2".to_string(), "keep-me".to_string())]);
+        let ok = |_: String, _: &str| -> Result<(), String> { Ok(()) };
+        uninstall_forgetting(&root, "keep-me", Some("1:2".into()), &ok).unwrap();
+        assert!(!root.join(".obsidian/plugins/keep-me").exists(), "pin forgotten, then removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /* #251: a store install pins exactly the bytes it wrote; the pin (written by store_install
+       outside the vault) lets that code load, and the same plugin rewritten on disk afterwards is
+       refused. The sidecar in the vault is never what lets it load. */
+    #[test]
+    fn store_install_pins_what_it_wrote() {
+        let _g = STORE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let root = vault("pin251");
+        reset();
+        let f = net("pin-plug", "pin-plug", 23, "github.com");
+        let (rec, pin) = install_pinned(&f, &root, "pin-plug").unwrap();
+        assert_eq!(pin.by, "store");
+        assert_eq!(pin.version, "1.0.0");
+        assert_eq!(pin.main, sha256_hex(b"module.exports=class{};"));
+        assert_eq!(Some(pin.main.as_str()), rec["files"]["main.js"]["sha256"].as_str());
+        assert_eq!(pin.styles, None, "the release has no styles.css");
+        let on_disk = crate::plugin_pins::pin_of(&crate::plugin_pins::read_files(&root, "pin-plug").unwrap(), "store", pin.at);
+        assert_eq!(pin, on_disk, "the pin is of the bytes on disk");
+        let mut cfg = serde_json::json!({});
+        crate::plugin_pins::apply_set(&mut cfg, "7:7", "pin-plug", &pin);
+        assert!(crate::plugin_pins::verify(&cfg, Some("7:7"), &root, "pin-plug").is_ok());
+        // rewritten on disk, sidecar rewritten to match: refused
+        let dir = root.join(".obsidian/plugins/pin-plug");
+        fs::write(dir.join("main.js"), "tampered").unwrap();
+        let mut side: Value = serde_json::from_slice(&fs::read(dir.join(SIDECAR)).unwrap()).unwrap();
+        side["files"]["main.js"]["sha256"] = json!(sha256_hex(b"tampered"));
+        fs::write(dir.join(SIDECAR), side.to_string()).unwrap();
+        assert!(crate::plugin_pins::verify(&cfg, Some("7:7"), &root, "pin-plug").is_err());
+        // nothing pins without an install: a refused install returns no pin
+        reset();
+        assert!(install_pinned(&net("bad-plug", "other-id", 23, "github.com"), &root, "bad-plug").is_err());
     }
 }

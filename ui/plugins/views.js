@@ -61,8 +61,27 @@
           return b;
         }
       }
+      /* issue #239: a FileView's header carries its file's name as the TITLE (stock 1.13.7, black-box: an
+         Excalidraw board's view header reads "Drawing.excalidraw", and a click on it edits the name in place).
+         The name is painted on every file change and every vault rename (_osPaintTitle); a click hands the
+         title to the app's inline rename (main.js pvTitleRename, the tab/explorer editor of #101/#142), so a
+         drawing renames through the same tail as a note: disk, tabs, explorer, bookmarks, links. */
       class FileView extends ItemView {
-        constructor(leaf) { super(leaf); this.file = null; this.allowNoFile = false; this.navigation = true; }
+        constructor(leaf) {
+          super(leaf); this.file = null; this.allowNoFile = false; this.navigation = true;
+          this.titleEl.classList.add("os-pvtitle");
+          this.titleEl.addEventListener("click", e => {
+            if (e.button !== 0 || e.target.closest(".exren")) return;
+            try { if (typeof pvTitleRename === "function") pvTitleRename(this, e); } catch (er) { console.error("[plugin] title rename:", er); }
+          });
+        }
+        _osPaintTitle() {
+          const t = this.titleEl;
+          if (!t || t.querySelector(".exren")) return;   // an open rename editor owns the title until it closes
+          const f = this.file, s = f && f.basename ? String(f.basename) : "";
+          if (t.textContent !== s) t.textContent = s;
+          t.title = s;
+        }
         getDisplayText() { return this.file ? this.file.basename : "No file"; }
         getState() { return this.file ? { file: this.file.path } : {}; }
         async setState(state) {
@@ -75,6 +94,7 @@
         async loadFile(file) {
           if (this.file) try { await this.onUnloadFile(this.file); } catch (e) { console.error(e); }
           this.file = file;
+          this._osPaintTitle();
           await this.onLoadFile(file);
         }
         onLoadFile() { return Promise.resolve(); }
@@ -182,6 +202,21 @@
         t.raw = raw;
         const name = title || r.type;
         if (t.name !== name) { t.name = name; const g = groupOfTab(t); if (g && typeof renderTabs === "function") try { renderTabs(g); } catch (_) {} }
+        if (typeof v._osPaintTitle === "function") safe("view title", () => v._osPaintTitle());   // #239: the header title follows the file
+      }
+      /* issue #239: a vault rename (the app's rename: tab, header title, explorer, F2) reaches every open view of
+         the file as stock does it — FileView.onRename(file) — and the tab label + header title follow the new name. */
+      let renRef = null;
+      function armRename() {
+        if (renRef) return;
+        try {
+          renRef = d.vault().on("rename", f => {
+            for (const r of recs.values()) if (r.view && f && r.view.file === f) {
+              safe("view onRename " + r.type, () => r.view.onRename(f));
+              syncTab(r);
+            }
+          });
+        } catch (e) { renRef = null; console.error("[plugin] rename hook:", e); }
       }
       function makeView(t, type, state, inst) {   // instantiate (or adopt inst) + load + onOpen, once per tab
         const ty = types.get(type);
@@ -194,6 +229,7 @@
         }
         const r = { t, leaf, view, type, pid: ty ? ty.pid : null, opened: null };
         recs.set(t, r);
+        armRename();
         // main.js mounts a plugin-view tab only through PVHOST, which registerView arms; a view handed to
         // WorkspaceLeaf.open needs no registered type, so the first record arms it too (else the tab shows
         // "No view for" and the view's containerEl is never attached)
@@ -256,6 +292,10 @@
         mount(g, t) {                   // main.js loadActive: t (active, kind unk) -> true if a plugin view shows it
           if (!isPvTab(t)) return false;
           let r = recs.get(t);
+          // #277 (review): during the startup plugin load no restored view of a type registered in that load is
+          // built, however its tab came to show (a click on a background tab included) — it would run inside the
+          // plugin's half-done onload. The pane stays blank (loadActive hid the rest); mountHeld builds it after.
+          if (!r && holdMount && heldTypes.has(t.utype)) return true;
           if (!r) { const st = t.raw && t.raw.state; r = makeView(t, t.utype, st && st.state); if (!r) return false; }
           const ce = r.view.containerEl;
           if (ce.parentNode !== g.content) g.content.appendChild(ce);
@@ -578,6 +618,7 @@
           if (svsProbe && svsProbe.leaf === this) { svsProbe.see(vs); return; }   // PV.openAs: the type the wrappers picked
           const type = vs && vs.type;
           if (type && types.has(type)) return openTyped(this, type, (vs && vs.state) || {}, vs.active);
+          if (type === "empty" && !this._side && this._t && this._t.kind === "unk") return emptyTab(this);
           if (this._side && (type === "empty" || !type)) return;
           const p = vs && vs.state && vs.state.file; const f = p && d.vault().getAbstractFileByPath(p);
           if (!(f instanceof d.TFile())) return;
@@ -689,6 +730,9 @@
         const split = leaf._split;
         // the leaf moves to the new tab: a pending leaf lands, a note/graph tab's leaf follows its view
         // (the note tab stays, as before; it gets a leaf of its own on next use); a stale group leaf mirrors
+        // #277: the note's own file, read while the leaf still IS the note tab (after bindLeaf it reads the new tab)
+        let noteFile0 = null;
+        if (t0 && !t0.kind) try { const ls = d.leafState(leaf); if (ls && ls.type === "markdown" && ls.state && typeof ls.state.file === "string") noteFile0 = ls.state.file; } catch (_) {}
         if (t0 || leaf._nt || split || !g.tabs.length) bindLeaf(leaf, t);
         const r = makeView(t, type, state, inst); if (!r) return;
         if (split && typeof splitWith === "function") {
@@ -722,15 +766,45 @@
           // (the insert shifts the tabs after `at`: the shown tab is re-found by identity BEFORE anything
           // renders, else a render in between sees the index on a neighbour and makes that the active leaf)
           const cur = activeTab(g), was = !cur || cur === t0;
+          // #277: a NOTE leaf switched to a view of its OWN file (Excalidraw turns a drawing's markdown leaf into its
+          // "excalidraw" view with setViewState and no active, on first open and again on every layout-ready) is that
+          // leaf changing view, as stock: the view takes the note's place and the note tab goes (one tab, not two).
+          // Kept the note would be restored next start as a markdown leaf, converted again, and the board shown would
+          // be a stale detached one. Data safety as the active branch: never a pinned note; a shown note goes only if
+          // saved and still clean at the switch; a hidden one only if it was never loaded (no buffer to lose).
+          const own = !t0.kind && !t0.pinned && !!state && typeof state.file === "string" && !!state.file && noteFile0 === state.file;
+          const saved = own && was ? await noteSaved(g, t0) : false;
           if (was && typeof flushSave === "function") try { await flushSave(g); } catch (_) {}
+          // the guard runs after the last await before the switch (nothing can type in between)
+          const drop = own && !t0.pinned && (was
+            ? saved && activeTab(g) === t0 && !(typeof bufDirty === "function" && bufDirty(g))
+            : t0.base === undefined && activeTab(g) !== t0);
           g.tabs.push(t);
           if (at < g.tabs.length - 1) { g.tabs.copyWithin(at + 1, at); g.tabs[at] = t; }
           g.active = g.tabs.indexOf(was ? t : cur);
           if (was && typeof loadActive === "function") await loadActive(g);
           else if (typeof renderTabs === "function") renderTabs(g);
+          if (drop) { const j = g.tabs.indexOf(t0); if (j >= 0 && typeof closeTab === "function") await closeTab(g, j, "plugin-detach", "plugin", true); }
         }
         else await openTabView(g, t, at, true);
         await r.opened;
+        d.touch();
+      }
+      /* #277: setViewState({type:"empty"}) on a plugin-view tab REPLACES its view with the empty view, as stock:
+         the old view is closed (onClose/unload) and the leaf keeps its tab. Excalidraw relies on it: a drawing
+         restored before layout-ready shows "waiting for Obsidian to initialize all of your plugins" and, once
+         layout is ready, rebuilds its leaf with setViewState empty -> excalidraw. Ignoring "empty" kept the
+         waiting view, the next same-type setViewState only re-set its state, and the board never painted. */
+      async function emptyTab(leaf) {
+        const t = leaf._t, g = groupOfTab(t);
+        const r = recs.get(t); if (r) closeRec(r);
+        t.utype = "empty";
+        if (!t.lid) t.lid = (t.raw && t.raw.id) || newId();
+        const raw = { id: t.lid, type: "leaf", state: { type: "empty", state: {}, icon: "lucide-file", title: "New tab" } };
+        if (t.raw && t.raw.group) raw.group = t.raw.group;
+        t.raw = raw; t.name = "New tab";
+        if (g && activeTab(g) === t && typeof loadActive === "function") await loadActive(g);
+        else if (g && typeof renderTabs === "function") renderTabs(g);
         d.touch();
       }
       async function reveal(leaf) {
@@ -805,10 +879,53 @@
         // main.js mounts a plugin-view tab only through PVHOST: a type registered here (by a plugin or straight
         // on the registry) arms it
         try { if (typeof PVHOST !== "undefined" && !PVHOST) PVHOST = PV; } catch (_) {}
-        // tabs restored from workspace.json (kind unk) of this type come alive; a SHOWING one re-mounts now
-        for (const g of M().groups()) { const t = activeTab(g); if (t && t.kind === "unk" && t.utype === type && typeof loadActive === "function") safe("remount " + type, () => loadActive(g)); }
+        // tabs restored from workspace.json (kind unk) of this type come alive; a SHOWING one re-mounts now —
+        // except during the startup plugin load (#277): stock builds the restored layout's views only after every
+        // enabled plugin's onload, so a view never runs inside its own plugin's half-done onload. holdMount
+        // (api-core.js boot) parks the remount; mountHeld() runs it once the load is done, before layout-ready.
+        if (holdMount) heldTypes.add(type);
+        if (!holdMount) for (const g of M().groups()) { const t = activeTab(g); if (t && t.kind === "unk" && t.utype === type && typeof loadActive === "function") safe("remount " + type, () => loadActive(g)); }
         viewRegistry.trigger("view-registered", type);
         d.touch();
+      }
+      /* #277: startup plugin load. holdRestore() parks addView's remount of showing restored tabs; mountHeld()
+         lifts the hold and mounts every group's SHOWING restored tab whose type is now registered (the views
+         stock builds when it loads the layout), awaiting each view's onOpen + setState so layout-ready fires
+         after them, as stock's does. A type nobody registered stays "No view for" (nothing to mount); a
+         background restored tab still mounts on its first show (switchTab -> loadActive). Fail closed: a
+         throwing remount is logged and the next group still mounts; the hold is lifted whatever happens. */
+      let holdMount = false;
+      /* #277 review: heldTypes = types registered while held (PV.mount defers their restored views too).
+         The onOpen wait is bounded: a view whose onOpen awaits workspace.onLayoutReady would otherwise
+         wait for layout-ready, which fires only after this wait. It ends at HOLD_OPEN_MS (one deadline
+         for all groups) or at once when anything queues an onLayoutReady callback meanwhile (lrKick);
+         boot then readies the layout and that callback runs. */
+      const HOLD_OPEN_MS = 10000, heldTypes = new Set();
+      let lrWakeRes = null;
+      function lrKick() { if (lrWakeRes) { const f = lrWakeRes; lrWakeRes = null; f(false); } }
+      function holdRestore() { holdMount = true; }
+      async function mountHeld() {
+        if (!holdMount) return 0;
+        holdMount = false; heldTypes.clear();
+        let n = 0; const until = Date.now() + HOLD_OPEN_MS;
+        const lrWake = new Promise(res => { lrWakeRes = res; });
+        try {
+          for (const g of M().groups()) {
+            const t = activeTab(g);
+            if (!(t && t.kind === "unk" && types.has(t.utype) && typeof loadActive === "function")) continue;
+            try { await loadActive(g); } catch (e) { console.error("[plugin] remount " + t.utype + ":", e); continue; }
+            const r = recs.get(t);
+            if (!(r && r.opened)) continue;
+            const done = (async () => { try { await r.opened; } catch (_) {} return true; })();
+            let tm = null;
+            const ok = await Promise.race([done, lrWake,
+              new Promise(res => { tm = setTimeout(() => res(false), Math.max(0, until - Date.now())); })]);
+            clearTimeout(tm);
+            if (ok) n++;
+            else console.warn("[plugin] restore views: " + t.utype + " onOpen still pending, layout goes ready");
+          }
+        } finally { lrWakeRes = null; }
+        return n;
       }
       function dropView(type) {         // the registry forgets now; the type's leaves detach after (Obsidian detaches them)
         type = String(type);
@@ -1025,7 +1142,7 @@
         const one = r => cs(r.type) + "@" + (r.side ? r.side[0] : "t" + gs.indexOf(groupOfTab(r.t))) + (r.view.containerEl.isConnected && !r.view.containerEl.hidden && r.view.containerEl.getClientRects().length ? "+" : "-");
         return " [pview:" + nt + "|" + [...recs.values(), ...sides].map(one).join(",") + "]";
       }
-      const host = { PV, sweep, censusTok, registerView, unregisterView, viewRegistry, leavesOfType, iterateLeaves, getLeaf, getSideLeaf,
+      const host = { PV, sweep, censusTok, registerView, unregisterView, holdRestore, mountHeld, lrKick, viewRegistry, leavesOfType, iterateLeaves, getLeaf, getSideLeaf,
                      reveal, leafOfGroup, leafOfTab, bindLeaf, activeTab, groupOfTab, typeOfTab, isPvTab, recs, types, sideHide, sideShowing,
                      mainRoot, newRoot() { rootGen++; }, dock, ribbon, floating };
       const layout = { WorkspaceItem, WorkspaceParent, WorkspaceSplit, WorkspaceContainer, WorkspaceRoot, WorkspaceWindow,
@@ -1425,7 +1542,7 @@
         if (name === "file-menu" || name === "editor-menu") try { PMENU = PM; } catch (_) {}
         return super.on(name, cb, ctx);
       }
-      onLayoutReady(cb) { if (K.st.layoutReady) queueMicrotask(() => { try { cb(); } catch (e) { console.error(e); } }); else this.on("layout-ready", cb); }
+      onLayoutReady(cb) { if (K.st.layoutReady) queueMicrotask(() => { try { cb(); } catch (e) { console.error(e); } }); else { views.lrKick(); this.on("layout-ready", cb); } }
       iterateAllLeaves(cb) { views.iterateLeaves(cb, true); }
       iterateRootLeaves(cb) { views.iterateLeaves(cb, false); }
       getLeavesOfType(t) { return views.leavesOfType(String(t)); }
@@ -1594,12 +1711,15 @@
         const f = files.get(normalizePath(String(path || "")));
         return f instanceof K.TFolder ? menuHook("file-menu", m, [f, "file-explorer-context-menu", null]) : 0;
       },
-      editorMenu(e) {
+      /* host (#37, an OMenu builder): the core editor menu being built — the plugin rows join it
+         after its rows (stock: core first, then plugins). No host = the plugin-only menu of old. */
+      editorMenu(e, host) {
         const x = bridge.editor ? bridge.editor() : null;
         if (!x || !x.editor) return false;
         const m = document.createElement("div");
         m.className = "ctxmenu menu os-plugin-menu";
         if (!menuHook("editor-menu", m, [x.editor, x.view])) return false;
+        if (host) { host.plugin(m); return true; }
         if (typeof closeMenu === "function") closeMenu();
         if (typeof placeMenu === "function") placeMenu(m, e.clientX, e.clientY);
         return true;

@@ -112,6 +112,29 @@ pub fn new_token() -> String {
     format!("{}-{n:x}", std::process::id())
 }
 
+
+/* #144 toggle 12 "Restart now": a switch onto THIS window's own vault. The old process holds
+   the vault lock until it exits, so the child (and the spawner's lock probe) must know the
+   holder is the window that asked for the restart: the token names its pid,
+   `restart-<pid>-<clock>`. The child waits for the lock only while that pid is alive
+   (main.rs boot); a token naming a dead pid, or any other token, keeps the old refusal. */
+pub const RESTART_PREFIX: &str = "restart-";
+
+/// a restart token for THIS process (passes Switch::check: alnum + '-', <= 64 bytes)
+pub fn restart_token() -> String {
+    format!("{RESTART_PREFIX}{}", new_token())
+}
+
+/// the pid a restart token names (None = not a restart token)
+pub fn restart_of(token: &str) -> Option<u32> {
+    let rest = token.strip_prefix(RESTART_PREFIX)?;
+    let (pid, clock) = rest.split_once('-')?;
+    if clock.is_empty() || !clock.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    pid.parse().ok().filter(|p| *p > 1)
+}
+
 /// split `--switch=` out of argv: (the Switch if one was valid, the rest).
 /// A bad flag is reported and dropped — the window still opens, unswitched.
 pub fn take_switch(args: Vec<OsString>) -> (Option<Switch>, Vec<OsString>, Option<String>) {
@@ -158,11 +181,57 @@ pub fn await_ready(ready: impl Fn() -> bool, alive: impl Fn() -> bool, timeout: 
 
 /// is `pid` a live (non-zombie) process? Reads /proc/<pid>/stat — a read
 /// root under landlock; signals (kill 0) may be scoped there.
+///
+/// rt-wm (box hz cpx51, Fedora 44, kernel 7.1): /proc mounted
+/// `hidepid=invisible` hides every pid the caller may not ptrace, and a
+/// Landlock domain may not ptrace a process outside it — so a confined window
+/// sees NO /proc entry for the child the (unconfined) spawner started, and the
+/// old probe called a live child dead at 0 ms ("exited before it was ready";
+/// the old window stayed beside the new one). A missing entry is therefore
+/// only "dead" if kill(pid, 0) agrees: ESRCH = gone; 0 / EPERM = it exists.
+/// (The sandbox's ruleset sets no signal scope, so kill 0 is not scoped.)
+#[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         // "pid (comm) S ..." — comm may hold spaces/parens: state follows the LAST ')'
         Ok(s) => s.rfind(')').and_then(|i| s[i + 1..].trim_start().chars().next()).is_some_and(|c| c != 'Z' && c != 'X'),
-        Err(_) => false,
+        Err(_) => hidden_alive(pid),
+    }
+}
+
+/// /proc gave no answer for `pid`: ask the kernel by signal 0 (no signal sent).
+#[cfg(unix)]
+fn hidden_alive(pid: u32) -> bool {
+    let Ok(p) = libc::pid_t::try_from(pid) else { return false };
+    if p <= 0 {
+        return false; // 0 / negative would address a process GROUP
+    }
+    // SAFETY: kill with signal 0 only performs the existence/permission check.
+    if unsafe { libc::kill(p, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        fn GetExitCodeProcess(h: *mut core::ffi::c_void, code: *mut u32) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == STILL_ACTIVE
     }
 }
 
@@ -214,10 +283,14 @@ pub fn current() -> Result<Launcher, String> {
 
 /// build the Command (not spawned) — split out so the env scrub is testable.
 pub fn command(l: &Launcher, vault: &Path, sw: Option<&Switch>) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
     let (prog, args) = argv(l, vault, sw);
     let mut c = std::process::Command::new(prog);
-    c.args(args).env_remove("VAULT_DIR").stdin(std::process::Stdio::null()).process_group(0);
+    c.args(args).env_remove("VAULT_DIR").stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
     c
 }
 
@@ -355,6 +428,7 @@ mod tests {
 
     /// /proc liveness: we are alive, a reaped child is not, a zombie is not.
     #[test]
+    #[cfg(target_os = "linux")] // reads /proc/<pid>/stat
     fn switch_alive_probe_reads_proc() {
         assert!(alive(std::process::id()));
         let mut c = std::process::Command::new("/bin/true").spawn().unwrap();
@@ -365,5 +439,33 @@ mod tests {
         assert!(!alive(pid), "zombie counted as alive");
         c.wait().unwrap();
         assert!(!alive(pid), "reaped pid counted as alive");
+    }
+
+    /// rt-wm: a pid /proc does not show (hidepid + landlock) is judged by kill 0:
+    /// an absent pid stays dead, and pid 0 / overflow never address a process group.
+    #[test]
+    #[cfg(unix)]
+    fn switch_alive_hidden_pid_falls_back_to_kill0() {
+        assert!(hidden_alive(std::process::id()), "kill 0 on ourselves must see us");
+        assert!(!hidden_alive(0));
+        assert!(!hidden_alive(u32::MAX));
+        let mut c = std::process::Command::new("true").spawn().unwrap(); // PATH: /usr/bin/true on macOS
+        let pid = c.id();
+        c.wait().unwrap();
+        assert!(!hidden_alive(pid), "reaped pid counted as alive");
+    }
+
+    /// #144 toggle 12: a restart token names this pid, survives the --switch round trip,
+    /// and nothing else reads as one
+    #[test]
+    fn restart_token_names_its_pid_only() {
+        let t = restart_token();
+        assert_eq!(restart_of(&t), Some(std::process::id()));
+        let sw = Switch { x: 0, y: 0, w: 800, h: 600, max: false, token: t.clone() };
+        let back = Switch::parse(sw.to_arg().to_str().unwrap()).expect("round trip");
+        assert_eq!(restart_of(&back.token), Some(std::process::id()));
+        for bad in [new_token(), "restart-".into(), "restart-1-ab".into(), "restart-x-ab".into(), "restart-42-".into(), "restart-42-zz".into()] {
+            assert_eq!(restart_of(&bad), None, "{bad}");
+        }
     }
 }

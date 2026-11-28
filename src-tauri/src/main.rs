@@ -14,36 +14,58 @@
 use pulldown_cmark::{html, Event, LinkType, Options, Parser, Tag, TagEnd};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::State;
 
 mod appid;
+mod devperm; // devaccess: the ONE decision for every webview permission request (Settings › Security › Device access)
+mod audiorec; // #116: Audio recorder core plugin — the mic gate (audio-only, armed) and the save
+mod webmdur; // #197: a saved recording gets the Duration a live WebM muxer could not write
 mod builtins;
+mod callout; // #59: Obsidian callouts in the reading render
 use opensidian_lib::canvasfs;
 mod cfgstore;
+mod consent; // spawn-consent: native GTK prompts before trusting a vault and before every plugin spawn
+mod clip; // #37 C3-3: the editor menu clipboard rows (GTK CLIPBOARD, text only)
+mod mdtable; // #37 C3-7: the LP table menu (Row/Column/Sort/Align) as text transforms
 mod census; // census-gate (#30): the window-title census is opt-in (OPENSIDIAN_CENSUS=1 / devui)
 use opensidian_lib::datefmt;
 use opensidian_lib::graphq;
 use opensidian_lib::index;
 mod migrate;
+#[cfg(windows)]
+mod pick_win; // the system folder dialog for choosing a vault (pick_folder)
 use opensidian_lib::outline;
 mod pdf;
 mod plugins;
 mod plugin_store;
+#[cfg(windows)]
+mod http_win; // the plugin store's HTTPS client on Windows (WinHTTP), see plugin_store::http_get
+#[cfg(windows)]
+mod secrets_win; // app.secretStorage in the Windows Credential Manager, see secrets::run
+mod plugin_pins; // #251: plugin code pinned by sha256 (main.js, manifest.json, styles.css) in ~/.opensidian.json, enforced at load
 mod pasteimg;
 mod qscreate;
 mod perf;
+mod props; // #119: types.json, the vault property census, the Properties in document mode
 mod sandbox;
+#[cfg(target_os = "macos")]
+mod macos; // AppKit / WebKit / Security glue for the macOS port
 // cp-secrets: app.secretStorage over the OS keyring (Secret Service)
 mod secrets;
+mod security; // #144: Settings › Security — the one reader of the "security" key (docs/security-section.md)
 mod settings;
 mod spawn;
 mod spawner;
+mod spawn_allow; // #74: "Always allow this program" grants (key + plugin/program fingerprints) in ~/.opensidian.json
 mod desk_http;
 mod desk_net;
 mod desk_proc;
+#[cfg(test)]
+mod testutil; // shared unit-test helpers (write_exe: no ETXTBSY from a write fd a parallel fork inherited)
 #[cfg(feature = "devui")]
 mod devui; // goal devui: DEV-ONLY UI hot reload, never in a default/release build
+mod i18n; // #220: UI translations (Project Fluent) — locales/<lang>/main.ftl embedded, shared with ui/i18n.js
 mod vaultlock;
 mod srcmode;
 mod themefs;
@@ -51,6 +73,10 @@ mod updates;
 use opensidian_lib::vaultfs;
 mod watcher;
 mod winsize;
+mod reveal; // #281: a vault-boot window is shown ONCE, when the UI is in (bounded fail-open timer)
+mod wsmgr; // #94: named layouts in .obsidian/workspaces.json (Obsidian core Workspaces parity)
+mod dropticket; // #280: a native drop is a one-shot ticket; attach_files consumes it
+mod xdnd; // #51: the window's OS drop transport — only a drop naming a local file is ours, a link drag reaches the editor
 use index::{link_parts, links_in, resolve, tag_spans, Graph, Index};
 
 /* perf-index: root + in-memory Index (src/index.rs). The index replaces the
@@ -66,7 +92,7 @@ use index::{link_parts, links_in, resolve, tag_spans, Graph, Index};
    impossible by construction, not by locking discipline. */
 struct Vault {
     root: OnceLock<PathBuf>,
-    index: Mutex<Index>,
+    index: Arc<Mutex<Index>>,
     /// vaultbleed B: the flock that makes this the ONLY backend on the vault
     /// (vaultlock.rs); held until the process exits
     lock: OnceLock<vaultlock::VaultLock>,
@@ -75,7 +101,7 @@ struct Vault {
     /// baseline from its own later walk, and a note created in between was in
     /// neither the index nor any diff: never reported (the typing phase red
     /// "external create of TYPEGATE not in the tree", 4/8 runs under load).
-    seed: Mutex<Option<watcher::Snapshot>>,
+    seed: Arc<Mutex<Option<watcher::Snapshot>>>,
 }
 
 fn cur_vault(v: &Vault) -> Option<PathBuf> {
@@ -119,12 +145,15 @@ fn bind_vault(v: &Vault, p: &Path) -> Result<(), String> {
 enum BindErr {
     Bound(PathBuf, PathBuf),
     Lock(vaultlock::LockErr),
+    /// #293: the sandbox was asked for and is not in force (sandbox::boot_may_bind)
+    Sandbox(String),
 }
 impl std::fmt::Display for BindErr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             BindErr::Bound(cur, p) => write!(f, "this window already has a vault open ({}); open {} in a new window", cur.display(), p.display()),
             BindErr::Lock(e) => write!(f, "{e}"),
+            BindErr::Sandbox(why) => write!(f, "{} {why}", sandbox::REFUSED_HEAD),
         }
     }
 }
@@ -134,6 +163,21 @@ impl std::fmt::Display for BindErr {
 /// process, vaultbleed B) -> claim the root. The lock is stored only after the
 /// root claim succeeded; a failed claim drops (releases) it.
 fn bind_vault_locked(v: &Vault, p: &Path, lock_dir: &Path) -> Result<(), BindErr> {
+    claim_vault(v, p, lock_dir)?;
+    let (base, ix) = index_vault(p);
+    *v.index.lock().unwrap() = ix;
+    *v.seed.lock().unwrap() = Some(base);
+    Ok(())
+}
+
+/// The claim half of a bind: everything but the walk + index (refuse if bound,
+/// flock, set-once root, built-in themes, app.json).
+fn claim_vault(v: &Vault, p: &Path, lock_dir: &Path) -> Result<(), BindErr> {
+    // #293: every bind (boot, picker, create) consults the ONE decision first: asked for and
+    // not in force binds nothing — before the lock, the root or any vault write
+    if let sandbox::BootBind::Refuse(why) = sandbox::boot_may_bind(sandbox::landlock_enabled(), sandbox::outcome()) {
+        return Err(BindErr::Sandbox(why));
+    }
     if let Some(cur) = cur_vault(v) {
         return Err(BindErr::Bound(cur, p.to_path_buf()));
     }
@@ -147,12 +191,70 @@ fn bind_vault_locked(v: &Vault, p: &Path, lock_dir: &Path) -> Result<(), BindErr
     // dirs. Seeding writes only paths that do not exist (builtins.rs).
     builtins::seed_and_record(p);
     ensure_app_json(p);
-    let base = watcher::snapshot(p); // the watcher baseline: walked first, so nothing created after it is missed
-    let ix = span_timed!("index_build", Index::build(p), serde_json::json!({"notes": 0}));
-    *v.index.lock().unwrap() = ix;
-    *v.seed.lock().unwrap() = Some(base);
     Ok(())
 }
+
+/// The index half of a bind: the watcher baseline, walked first so nothing
+/// created after it is missed, then the one walk + read of every note.
+fn index_vault(p: &Path) -> (watcher::Snapshot, Index) {
+    let base = watcher::snapshot(p);
+    let ix = span_timed!("index_build", Index::build(p), serde_json::json!({"notes": 0}));
+    (base, ix)
+}
+
+/// issue #106: the BOOT bind (VAULT_DIR / argv / last vault). The claim is
+/// synchronous (a Busy or bad vault still exits before any window), but the
+/// walk + index of a big vault no longer runs in front of the window: a worker
+/// thread takes the index and seed locks FIRST — main waits only for that
+/// handshake — and fills them, while webkit starts and loads the page in
+/// parallel. Every reader (each command, the watcher's first tick) goes
+/// through `v.index.lock()` / `v.seed.lock()`, so it blocks until the build
+/// is in and never sees the empty index: same answers, same order (baseline
+/// before index), only overlapped with the webview start. A thread that
+/// cannot be spawned falls back to the synchronous build.
+fn bind_vault_boot(v: &Vault, p: &Path, lock_dir: &Path) -> Result<(), BindErr> {
+    claim_vault(v, p, lock_dir)?;
+    let (index, seed, root) = (Arc::clone(&v.index), Arc::clone(&v.seed), p.to_path_buf());
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new().name("index-build".into()).spawn(move || {
+        let mut sg = seed.lock().unwrap();
+        let mut ig = index.lock().unwrap();
+        let _ = held_tx.send(()); // both locks held: main may go on
+        let (base, ix) = index_vault(&root);
+        *ig = ix;
+        *sg = Some(base);
+    });
+    // Ok(()) = the worker holds both locks; Err = it ended (panicked) before
+    // taking them, or never started: build here, as before.
+    if spawned.is_err() || held_rx.recv().is_err() {
+        let (base, ix) = index_vault(p);
+        *v.index.lock().unwrap_or_else(|e| e.into_inner()) = ix;
+        *v.seed.lock().unwrap_or_else(|e| e.into_inner()) = Some(base);
+    }
+    Ok(())
+}
+/// #144 toggle 12 "Restart now": the old window (`restart`, the pid its --switch token names)
+/// holds the vault lock until it exits right after spawning us. While THAT pid is alive a busy
+/// lock is waited for (bounded, RESTART_LOCK_WAIT); once it is gone one last try decides. Any
+/// other boot (no restart token) keeps the immediate refusal.
+const RESTART_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+fn bind_vault_boot_after(v: &Vault, p: &Path, lock_dir: &Path, restart: Option<u32>) -> Result<(), BindErr> {
+    let t0 = std::time::Instant::now();
+    loop {
+        match bind_vault_boot(v, p, lock_dir) {
+            Err(BindErr::Lock(vaultlock::LockErr::Busy(_))) if restart.is_some_and(spawn::alive) && t0.elapsed() < RESTART_LOCK_WAIT => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(BindErr::Lock(vaultlock::LockErr::Busy(_))) if restart.is_some() && t0.elapsed() < RESTART_LOCK_WAIT => {
+                // the old window just exited: the kernel dropped its flock, one last try
+                eprintln!("[sec] restart: pid={} gone after {}ms, taking the vault", restart.unwrap_or(0), t0.elapsed().as_millis());
+                return bind_vault_boot(v, p, lock_dir);
+            }
+            r => return r,
+        }
+    }
+}
+
 /// census C4 (make-md): an opened vault always carries `.obsidian/app.json` —
 /// stock materializes it on open, so a plugin that reads it straight through
 /// the adapter (make-md: adapter.read(configDir + "/app.json")) gets `{}` on a
@@ -226,10 +328,6 @@ fn note_path_in(root: &Path, name: &str, create: bool) -> Option<PathBuf> {
     Some(p)
 }
 
-fn note_path(v: &State<Vault>, name: &str, create: bool) -> Option<PathBuf> {
-    note_path_in(&cur_vault(v)?, name, create)
-}
-
 /* ---- R29 image embeds: the vault-contained byte server ------------------
    The attacker's input here is a .md file that arrived by sync/clone/share,
    so a rendered document decides which path we read. The containment rule is
@@ -239,18 +337,59 @@ fn note_path(v: &State<Vault>, name: &str, create: bool) -> Option<PathBuf> {
    /etc and /usr for reading and sandbox.rs:94 reports it unsupported on this
    kernel; it is defence in depth that is currently absent.                */
 
-/// R29.8: what v1 serves — Obsidian's list minus `svg` (scriptable, and we have
-/// no sanitizer), `bmp` and `avif` (scope only). ext -> Content-Type.
-const IMG_TYPES: [(&str, &str); 5] = [
+/// R29.8: what is served — Obsidian's list minus `bmp` and `avif` (scope only).
+/// ext -> Content-Type.
+///
+/// `svg` was left out of v1 as scriptable with no sanitizer here. It is served
+/// now WITHOUT a sanitizer, because the page never lets an SVG run as a
+/// document: every place that shows one does it through `<img>` (image_html,
+/// editor.js imgEl, the canvas image card), and an SVG loaded as an image runs
+/// no script and fetches nothing, in WebKit and Chromium alike. Two fences
+/// stand behind that, in case some later code puts the URL somewhere else:
+///   - the page CSP keeps the image scheme out of frame/object/script sources
+///     (default-src 'self'), and navigation to it is refused (nav_allowed);
+///   - the SVG response itself carries `SVG_CSP` (below), a sandbox with no
+///     script and no network, so even opened as a document it is inert.
+const IMG_TYPES: [(&str, &str); 6] = [
     ("png", "image/png"),
     ("jpg", "image/jpeg"),
     ("jpeg", "image/jpeg"),
     ("gif", "image/gif"),
     ("webp", "image/webp"),
+    ("svg", "image/svg+xml"),
 ];
+
+/// The Content-Security-Policy every SVG response carries (see IMG_TYPES): no
+/// script, no network, no frames; only its own inline styles and data: images
+/// and fonts, which Illustrator-style exports embed.
+const SVG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; sandbox";
+
+/// #276: the headers EVERY vault-image response carries, in one place so a
+/// unit test can pin them. `mime` is IMG_TYPES' Content-Type; an SVG (a
+/// document format) additionally gets SVG_CSP, so it stays inert even if it
+/// is ever opened as a document instead of through `<img>`.
+fn img_headers(mime: &'static str) -> Vec<(&'static str, &'static str)> {
+    let mut h = vec![("Content-Type", mime), ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")];
+    if mime == "image/svg+xml" {
+        h.push(("Content-Security-Policy", SVG_CSP));
+    }
+    h
+}
 
 /// the scheme our images are served on; the CSP names it exactly (R29 / S1)
 const IMG_SCHEME: &str = "opensidian-img";
+/// WebView2 serves a custom protocol as http://<scheme>.localhost/... (not <scheme>://localhost/...);
+/// WebKitGTK and WKWebView keep the scheme form. One helper, so image_html and the CSP origins agree.
+fn custom_scheme_url(scheme: &str, path: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("http://{scheme}.localhost/{path}")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{scheme}://localhost/{path}")
+    }
+}
 
 /// R29.10: the label the R29.4 banner carries in place of a REMOTE target.
 /// Both engines paint the same sentence (ui/editor.js `imgEl` sets it as
@@ -320,6 +459,7 @@ fn pct_decode(s: &str) -> Option<String> {
 ///     genuinely symlinked vault (req S2) working;
 ///  5. the LEAF must not be a symlink — that is the symlink-inside-the-vault-
 ///     pointing-out case, which canonicalizing the dir alone would not catch.
+#[cfg_attr(not(test), allow(dead_code))] // the R29.5 rule as a path check (tests); serving is contained_open (#250)
 fn img_path_in(root: &Path, target: &str) -> Option<PathBuf> {
     contained_in(root, target, |ext| IMG_TYPES.iter().any(|(e, _)| *e == ext), MAX_IMG_BYTES)
 }
@@ -329,21 +469,15 @@ fn img_path_in(root: &Path, target: &str) -> Option<PathBuf> {
 /// and the cap (`pdf::MAX_PDF_BYTES`) differ — so a PDF embed cannot escape by
 /// any route an image embed cannot (README "security design": `../`, `%2e%2e`,
 /// absolute, hidden, symlinked leaf, symlinked dir out of the vault).
+#[cfg_attr(not(test), allow(dead_code))]
 fn pdf_path_in(root: &Path, target: &str) -> Option<PathBuf> {
     contained_in(root, target, |ext| ext == pdf::PDF_EXT, pdf::MAX_PDF_BYTES)
 }
 
 /// the shared body of `img_path_in` / `pdf_path_in` (steps 1-5 above).
+#[cfg_attr(not(test), allow(dead_code))]
 fn contained_in(root: &Path, target: &str, ext_ok: impl Fn(&str) -> bool, cap: u64) -> Option<PathBuf> {
-    let dec = pct_decode(target)?;
-    if dec.contains('\0') {
-        return None;
-    }
-    let rel = safe_rel(&dec)?;
-    let ext = rel.extension()?.to_str()?.to_ascii_lowercase();
-    if !ext_ok(&ext) {
-        return None;
-    }
+    let rel = contained_rel(target, ext_ok)?;
     let croot = root.canonicalize().ok()?;
     let cdir = root.join(rel.parent().unwrap_or(Path::new(""))).canonicalize().ok()?;
     if !cdir.starts_with(&croot) {
@@ -357,14 +491,50 @@ fn contained_in(root: &Path, target: &str, ext_ok: impl Fn(&str) -> bool, cap: u
     Some(p)
 }
 
+/// steps 1-3 above: the lexical part of the rule (decode, NUL, `safe_rel`,
+/// extension allowlist) -> the vault-relative path
+fn contained_rel(target: &str, ext_ok: impl Fn(&str) -> bool) -> Option<PathBuf> {
+    let dec = pct_decode(target)?;
+    if dec.contains('\0') {
+        return None;
+    }
+    let rel = safe_rel(&dec)?;
+    let ext = rel.extension()?.to_str()?.to_ascii_lowercase();
+    if !ext_ok(&ext) {
+        return None;
+    }
+    Some(rel)
+}
+
+/// #250 (audit F-9): what the app SERVES goes through here, not through the
+/// path check above. Steps 1-3, then the file is OPENED by `vaultfs` (the
+/// openat walk from the vault fd, O_NOFOLLOW at every component and on the
+/// leaf, O_NONBLOCK, regular file by fstat on the fd) and the cap is checked
+/// on that fd. The caller reads (or queues) THAT fd: no path is resolved
+/// again between the check and the read, so a leaf or folder swapped for a
+/// symlink afterwards cannot redirect it. Stricter than step 4 on purpose: a
+/// symlinked folder is refused even when it points back inside the vault
+/// (the note index never lists files below one either).
+fn contained_open(root: &Path, target: &str, ext_ok: impl Fn(&str) -> bool, cap: u64) -> Option<(PathBuf, fs::File)> {
+    let rel = contained_rel(target, ext_ok)?;
+    let f = vaultfs::Vault::open(root).ok()?.open_read(&rel).ok()?;
+    (f.metadata().ok()?.len() <= cap).then_some((rel, f))
+}
+
+/// #250: the opened PDF for an embed target (the `pdf_path_in` rule, fd-based)
+fn pdf_open_in(root: &Path, target: &str) -> Option<fs::File> {
+    contained_open(root, target, |ext| ext == pdf::PDF_EXT, pdf::MAX_PDF_BYTES).map(|(_, f)| f)
+}
+
 /// R29: bytes + Content-Type for a contained image, or None. The type comes
 /// from OUR allowlist, never from the file, and the response is served
 /// `nosniff` so a mislabeled blob cannot be re-interpreted as script.
+/// #250: read from the fd `contained_open` checked, capped on that fd.
 fn serve_image(root: &Path, target: &str) -> Option<(&'static str, Vec<u8>)> {
-    let p = img_path_in(root, target)?;
-    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    let (rel, f) = contained_open(root, target, |ext| IMG_TYPES.iter().any(|(e, _)| *e == ext), MAX_IMG_BYTES)?;
+    let ext = rel.extension()?.to_str()?.to_ascii_lowercase();
     let mime = IMG_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, m)| *m)?;
-    Some((mime, fs::read(&p).ok()?))
+    Some((mime, vaultfs::read_fd(f, MAX_IMG_BYTES).ok()?))
 }
 
 /// percent-ENCODE a vault-relative path for the `opensidian-img:` URL. Unreserved
@@ -394,7 +564,7 @@ fn pct_encode(s: &str) -> String {
    inside the vault), and the type comes from OUR list. */
 
 /// ext -> Content-Type. Anything not listed is refused.
-const MEDIA_TYPES: [(&str, &str); 12] = [
+const MEDIA_TYPES: [(&str, &str); 13] = [
     ("mp3", "audio/mpeg"),
     ("m4a", "audio/mp4"),
     ("ogg", "audio/ogg"),
@@ -402,6 +572,7 @@ const MEDIA_TYPES: [(&str, &str); 12] = [
     ("opus", "audio/ogg"),
     ("wav", "audio/wav"),
     ("flac", "audio/flac"),
+    ("3gp", "audio/3gpp"), // #116: stock audio embed set (canvasfs MEDIA_EXTS too)
     ("webm", "video/webm"),
     ("mp4", "video/mp4"),
     ("m4v", "video/mp4"),
@@ -425,6 +596,7 @@ fn media_mime(ext: &str) -> Option<&'static str> {
 /// openat(O_NOFOLLOW) per component, and check the OPENED fd is a regular
 /// file (O_NONBLOCK so a FIFO cannot hang the open). No path is re-resolved
 /// between the check and the read.
+#[cfg(unix)]
 fn media_open(root: &Path, rel: &Path) -> Option<fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -456,6 +628,14 @@ fn media_open(root: &Path, rel: &Path) -> Option<fs::File> {
     }
     let f = fs::File::from(open_at(dir.as_raw_fd(), leaf, libc::O_RDONLY | libc::O_NONBLOCK)?);
     f.metadata().ok()?.is_file().then_some(f)
+}
+
+/// Windows: the same refusals through vaultfs's handle walk (every component opened as itself, a
+/// reparse point refused), and the OPENED handle must be a regular file.
+#[cfg(windows)]
+fn media_open(root: &Path, rel: &Path) -> Option<fs::File> {
+    let v = vaultfs::Vault::open(root).ok()?;
+    v.open_read(rel).ok().filter(|f| f.metadata().map(|m| m.is_file()).unwrap_or(false))
 }
 
 /// cvf-mediasrv (ruling 1.2): rename ONE media file inside the vault — the
@@ -530,6 +710,7 @@ fn media_read_in(root: &Path, path: &str, offset: u64) -> Result<(u64, Vec<u8>),
 #[tauri::command]
 fn media_read(v: State<Vault>, path: String, offset: u64) -> Result<tauri::ipc::Response, String> {
     span_timed!("media_read", (|| {
+        media_allowed("media_read")?;
         let root = cur_vault(&v).ok_or("no vault open")?;
         let (size, body) = media_read_in(&root, &path, offset)?;
         let mut out = Vec::with_capacity(8 + body.len());
@@ -559,6 +740,21 @@ fn media_read(v: State<Vault>, path: String, offset: u64) -> Result<tauri::ipc::
 /// itself never reaches the DOM: an attribute a note controls is a beacon the
 /// moment some later CSS/JS reads it.
 fn image_html(imgs: &[String], target: &str, alt: &str) -> String {
+    if is_remote_img(target) {
+        // #144 toggle 1 (Load external resources), layer 1. On: an https target mints
+        // its element with the URL (the CSP's img-src / media-src carry https: only
+        // then — security::csp_remote). Off (default) or http://: R29.4's banner, the
+        // URL never reaches the DOM, and the banner names the setting that is the cause.
+        let on = security::remote_on();
+        if on && url_scheme(target).as_deref() == Some("https") {
+            return remote_html(target, alt);
+        }
+        let why = if on { security::REMOTE_HTTP_ONLY_HTTPS.to_string() } else { security::remote_off_text() };
+        return format!(
+            "<span class=\"imgmiss\" data-sec=\"remoteMedia\">\u{201c}{REMOTE_IMG_LABEL}\u{201d} was blocked. <span class=\"secwhy\">{}</span></span>",
+            esc(&why)
+        );
+    }
     if url_scheme(target).is_some() {
         return format!(
             "<span class=\"imgmiss\">\u{201c}{REMOTE_IMG_LABEL}\u{201d} could not be found.</span>"
@@ -570,11 +766,17 @@ fn image_html(imgs: &[String], target: &str, alt: &str) -> String {
     if is_pdf_target(path) {
         return pdf_html(imgs, path, frag, alt);
     }
+    // #116: `![](x.webm)` — an audio player (no fragment form), like `![[x.webm]]`
+    if frag.is_empty() && !target.contains('#') && is_audio_target(path) {
+        return audio_html(path, alt);
+    }
     let dec = pct_decode(target).unwrap_or_else(|| target.to_string());
     match index::resolve(imgs, &dec).map(|i| &imgs[i]) {
+        // #144 toggle 4 off: a resolved vault image gets the placeholder, never a URL
+        Some(rel) if !security::media_on() => media_off_html(rel),
         Some(rel) => format!(
-            "<img class=\"vimg\" src=\"{IMG_SCHEME}://localhost/{}\" alt=\"{}\">",
-            pct_encode(rel),
+            "<img class=\"vimg\" src=\"{}\" alt=\"{}\">",
+            custom_scheme_url(IMG_SCHEME, &pct_encode(rel)),
             esc(alt)
         ),
         None => format!(
@@ -582,6 +784,61 @@ fn image_html(imgs: &[String], target: &str, alt: &str) -> String {
             esc(target)
         ),
     }
+}
+
+/// #144 toggle 4 OFF: the placeholder an image / PDF / audio embed gets instead of its element.
+/// `name` = the file's last path component (escaped); no URL, no data-* path reaches the DOM.
+fn media_off_html(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    format!(
+        "<span class=\"imgmiss secmedia\" data-sec=\"vaultMedia\">{} \u{2014} {} <span class=\"secwhy\">{}</span></span>",
+        esc(base),
+        security::MEDIA_OFF,
+        esc(&security::named("vaultMedia"))
+    )
+}
+
+/// #144 toggle 1 ON: the element for an https:// embed. Audio / video by the path's
+/// extension (query / fragment ignored), everything else an image. preload none +
+/// lazy + no-referrer: rendering a note sends no Referer and a player fetches only on Play.
+fn remote_html(url: &str, alt: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let (u, a) = (esc(url), esc(alt));
+    if ["mp4", "m4v", "mov", "ogv"].contains(&ext.as_str()) {
+        format!("<video class=\"rmedia\" controls preload=\"none\" src=\"{u}\" title=\"{a}\"></video>")
+    } else if AUDIO_EXTS.contains(&ext.as_str()) {
+        format!("<audio class=\"rmedia\" controls preload=\"none\" src=\"{u}\" title=\"{a}\"></audio>")
+    } else {
+        format!("<img class=\"rimg\" src=\"{u}\" alt=\"{a}\" loading=\"lazy\" referrerpolicy=\"no-referrer\">")
+    }
+}
+
+/// #116 audio embeds: the extensions `![[x.webm]]` / `![](x.mp3)` play as an <audio> player
+/// (stock's audio set; ui/editor.js Ed.AUDIO_EXTS is the same list)
+const AUDIO_EXTS: [&str; 7] = ["mp3", "webm", "wav", "m4a", "ogg", "3gp", "flac"];
+
+/// #116: is this embed target an audio file (`![[Recording 20261115.webm]]`)?
+fn is_audio_target(target: &str) -> bool {
+    target
+        .rsplit_once('.')
+        .is_some_and(|(s, e)| !s.is_empty() && AUDIO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// #116: the html for ONE audio embed — an EMPTY span carrying the note's target (escaped) and the
+/// alt; ui/editor.js Ed.audioFill resolves the target against the vault's media list (canvas_io
+/// media, the same list live preview uses) and builds the <audio>, so both views paint one element.
+/// No path is minted here: an unresolved or escaping target gets no player, only the banner.
+fn audio_html(target: &str, alt: &str) -> String {
+    // #144 toggle 4 off: no span for Ed.audioFill to resolve — the placeholder (target's name only)
+    if !security::media_on() {
+        return media_off_html(&pct_decode(target).unwrap_or_else(|| target.to_string()));
+    }
+    format!(
+        "<span class=\"internal-embed media-embed audio-embed\" data-target=\"{}\" data-alt=\"{}\"></span>",
+        esc(target),
+        esc(alt)
+    )
 }
 
 /// pdfembed: `#page=N`, `#height=N`, `#page=N&height=N` -> (page, height).
@@ -611,6 +868,8 @@ fn pdf_frag(frag: &str) -> (usize, Option<u32>) {
 fn pdf_html(imgs: &[String], target: &str, frag: &str, alt: &str) -> String {
     let dec = pct_decode(target).unwrap_or_else(|| target.to_string());
     match index::resolve(imgs, &dec).map(|i| &imgs[i]).filter(|r| is_pdf_target(r)) {
+        // #144 toggle 4 off: no data-pdf for Ed.pdfFill (pdf_info would refuse anyway)
+        Some(rel) if !security::media_on() => media_off_html(rel),
         Some(rel) => {
             let (page, h) = pdf_frag(frag);
             format!(
@@ -652,9 +911,11 @@ fn is_pdf_target(target: &str) -> bool {
 /// i.e. what the frame waits for before it can size itself.
 #[tauri::command]
 async fn pdf_info(v: State<'_, Vault>, path: String, otel: Option<perf::Ctx>) -> Result<Option<pdf::Info>, String> {
-    let Some(p) = cur_vault(&v).and_then(|r| pdf_path_in(&r, &path)) else { return Ok(None) };
+    // #144 toggle 4: refused BEFORE the path is resolved or the worker queued
+    media_allowed("pdf_info")?;
+    let Some(f) = cur_vault(&v).and_then(|r| pdf_open_in(&r, &path)) else { return Ok(None) };
     let (tx, rx) = std::sync::mpsc::channel();
-    pdf::queue_info(p, Box::new(move |i| {
+    pdf::queue_info_file(f, Box::new(move |i| {
         let _ = tx.send(i);
     }));
     span_timed!(otel => "pdf_info", tauri::async_runtime::spawn_blocking(move || rx.recv().ok().flatten()).await)
@@ -667,8 +928,8 @@ async fn pdf_info(v: State<'_, Vault>, path: String, otel: Option<perf::Ctx>) ->
    here. The whole behaviour lives in `attach_drop` below: it takes the vault,
    the note being edited and the dropped paths, MOVES what it is allowed to
    move and RETURNS the text to insert. The Tauri command and the
-   WindowEvent::DragDrop handler are pass-throughs. The transport (a real XDND
-   drag from another X client -> wry/WebKitGTK -> WindowEvent::DragDrop ->
+   drop transport (xdnd.rs) are pass-throughs. The transport (a real XDND
+   drag from another X client -> WebKitGTK -> xdnd (a local-file uri-list only, #51) ->
    `drop-files` -> attach_files) is exercised end to end by the release-
    mandatory gate phase `osdrop`, which drags with real pointer input.
 
@@ -789,7 +1050,7 @@ struct Attached {
 /// root with a visible notice, never silently. Returns (dir, notice).
 fn attach_dir(root: &Path) -> Result<(PathBuf, Option<String>), DropErr> {
     let croot = root.canonicalize().map_err(|_| DropErr::BadAttachDir)?;
-    let cfg = fs::read_to_string(root.join(".obsidian/app.json")).unwrap_or_default();
+    let cfg = vcfg_read(root, ".obsidian/app.json").unwrap_or_default();
     let want = serde_json::from_str::<serde_json::Value>(&cfg)
         .ok()
         .and_then(|v| v.get("attachmentFolderPath")?.as_str().map(str::to_string))
@@ -863,7 +1124,7 @@ fn attach_drop(root: &Path, note: &str, paths: &[PathBuf]) -> Result<Attached, D
     let (dir, notice) = attach_dir(root)?;
     let croot = root.canonicalize().map_err(|_| DropErr::BadAttachDir)?;
     let rel_path = dir.strip_prefix(&croot).map_err(|_| DropErr::BadAttachDir)?.to_path_buf();
-    let rel_dir = rel_path.display().to_string();
+    let rel_dir = vaultfs::rel_slash(&rel_path);
     // audit #6: every create/rename/unlink below is relative to this dir fd
     let vfs = vaultfs::Vault::open(root).map_err(|_| DropErr::BadAttachDir)?;
     let mut out = Attached::default();
@@ -947,22 +1208,61 @@ fn attach_one(vfs: &vaultfs::Vault, dir: &Path, p: &Path) -> Result<(String, Opt
    async runtime instead of the event loop (rule of order: no lag the user can
    feel). The index learns the copied images here because BOTH renderers
    resolve `![[x.png]]` against `Index::images()` (R29.11) — a file copied but
-   not indexed would not paint. */
+   not indexed would not paint.
+   #280: the page no longer names the paths. The native drop transport (xdnd.rs) stored them
+   under a one-shot ticket (dropticket.rs) and the page only got that ticket + the display
+   names; this command takes the ticket and consumes it (attach_ticket). A raw path, an
+   unknown, reused, expired or other-window ticket is refused before anything is touched. */
 #[tauri::command]
 async fn attach_files(
+    win: tauri::Window,
     v: State<'_, Vault>,
     note: String,
-    paths: Vec<PathBuf>,
+    ticket: String,
     otel: Option<perf::Ctx>,
 ) -> Result<Attached, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
-    let n = paths.len();
-    let a = span_timed!(otel => "attach_files", attach_drop(&root, &note, &paths), serde_json::json!({"files": n}))
-        .map_err(|e| e.say())?;
+    let a = span_timed!(otel => "attach_files", attach_ticket(&root, &note, win.label(), &ticket), serde_json::json!({}))?;
+    index_attached(&v, &a);
+    Ok(a)
+}
+
+/// #280 THE gate in front of attach_drop for a drop: the paths come from the ticket the
+/// native drop minted, never from the caller. The ticket is consumed first (single use,
+/// whatever happens next); an Err here has moved, copied and created nothing.
+fn attach_ticket(root: &Path, note: &str, win: &str, ticket: &str) -> Result<Attached, String> {
+    let paths = dropticket::take(win, ticket).map_err(|e| {
+        eprintln!("[osdrop] attach_files refused: {e:?}");
+        e.say()
+    })?;
+    attach_drop(root, note, &paths).map_err(|e| e.say())
+}
+
+/// R29.11: both renderers resolve ![[x.png]] against the index, so it learns what landed
+fn index_attached(v: &Vault, a: &Attached) {
     let mut ix = v.index.lock().unwrap();
     for rel in &a.copied {
         ix.add_image(rel);
     }
+}
+
+/* #280 R31.7 "Insert attachment" (the typed path, the keyboard road for people and probes
+   with no pointer) names its path in the PAGE, so it cannot be told apart from a script
+   calling it. It is therefore no drop and gets no ticket: the user confirms the exact path
+   in a NATIVE dialog (consent::Kind::Attach, default answer Cancel) before attach_drop
+   runs; every rule after that is the drop's. No dialog = nothing attached (fail closed). */
+#[tauri::command]
+async fn attach_typed(win: tauri::Window, v: State<'_, Vault>, note: String, path: String) -> Result<Attached, String> {
+    let root = cur_vault(&v).ok_or("no vault open")?;
+    if path.trim().is_empty() {
+        return Err(DropErr::Empty.say());
+    }
+    let slot = consent::admit()?;
+    if !consent::ask(slot, win, consent::Kind::Attach, consent::attach_question(&path, &note)).await? {
+        return Err("attach cancelled".into());
+    }
+    let a = attach_drop(&root, &note, &[PathBuf::from(&path)]).map_err(|e| e.say())?;
+    index_attached(&v, &a);
     Ok(a)
 }
 
@@ -996,14 +1296,372 @@ async fn paste_image(
     })(), serde_json::json!({"b64": data.len()}))
 }
 
-/// S5: read a note off disk, "" when it is oversized (never part of the vault)
-fn read_capped(p: &Path) -> Option<String> {
-    let m = fs::symlink_metadata(p).ok()?;
-    if m.len() > index::MAX_NOTE_BYTES {
-        index::warn_oversized(p);
-        return None;
+/* #116 Audio recorder — the IPC half of audiorec.rs. audio_token hands the
+   per-page-load secret to its FIRST caller (the core recorder in ui/main.js, at
+   boot, before any plugin script); audio_rec_start / audio_rec_stop need it.
+   #136: the capture itself runs in the hidden recorder webview `rec-<window>`
+   (ui/recorder.html, audiorec.rs "EXCLUSIVE MIC"): the app window's gate denies
+   every capture request, so a plugin of the app page never receives a stream.
+     app window                         recorder webview (rec-<label>)
+     audio_rec_start(token) ─ builds ─> audio_rec_go       (gate connected + armed)
+            <──── ok / "<Error>: msg" ─ audio_rec_started  (getUserMedia + MediaRecorder)
+     audio_rec_stop(token, note, tm) ─> audio_rec_started returns (= stop)
+            <──────── base64 webm ───── audio_rec_data
+     -> mic off + webview destroyed -> save (audio_save rules) -> the embed
+   The recorder-side commands answer only a webview whose label is rec-<parent>
+   while <parent> has a session; a label is the webview's, not the caller's choice. */
+#[tauri::command]
+fn audio_token(win: tauri::WebviewWindow) -> Result<String, String> {
+    audiorec::token(win.label())
+}
+
+/// how long the app window waits for its recorder page: to start, and for the data after a stop
+const REC_START_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+const REC_DATA_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// the recorder webview of app window `parent`: microphone off, webview gone, session dropped
+fn rec_close(app: &tauri::AppHandle, parent: &str) {
+    use tauri::Manager;
+    audiorec::sess_drop(parent);
+    if audiorec::indicator_on(parent) {
+        match app.get_webview_window(parent) {
+            Some(w) => rec_indicator(&w, false),
+            None => {
+                audiorec::indicator_set(parent, false);
+            }
+        }
     }
-    fs::read_to_string(p).ok()
+    if let Some(rw) = app.get_webview_window(&audiorec::rec_label(parent)) {
+        let _ = audiorec::mic_off(&rw); // reason: the webview is destroyed next either way
+        audiorec::rec_offscreen_drop(&rw);
+        if let Err(e) = rw.destroy() {
+            eprintln!("[audiorec] recorder webview not closed: {e}");
+        }
+    }
+}
+
+/* #295 (audit F-8) the recording indicator the page cannot hide: while app window <label>
+   records, its NATIVE window title starts with audiorec::REC_MARK ("● Recording — "). Chosen over
+   a tray icon / desktop notification because the app has neither (no tray-icon feature, no
+   notification plugin: adding one = a new dependency), while the title is what the window manager,
+   the taskbar and the window switcher show on both platforms and is set from Rust here.
+   - Linux (GTK): a notify::title handler on the GtkWindow re-applies the mark on EVERY title change,
+     synchronously, so the page's own setTitle (pushTitle, or a plugin's) cannot drop it; removed
+     with the mark when the recording ends (rec_close).
+   - macOS / other: no title-change hook in our code, so a thread re-applies the mark every
+     audiorec::REC_MARK_TICK while the recording lasts; macOS also shows its own system
+     microphone-in-use indicator (menu bar), which no app code can hide. */
+#[cfg(target_os = "linux")]
+thread_local! {
+    static REC_TITLE_HOOK: std::cell::RefCell<std::collections::HashMap<String, gtk::glib::SignalHandlerId>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(target_os = "linux")]
+fn rec_indicator(win: &tauri::WebviewWindow, on: bool) {
+    audiorec::indicator_set(win.label(), on);
+    let w2 = win.clone();
+    let r = win.run_on_main_thread(move || {
+        use gtk::glib::prelude::ObjectExt;
+        use gtk::prelude::GtkWindowExt;
+        let Ok(gw) = w2.gtk_window() else {
+            eprintln!("[audiorec] indicator: no GTK window for {}", w2.label());
+            return;
+        };
+        // devaccess: both marks in one fixed order (audiorec::title_with), so this hook and the
+        // camera hook (audiorec::cam_hook) always aim at the same title
+        let lab = w2.label().to_string();
+        let fix = move |gw: &gtk::ApplicationWindow, on: bool| {
+            let cur = gw.title().map(|t| t.to_string()).unwrap_or_default();
+            if let Some(t) = audiorec::title_with(&cur, on, audiorec::cam_on(&lab)) {
+                gw.set_title(&t);
+            }
+        };
+        let label = w2.label().to_string();
+        REC_TITLE_HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(id) = h.remove(&label) {
+                gw.disconnect(id);
+            }
+            fix(&gw, on);
+            if on {
+                let id = gw.connect_notify_local(Some("title"), move |gw, _| fix(gw, true));
+                h.insert(label, id);
+            }
+        });
+        eprintln!("[audiorec] indicator {}: {}", w2.label(), if on { "on" } else { "off" });
+    });
+    if let Err(e) = r {
+        eprintln!("[audiorec] indicator not applied: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rec_indicator(win: &tauri::WebviewWindow, on: bool) {
+    let gen = audiorec::indicator_set(win.label(), on);
+    let fix = |w: &tauri::WebviewWindow, on: bool| {
+        if let Ok(cur) = w.title() {
+            if let Some(t) = audiorec::title_with(&cur, on, audiorec::cam_on(w.label())) {
+                let _ = w.set_title(&t); // reason: a window being destroyed takes its title with it
+            }
+        }
+    };
+    fix(win, on);
+    if let Some(gen) = gen {
+        let w = win.clone();
+        std::thread::spawn(move || {
+            while audiorec::indicator_live(w.label(), gen) {
+                fix(&w, true);
+                std::thread::sleep(audiorec::REC_MARK_TICK);
+            }
+            // a re-apply that raced the off: take the mark down again (unless a new recording runs)
+            if !audiorec::indicator_on(w.label()) {
+                fix(&w, false);
+            }
+        });
+    }
+    eprintln!("[audiorec] indicator {}: {}", win.label(), if on { "on" } else { "off" });
+}
+
+/// block (off the async runtime) on a hand-off from the recorder page
+async fn rec_recv<T: Send + 'static>(rx: std::sync::mpsc::Receiver<T>, wait: std::time::Duration) -> Option<T> {
+    tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(wait).ok()).await.ok().flatten()
+}
+
+/// start a recording: a fresh recorder webview, armed for ONE audio-only request; Ok once it records,
+/// Err("<DOMException name>: <message>") when it could not (the webview is closed again)
+#[tauri::command]
+async fn audio_rec_start(app: tauri::AppHandle, win: tauri::WebviewWindow, token: String) -> Result<(), String> {
+    use tauri::Manager;
+    let parent = win.label().to_string();
+    audiorec::authorized(&parent, &token)?;
+    if audiorec::is_rec(&parent) {
+        return Err("SecurityError: not an app window".into());
+    }
+    /* #295 (audit F-8): the decision is NATIVE. Settings › Security › Microphone off (or lockdown)
+       refuses before any dialog; otherwise EVERY start asks the user in the native consent
+       (Record / Cancel, default Cancel) and only Record mints the one-shot grant that
+       audiorec::start_check consumes below. A page script driving the core recorder gets the
+       dialog, never a silent recording. */
+    security::mic_check(security::mic_effective(&cfg_value())).inspect_err(|e| eprintln!("[audiorec] start refused: {e}"))?;
+    /* #295 follow-up: Microphone = always allow (app-wide, set only through the native Security
+       confirm) skips THIS question and nothing else: the token above, the setting re-read by
+       start_check below and the native recording indicator (rec_indicator after the recorder
+       runs) apply to every start alike. Lockdown has already turned it into off above. */
+    if security::mic_asks(security::mic_effective(&cfg_value())) {
+        let vault = cur_vault(&app.state::<Vault>()).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let slot = consent::admit()?;
+        if !consent::ask(slot, win.as_ref().window(), consent::Kind::Mic, consent::mic_question(&vault)).await? {
+            eprintln!("[audiorec] start: cancelled in the native consent, nothing started");
+            return Err(audiorec::NO_GRANT.into());
+        }
+    } else {
+        eprintln!("[audiorec] start: Microphone = always allow, no per-start consent (token, setting and the recording indicator still apply)");
+    }
+    audiorec::grant(&parent, std::time::Instant::now());
+    // the setting is read AGAIN after the dialog (turned off / lockdown meanwhile = refused);
+    // the grant is consumed here, whatever the outcome
+    audiorec::start_check(&parent, &token, security::mic_check(security::mic_effective(&cfg_value())), std::time::Instant::now())?;
+    rec_close(&app, &parent);
+    let (gtx, grx) = std::sync::mpsc::channel();
+    let (stx, srx) = std::sync::mpsc::channel();
+    let (ptx, prx) = std::sync::mpsc::channel();
+    audiorec::sess_put(&parent, audiorec::Sess { gated: Some(grx), ready: false, started: Some(stx), stop_tx: Some(ptx), stop_rx: Some(prx), data: None });
+    audiorec::arm(&parent, &token, std::time::Instant::now())?;
+    let b = tauri::WebviewWindowBuilder::new(&app, audiorec::rec_label(&parent), tauri::WebviewUrl::App("recorder.html".into()))
+        .title("audio capture")
+        .focused(false)
+        .skip_taskbar(true)
+        .decorations(false)
+        .inner_size(1.0, 1.0);
+    #[cfg(not(target_os = "macos"))]
+    let b = b.visible(false);
+    // macOS: WKWebView never answers getUserMedia from a page in a hidden window, and there is no
+    // GTK box to embed it in (rec_offscreen is a no-op), so the recorder is a visible 1x1
+    // borderless, unfocused, always-on-top window in the screen corner
+    #[cfg(target_os = "macos")]
+    let b = b.visible(true).position(0.0, 0.0).always_on_top(true).shadow(false).resizable(false);
+    let built = b.build();
+    let rw = match built {
+        Ok(w) => w,
+        Err(e) => {
+            rec_close(&app, &parent);
+            return Err(format!("NotReadableError: the recorder could not start ({e})"));
+        }
+    };
+    audiorec::rec_offscreen(&rw, &win);
+    let lbl = rw.label().to_string();
+    audiorec::install_then(&rw, move || {
+        eprintln!("[audiorec] {lbl}: gate connected");
+        let _ = gtx.send(()); // reason: a recorder page that is already gone needs no signal
+    });
+    match rec_recv(srx, REC_START_WAIT).await {
+        Some(Ok(())) => {
+            eprintln!("[audiorec] recording in {}", rw.label());
+            rec_indicator(&win, true);
+            Ok(())
+        }
+        r => {
+            eprintln!("[audiorec] recorder start failed: {r:?}");
+            rec_close(&app, &parent);
+            Err(match r {
+                Some(Err(e)) => e,
+                _ => "NotReadableError: the recorder did not start".into(),
+            })
+        }
+    }
+}
+
+/// recorder page: wait until this webview's gate is connected (then its getUserMedia meets the gate)
+#[tauri::command]
+async fn audio_rec_go(win: tauri::WebviewWindow) -> Result<(), String> {
+    let parent = audiorec::parent_of(win.label()).ok_or("not allowed")?.to_string();
+    // a reload of the recorder page (recorder.js: media capture turned on after its first load) asks again
+    let rx = audiorec::with_sess(&parent, |s| s.map(|s| (s.gated.take(), s.ready))).ok_or("not allowed")?;
+    eprintln!("[audiorec] {}: page up, waiting for the gate", win.label());
+    match rx {
+        (_, true) => Ok(()),
+        (Some(rx), false) => {
+            rec_recv(rx, REC_START_WAIT).await.ok_or_else(|| "the microphone gate is not ready".to_string())?;
+            audiorec::with_sess(&parent, |s| {
+                if let Some(s) = s {
+                    s.ready = true;
+                }
+            });
+            eprintln!("[audiorec] {}: gate ready", win.label());
+            Ok(())
+        }
+        (None, false) => Err("not allowed".into()),
+    }
+}
+
+/// recorder page: a step of its start (the box log shows where a start stopped)
+#[tauri::command]
+fn audio_rec_log(win: tauri::WebviewWindow, m: String) -> Result<(), String> {
+    audiorec::parent_of(win.label()).ok_or("not allowed")?;
+    eprintln!("[audiorec] {}: page {}", win.label(), m.chars().take(160).collect::<String>());
+    Ok(())
+}
+
+/// recorder page: its start outcome; on ok this returns only when the app window stops the recording
+#[tauri::command]
+async fn audio_rec_started(win: tauri::WebviewWindow, ok: bool, err: String) -> Result<(), String> {
+    let parent = audiorec::parent_of(win.label()).ok_or("not allowed")?.to_string();
+    let (tx, stop) = audiorec::with_sess(&parent, |s| s.map(|s| (s.started.take(), s.stop_rx.take()))).ok_or("not allowed")?;
+    let tx = tx.ok_or("not allowed")?;
+    eprintln!("[audiorec] {}: started ok={ok} {}", win.label(), err.chars().take(120).collect::<String>());
+    let _ = tx.send(if ok { Ok(()) } else { Err(err.chars().take(300).collect()) }); // reason: a start that gave up already closes this webview
+    if ok {
+        if let Some(rx) = stop {
+            // no cap: a recording lasts until the user stops it (the app window closing drops the session)
+            let _ = tauri::async_runtime::spawn_blocking(move || rx.recv()).await;
+        }
+    }
+    Ok(())
+}
+
+/// recorder page: the finished recording (base64 webm, "" = nothing recorded)
+#[tauri::command]
+fn audio_rec_data(win: tauri::WebviewWindow, data: String) -> Result<(), String> {
+    let parent = audiorec::parent_of(win.label()).ok_or("not allowed")?.to_string();
+    let tx = audiorec::with_sess(&parent, |s| s.and_then(|s| s.data.take())).ok_or("not allowed")?;
+    eprintln!("[audiorec] {}: data {} b64 bytes", win.label(), data.len());
+    tx.send(data).map_err(|_| "the recording was not taken".to_string())
+}
+
+/// stop the recording of this app window: the recorder page hands its data over, its webview is
+/// closed (microphone off), the recording -> `Recording <ts>.webm` in the attachment folder of `note`
+/// ("" = no note open) and its embed; None = nothing was recorded
+#[tauri::command]
+async fn audio_rec_stop(app: tauri::AppHandle, win: tauri::WebviewWindow, token: String, note: String, tm: datefmt::Tm) -> Result<Option<pasteimg::Pasted>, String> {
+    use tauri::Manager;
+    let parent = win.label().to_string();
+    audiorec::authorized(&parent, &token)?;
+    let (dtx, drx) = std::sync::mpsc::channel();
+    let stop = audiorec::with_sess(&parent, |s| s.and_then(|s| {
+        s.data = Some(dtx);
+        s.stop_tx.take()
+    }));
+    let data = match stop {
+        Some(stop) => {
+            let _ = stop.send(()); // reason: a recorder page that already ended still sends its data
+            rec_recv(drx, REC_DATA_WAIT).await
+        }
+        None => None,
+    };
+    rec_close(&app, &parent);
+    let data = data.ok_or("the recorder sent no data")?;
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let v = app.state::<Vault>();
+    audio_save(&v, &note, &data, &tm).map(Some)
+}
+
+/// the recording (base64 webm) -> `Recording <ts>.webm` in the attachment folder of `note`
+fn audio_save(v: &Vault, note: &str, data: &str, tm: &datefmt::Tm) -> Result<pasteimg::Pasted, String> {
+    span_timed!("audio_save", (|| {
+        let root = cur_vault(v).ok_or("no vault open")?;
+        if data.len() as u64 > audiorec::MAX_REC_BYTES / 3 * 4 + 8 {
+            return Err(format!("the recording is over the {} MB limit", audiorec::MAX_REC_BYTES / 1048576));
+        }
+        let bytes = vaultfs::b64_decode(data).ok_or("the recording is not valid base64")?;
+        let st = pasteimg::stamp(tm).map_err(|e| e.say())?;
+        let (cfg, md) = pasteimg::app_cfg(&root);
+        let mut media: Vec<String> = v.index.lock().unwrap().images().to_vec();
+        // the audio / video files too (codeant M4 on #124): a `Recording <ts>.webm` in ANOTHER folder makes
+        // the bare-name embed ambiguous, so its name counts as taken (write_into then picks ` 1`, ` 2`, ...)
+        media.extend(canvasfs::media(&root));
+        let taken = |n: &str| media.iter().any(|p| p.rsplit('/').next() == Some(n));
+        let n = bytes.len();
+        let p = audiorec::save_owned(&root, Some(note), bytes, &st, &cfg, md, &taken)?;
+        eprintln!("[audiorec] {} bytes -> {}", n, p.path);
+        // audio files join the index with the ![[x.webm]] embed (#116); the image list stays images/pdf
+        Ok(p)
+    })(), serde_json::json!({"b64": data.len()}))
+}
+
+/// S5: read the file `p` off disk, None when it is oversized (never part of
+/// the vault). #250: through vaultfs with `p`'s directory as the root — the
+/// leaf is opened O_NOFOLLOW|O_NONBLOCK, must be a regular file by fstat on
+/// that fd, and the cap is checked on the fd. Vault callers use
+/// `read_capped_in(root, rel)`, which also walks every parent no-follow.
+fn read_capped(p: &Path) -> Option<String> {
+    read_capped_in(p.parent()?, Path::new(p.file_name()?))
+}
+
+/// #250: the vault file `rel` (note or config) through `vaultfs::read_string`
+/// with MAX_NOTE_BYTES on the opened fd. None: absent, refused (a symlink at
+/// any component, FIFO, device, directory), over the cap, or not UTF-8.
+fn read_capped_in(root: &Path, rel: &Path) -> Option<String> {
+    match vaultfs::read_string(root, rel, index::MAX_NOTE_BYTES) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::FileTooLarge {
+                index::warn_oversized(&root.join(rel));
+            }
+            None
+        }
+    }
+}
+
+/// #250 (audit F-3): a `.obsidian/*.json` (or other vault config file) for
+/// READING: vaultfs fd read, vaultfs::CFG_MAX on the fd. None = absent,
+/// refused or unreadable, which every caller treats as "the default".
+fn vcfg_read(root: &Path, rel: &str) -> Option<String> {
+    vaultfs::read_string(root, Path::new(rel), vaultfs::CFG_MAX).ok()
+}
+
+/// #250: the same for a read-MODIFY-WRITE. Absent = "" (the first write
+/// creates it); anything else that cannot be read (a symlinked or
+/// non-regular leaf or parent, over the cap, not UTF-8) is an Err, so the
+/// merge never overwrites a file it could not read.
+fn vcfg_read_rmw(root: &Path, rel: &str) -> Result<String, String> {
+    match vaultfs::read_string(root, Path::new(rel), vaultfs::CFG_MAX) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("{rel}: {e} — refusing to overwrite it")),
+    }
 }
 
 // folder tree for the sidebar. vaultfs::walk_real_dirs never descends a
@@ -1056,7 +1714,13 @@ fn list_images(v: State<Vault>, otel: Option<perf::Ctx>) -> Vec<String> {
 #[tauri::command]
 fn canvas_io(v: State<Vault>, op: String, path: Option<String>, data: Option<String>, otel: Option<perf::Ctx>) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
-    span_timed!(otel => "canvas_io", canvasfs::op(&root, &op, path.as_deref().unwrap_or(""), data.as_deref()))
+    let r = span_timed!(otel => "canvas_io", canvasfs::op(&root, &op, path.as_deref().unwrap_or(""), data.as_deref()));
+    // issue #31: a canvas renamed / moved takes its bookmarks along (stock FINDINGS rename); a trash
+    // (delete) leaves them, stale, as stock does (D5)
+    if let (true, Ok(_), Some(from), Some(to)) = (op == "rename", &r, path.as_deref(), data.as_deref()) {
+        rename_bookmark_path_in(&root, from, to);
+    }
+    r
 }
 
 /// canvas_attach (canvasfs::attach): a NEW png/jpg/jpeg/gif/webp file in the
@@ -1072,18 +1736,34 @@ fn canvas_attach(v: State<Vault>, path: String, data_b64: String, otel: Option<p
 fn read_note(v: State<Vault>, name: String, otel: Option<perf::Ctx>) -> String {
     span_timed!(otel =>
         "read_note",
-        note_path(&v, &name, false)
-            .and_then(|p| read_capped(&p))
+        cur_vault(&v)
+            .zip(note_rel(&name))
+            .and_then(|(root, rel)| read_capped_in(&root, &rel))
             .unwrap_or_default()
     )
 }
 
 // F1 (dataloss-audit): the Result is the product. A save that did not land
 // MUST reach the UI — a swallowed ENOSPC/EROFS costs every edit of a session.
+/* #128: OFF the main thread. A sync command runs on the GTK main thread — the
+   thread that also dispatches input to the webview — and a save is O(note):
+   fsync + an Index::upsert that reparses the whole note (5000 lines: p95 30 ms).
+   A checkbox click landing while an autosave was in flight queued behind it
+   (task_toggle queue_ms p95 32 ms, max 47). Now the body runs on the blocking
+   pool. Ordering is unchanged: the UI serialises a group's saves (g.saveQ) and
+   awaits each result, the quit flush awaits every write in flight, the vault
+   root is a OnceLock (a switch is refused) and the index mutex is taken before
+   the bytes go down, exactly as before. */
 #[tauri::command]
-fn write_note(v: State<Vault>, name: String, content: String, otel: Option<perf::Ctx>) -> Result<(), String> {
-    let bytes = content.len();
-    span_timed!(otel => "write_note", write_note_inner(&v, &name, &content), serde_json::json!({"bytes": bytes}))
+async fn write_note(app: tauri::AppHandle, name: String, content: String, otel: Option<perf::Ctx>) -> Result<(), String> {
+    use tauri::Manager;
+    tauri::async_runtime::spawn_blocking(move || {
+        let v = app.state::<Vault>();
+        let bytes = content.len();
+        span_timed!(otel => "write_note", write_note_inner(&v, &name, &content), serde_json::json!({"bytes": bytes}))
+    })
+    .await
+    .map_err(|e| format!("write_note: {e}"))?
 }
 
 fn write_note_inner(v: &Vault, name: &str, content: &str) -> Result<(), String> {
@@ -1124,7 +1804,7 @@ fn write_note_in(root: &Path, ix: &mut Index, name: &str, content: &str) -> Resu
     vaultfs::write_atomic(root, &frel, content.as_bytes()).map_err(|e| e.to_string())?;
     // index == disk: reparse this note, patch its outgoing edges
     // (a NEW key triggers a full in-memory edge rebuild inside upsert)
-    ix.upsert(&rel.display().to_string(), content);
+    ix.upsert(&vaultfs::rel_slash(&rel), content);
     Ok(())
 }
 
@@ -1174,7 +1854,7 @@ fn create_note_in(root: &Path, ix: &mut Index, name: &str, content: &str) -> Res
         })?;
     f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())?;
-    ix.upsert(&rel.display().to_string(), content);
+    ix.upsert(&vaultfs::rel_slash(&rel), content);
     Ok(())
 }
 
@@ -1220,7 +1900,7 @@ fn move_note_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> Result<(us
     // LATER: file watcher) gets its [[old]] links rewritten too. One walk per
     // rename — the hot paths (search/graph/backlinks) stay disk-free.
     *ix = Index::build(root);
-    let (okey, nkey) = (orel.display().to_string(), nrel.display().to_string());
+    let (okey, nkey) = (vaultfs::rel_slash(&orel), vaultfs::rel_slash(&nrel));
     // counted BEFORE the move, off the freshly-resynced index
     let radius = ix.rename_blast(&okey, &nkey);
     // audit #6: claim (O_EXCL|O_NOFOLLOW) + renameat, both relative to parent
@@ -1238,7 +1918,7 @@ fn move_note_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> Result<(us
         })?;
     // index==disk invariant: if the key is somehow missing, seed it from the
     // moved file rather than dropping the note
-    let fallback = if ix.content(&okey).is_none() { fs::read_to_string(&np).ok() } else { None };
+    let fallback = if ix.content(&okey).is_none() { read_capped_in(root, &nfr) } else { None };
     ix.move_key(&okey, &nkey, fallback);
     // R9.8: the note's name changed, so its BOOKMARK follows it — here, after
     // the rename is a fact on disk, and never before: everything above this
@@ -1256,8 +1936,8 @@ fn move_note_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> Result<(us
    preserving alias, #anchor and embed form (index::rewrite_links). Returns
    how many files were written. Never called without the user's answer. */
 fn update_links_in(root: &Path, ix: &mut Index, old: &str, new: &str) -> usize {
-    let okey = safe_rel(old).map(|p| p.display().to_string()).unwrap_or_default();
-    let nkey = safe_rel(new).map(|p| p.display().to_string()).unwrap_or_default();
+    let okey = safe_rel(old).map(|p| vaultfs::rel_slash(&p)).unwrap_or_default();
+    let nkey = safe_rel(new).map(|p| vaultfs::rel_slash(&p)).unwrap_or_default();
     let mut wrote = 0;
     let Ok(vfs) = vaultfs::Vault::open(root) else { return 0 };
     for (n, c) in ix.rewrite_to(&okey, &nkey) {
@@ -1318,7 +1998,7 @@ fn link_consent_in(root: &Path) -> bool {
 /// not a bool = false, which is Obsidian's default for every key read this way
 /// (alwaysUpdateLinks, strictLineBreaks).
 fn app_bool_in(root: &Path, key: &str) -> bool {
-    let cfg = fs::read_to_string(root.join(".obsidian/app.json")).unwrap_or_default();
+    let cfg = vcfg_read(root, ".obsidian/app.json").unwrap_or_default();
     serde_json::from_str::<serde_json::Value>(&cfg)
         .ok()
         .and_then(|v| v.get(key).and_then(|b| b.as_bool()))
@@ -1339,7 +2019,7 @@ fn set_link_consent_in(root: &Path, on: bool) -> Result<(), String> {
 /// merge ONE boolean key into app.json — the refusal and temp+fsync+rename
 /// rules above hold for every key written through here
 fn set_app_bool_in(root: &Path, key: &str, on: bool) -> Result<(), String> {
-    let cur = fs::read_to_string(root.join(".obsidian/app.json")).unwrap_or_default();
+    let cur = vcfg_read_rmw(root, ".obsidian/app.json")?;
     let mut v = if cur.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -1404,6 +2084,78 @@ fn set_strict_line_breaks(v: State<Vault>, on: bool) -> Result<(), String> {
     set_app_bool_in(&root, "strictLineBreaks", on)
 }
 
+/* issue #119 — Properties (src-tauri/src/props.rs). "Properties in document" is
+   Obsidian's Editor > Display dropdown, Obsidian's key: app.json
+   "propertiesInDocument" = "visible" | "hidden" | "source", absent = visible. Read
+   on every ask (a hand edit or another window shows on the next settings open /
+   note open); written by the same merge as the boolean keys above. */
+fn app_value_in(root: &Path, key: &str) -> Option<serde_json::Value> {
+    let cfg = vcfg_read(root, ".obsidian/app.json")?;
+    serde_json::from_str::<serde_json::Value>(&cfg).ok()?.get(key).cloned()
+}
+
+fn props_mode_in(root: &Path) -> &'static str {
+    props::mode_of(app_value_in(root, "propertiesInDocument").as_ref())
+}
+
+fn set_props_mode_in(root: &Path, mode: &str) -> Result<(), String> {
+    if !props::MODES.contains(&mode) {
+        return Err(format!("unknown Properties in document mode {mode:?}"));
+    }
+    let cur = vcfg_read_rmw(root, ".obsidian/app.json")?;
+    let mut v = if cur.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str::<serde_json::Value>(&cur).map_err(|e| format!("app.json is not JSON ({e}) — refusing to overwrite it"))?
+    };
+    let o = v.as_object_mut().ok_or("app.json is not a JSON object — refusing to overwrite it")?;
+    o.insert("propertiesInDocument".into(), serde_json::Value::String(mode.into()));
+    let body = serde_json::to_string(&v).map_err(|e| e.to_string())?;
+    vaultfs::write_atomic(root, Path::new(".obsidian/app.json"), body.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn props_mode(v: State<Vault>) -> String {
+    cur_vault(&v).map(|r| props_mode_in(&r)).unwrap_or("visible").to_string()
+}
+
+#[tauri::command]
+fn set_props_mode(v: State<Vault>, mode: String) -> Result<(), String> {
+    let root = cur_vault(&v).ok_or("no vault open")?;
+    set_props_mode_in(&root, &mode)
+}
+
+/// #119: the user's property types (.obsidian/types.json), lowercase name -> type
+#[tauri::command]
+fn props_types(v: State<Vault>) -> std::collections::BTreeMap<String, String> {
+    cur_vault(&v).map(|r| props::types_in(&r)).unwrap_or_default()
+}
+
+/// #119: assign (or with ty None, drop) the type of a property in types.json, by merge
+#[tauri::command]
+fn set_prop_type(v: State<Vault>, name: String, ty: Option<String>) -> Result<(), String> {
+    let root = cur_vault(&v).ok_or("no vault open")?;
+    let cur = vcfg_read_rmw(&root, props::TYPES_REL)?;
+    let body = props::types_merged(&cur, &name, ty.as_deref())?;
+    vaultfs::write_atomic(&root, Path::new(props::TYPES_REL), body.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// #119: the notes whose frontmatter holds `key` (the Properties view's Rename)
+#[tauri::command]
+fn props_notes(v: State<Vault>, key: String) -> Vec<String> {
+    let ix = v.index.lock().unwrap();
+    props::notes_with(ix.docs().map(|(n, c, _)| (n, c)), &key)
+}
+
+/// #119: every vault property (key, notes holding it, distinct values) off the index
+#[tauri::command]
+fn props_index(v: State<Vault>) -> Vec<props::PropStat> {
+    span_timed!("props_index", {
+        let ix = v.index.lock().unwrap();
+        props::census(ix.docs().map(|(_, c, _)| c))
+    })
+}
+
 /* goal/minimalmargin — Obsidian's Settings > Editor > Display "Readable line
    length": `<vault>/.obsidian/app.json` "readableLineLength". Unlike the keys
    above its default is ON (stock 1.13.7 recon: a vault without the key paints
@@ -1411,7 +2163,7 @@ fn set_strict_line_breaks(v: State<Vault>, on: bool) -> Result<(), String> {
    `is-readable-line-width` class on every note view, which is the class the
    themes (Minimal 9.0.2) key their column width and file margins on. */
 fn readable_line_length_in(root: &Path) -> bool {
-    let cfg = fs::read_to_string(root.join(".obsidian/app.json")).unwrap_or_default();
+    let cfg = vcfg_read(root, ".obsidian/app.json").unwrap_or_default();
     serde_json::from_str::<serde_json::Value>(&cfg)
         .ok()
         .and_then(|v| v.get("readableLineLength").and_then(|b| b.as_bool()))
@@ -1459,7 +2211,7 @@ fn graph_groups_ok(v: &serde_json::Value) -> bool {
 
 /// the whole graph.json object; absent / unreadable / unparsable / not an object = {}
 fn graph_settings_in(root: &Path) -> serde_json::Value {
-    read_capped(&root.join(GRAPH_REL))
+    vcfg_read(root, GRAPH_REL)
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}))
@@ -1485,7 +2237,7 @@ fn set_graph_settings_in(root: &Path, patch: &serde_json::Value) -> Result<(), S
             return Err(format!("graph.json: bad value for {k:?}"));
         }
     }
-    let cur = read_capped(&root.join(GRAPH_REL)).unwrap_or_default();
+    let cur = vcfg_read_rmw(root, GRAPH_REL)?;
     let mut v = if cur.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -1566,7 +2318,7 @@ const TRASH_DIR: &str = ".trash";
 /// what the UI reports, and what a test reads the original bytes back from.
 fn delete_note_in(root: &Path, ix: &mut Index, name: &str) -> Result<String, String> {
     let rel = safe_rel(name).ok_or("invalid name")?;
-    let key = rel.display().to_string();
+    let key = vaultfs::rel_slash(&rel);
     let frel = note_rel(name).ok_or("invalid name")?;
     // S2: confined to the vault, and never through a symlinked leaf/parent
     let p = note_path_in(root, name, false).ok_or("invalid name")?;
@@ -1588,7 +2340,7 @@ fn delete_note_in(root: &Path, ix: &mut Index, name: &str) -> Result<String, Str
             // index==disk: the key is gone, so every inbound link stops resolving
             // and R24.9's faded rendering appears. No other note is touched.
             ix.remove(&key);
-            dest.display().to_string()
+            vaultfs::rel_slash(&dest)
         })
         .map_err(|e| format!("cannot move the note to the vault trash: {e}"))
 }
@@ -1611,7 +2363,19 @@ fn vault_get(v: State<Vault>) -> Option<String> {
 /* R1.6 vault persistence: ~/.opensidian.json {"last": path, "list": [paths]}.
    Written only on explicit open/create — VAULT_DIR boots (probes) never touch it. */
 fn cfg_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())).join(".opensidian.json")
+    PathBuf::from(user_home()).join(".opensidian.json")
+}
+
+/// $HOME on Unix (/ when unset); %USERPROFILE%, then $HOME, on Windows.
+fn user_home() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    }
 }
 
 /// whole config as a Value, read under the shared cfg lock (cfgstore.rs)
@@ -1631,13 +2395,55 @@ fn cfg_value() -> serde_json::Value {
    rename. A call site names the key it changes, never a whole Value it read
    earlier (that read is stale by the time another window has written). */
 fn cfg_update(ops: &[cfgstore::Op]) {
-    let r = match spawner::client() {
-        Some(c) => c.cfg(ops), // confined: the unconfined spawner applies the Ops
-        None => cfgstore::update_in(&vaultlock::env_lock_dir(), &cfg_path(), ops).map(|_| ()),
-    };
-    if let Err(e) = r {
+    if let Err(e) = cfg_try_update(ops) {
         eprintln!("config write failed: {e}");
     }
+}
+
+/// the same write, the error returned: for a caller that must not go on when it failed
+/// (#288 review: uninstall refuses when the pin could not be forgotten)
+pub(crate) fn cfg_try_update(ops: &[cfgstore::Op]) -> Result<(), String> {
+    match spawner::client() {
+        Some(c) => c.cfg(ops), // confined: the unconfined spawner applies the Ops
+        None => cfgstore::update_in(&vaultlock::env_lock_dir(), &cfg_path(), ops).map(|_| ()),
+    }
+}
+
+/// #144 toggle 3: the network choke point (security::net_check) with the current config.
+/// Called first by every outbound path; `every_outbound_path_goes_through_the_choke_point` pins it.
+pub(crate) fn net_allowed(what: &str) -> Result<(), String> {
+    security::net_check(&security::effective(&cfg_value()), what)
+}
+
+/// #144 toggle 2 (+ 3): the plugin network commands ask this — offline first, then the
+/// community-plugin network toggle (security::plugin_net_check). `plugin` is a message label.
+pub(crate) fn plugin_net_allowed(what: &str, plugin: Option<&str>) -> Result<(), String> {
+    security::plugin_net_check(&security::effective(&cfg_value()), what, plugin)
+}
+
+/// #144 toggle 10: desk_proc_spawn + desk_shell ask this BEFORE consent::admit (no question
+/// queued, no dialog) with the EFFECTIVE value (live, lockdown included)
+pub(crate) fn spawn_allowed(what: &str, plugin: Option<&str>) -> Result<(), String> {
+    security::spawn_check(&security::effective(&cfg_value()), what, plugin).map_err(|e| {
+        eprintln!("[sec] refused {e}");
+        e
+    })
+}
+
+/// #144 toggle 4: the vault-media commands and the opensidian-img: handler ask this
+/// with the EFFECTIVE value (live: no reload needed for the refusal itself)
+pub(crate) fn media_allowed(what: &str) -> Result<(), String> {
+    security::media_check(&security::effective(&cfg_value()), what)
+}
+
+/// #144 toggles 8 + 9: clip_text / clip_has_text / clip_set_text ask this FIRST with the
+/// EFFECTIVE value (live) and the page realm's taint (security::REALM_PLUGIN)
+pub(crate) fn clip_allowed(what: &str) -> Result<(), String> {
+    let tainted = security::REALM_PLUGIN.load(std::sync::atomic::Ordering::SeqCst);
+    security::clip_check(&security::effective(&cfg_value()), tainted, what).map_err(|e| {
+        eprintln!("[sec] refused {e}");
+        e
+    })
 }
 
 fn cfg_set(k: &str, x: serde_json::Value) {
@@ -1707,7 +2513,7 @@ fn read_workspace(v: State<Vault>) -> Option<serde_json::Value> {
     span_timed!(
         "read_workspace",
         cur_vault(&v)
-            .and_then(|root| fs::read_to_string(workspace_path(&root)).ok())
+            .and_then(|root| vcfg_read(&root, ".obsidian/workspace.json"))
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
     )
 }
@@ -1736,8 +2542,7 @@ fn insert_datetime(v: State<Vault>, kind: String, tm: datefmt::Tm) -> Result<Str
 
 /// read-only lookup of one string key in <vault>/.obsidian/templates.json
 fn templates_format(root: &Path, key: &str) -> Option<String> {
-    let p = root.join(".obsidian").join("templates.json");
-    let s = read_capped(&p)?;
+    let s = vcfg_read(root, ".obsidian/templates.json")?;
     let j: serde_json::Value = serde_json::from_str(&s).ok()?;
     j.get(key)?.as_str().map(str::to_owned)
 }
@@ -1796,9 +2601,86 @@ fn write_workspace(
     )
 }
 
+
+/* #94 WORKSPACE MANAGER (src-tauri/src/wsmgr.rs): named layouts in <vault>/.obsidian/workspaces.json,
+   Obsidian's core "Workspaces" file. Reads never fail (a missing/corrupt file lists as empty, R28.13's
+   rule); mutations are VAULT-SCOPED exactly like write_workspace — the UI names the vault the layout was
+   serialized from and a disagreeing vault is refused, so a saved layout can never land in another vault. */
+#[tauri::command]
+fn wsm_list(v: State<Vault>) -> serde_json::Value {
+    span_timed!("wsm_list", cur_vault(&v).map(|r| wsmgr::list(&wsmgr::read_in(&r))).unwrap_or_else(|| wsmgr::list(&wsmgr::OnDisk::Absent)))
+}
+
+#[tauri::command]
+fn wsm_get(v: State<Vault>, name: String) -> Option<serde_json::Value> {
+    span_timed!("wsm_get", cur_vault(&v).and_then(|r| wsmgr::get(&wsmgr::read_in(&r), &name)))
+}
+
+/// op: "save" (name, layout) | "delete" (name) | "rename" (name -> to) | "activate" (name)
+#[tauri::command(async)]
+fn wsm_op(
+    v: State<Vault>,
+    vault: String,
+    op: String,
+    name: String,
+    to: Option<String>,
+    layout: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    span_timed!("wsm_op", (|| {
+        let root = cur_vault(&v).ok_or("no vault open")?;
+        if root != PathBuf::from(&vault) {
+            return Err(format!("stale workspaces write: serialized from {vault}, current vault is {}", root.display()));
+        }
+        wsm_op_in(&root, &op, &name, to.as_deref(), layout.as_ref())
+    })())
+}
+
+fn wsm_op_in(root: &Path, op: &str, name: &str, to: Option<&str>, layout: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    match op {
+        "save" => {
+            let l = layout.ok_or("save: no layout")?;
+            wsmgr::mutate_in(root, |d| wsmgr::op_save(d, name, l))
+        }
+        "delete" => wsmgr::mutate_in(root, |d| wsmgr::op_delete(d, name)),
+        "rename" => {
+            let t = to.ok_or("rename: no new name")?;
+            wsmgr::mutate_in(root, |d| wsmgr::op_rename(d, name, t))
+        }
+        "activate" => wsmgr::mutate_in(root, |d| wsmgr::op_activate(d, name)),
+        _ => Err(format!("wsm_op: unknown op {op:?}")),
+    }
+}
 #[tauri::command]
 fn recent_vaults() -> Vec<String> {
-    span_timed!("recent_vaults", read_cfg().1.into_iter().filter(|p| Path::new(p).is_dir()).collect())
+    span_timed!("recent_vaults", recent_shown(read_cfg().1).into_iter().filter(|p| Path::new(p).is_dir()).collect())
+}
+
+/// Windows: the vault path a person sees and the recent list records. canonicalize answers in
+/// the verbatim form (`\\?\D:\notes`), which is right for file calls but not as a NAME: it is not
+/// what the user picked or will recognise, and the same vault, once picked (`D:\notes`) and once
+/// opened through argv (open in new window, switch), showed up twice in the recent list. The
+/// plain form (desk_proc::plain_path) names the same directory. Every config key that must not
+/// drift (trust, secrets, window record, vault id, lock) canonicalizes on its own, so none of
+/// them changes. Elsewhere: unchanged.
+fn shown_vault_path(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    return desk_proc::plain_path(&p);
+    #[cfg(not(windows))]
+    p
+}
+
+/// the recent list as shown: entries an older build recorded in the verbatim form are shown
+/// plain, and a vault recorded in both forms is shown once (its newest place). The config file
+/// is not rewritten here.
+fn recent_shown(list: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in list {
+        let s = shown_vault_path(PathBuf::from(&p)).display().to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// the BOOT picker's one bind (vaultbleed: Err once this process has a vault —
@@ -2042,9 +2924,15 @@ static SWITCH_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /* goal winsize (winsize.rs has the rules and the stock evidence pointers).
    WIN_REC: this vault's saved record + the config default size, read in main()
    before the Builder; set => the window is created hidden and winsize_restore
-   places + shows it in setup. A switch-started window never reads it (the old
-   window's rect wins). WIN_TRACK: the last normal (not maximized) bounds. */
+   places it in setup (#281: the SHOW is boot_show's). A switch-started window never reads it
+   (the old window's rect wins). WIN_TRACK: the last normal (not maximized) bounds. */
 static WIN_REC: OnceLock<(serde_json::Value, (f64, f64))> = OnceLock::new();
+/* #281 startup reveal (reveal.rs): every window that boots INTO a vault (not a switch, not the
+   picker) is created hidden and shown once — by boot_reveal (the UI: layout + theme + tree +
+   tabs in) or by the reveal::FALLBACK timer, whichever is first. BOOT_MAX: the restored record
+   is maximized; applied before the show, so the first mapped frame is already the final size. */
+static BOOT_GATE: reveal::Gate = reveal::Gate::new();
+static BOOT_MAX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WIN_TRACK: Mutex<winsize::Track> = Mutex::new(winsize::Track::new());
 
 /// the record's key: the canonical vault path
@@ -2052,8 +2940,10 @@ fn winsize_key(p: &Path) -> String {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).display().to_string()
 }
 
-/// setup: sanitise the record against the monitors' work areas, then size,
-/// place (or centre), show, maximize — before the user sees a frame.
+/// setup: sanitise the record against the monitors' work areas, then size and
+/// place (or centre) the HIDDEN window. #281: no show here — boot_show maps it
+/// once (maximized first when the record says so): the user never watches the
+/// window resize, and never sees it before the UI is in.
 fn winsize_restore(w: &tauri::WebviewWindow, rec: &serde_json::Value, default: (f64, f64), wayland: bool) {
     let mut ms = w.available_monitors().unwrap_or_default();
     if let Ok(Some(p)) = w.primary_monitor() {
@@ -2078,10 +2968,7 @@ fn winsize_restore(w: &tauri::WebviewWindow, rec: &serde_json::Value, default: (
             let _ = w.center();
         }
     }
-    let _ = w.show();
-    if plan.max {
-        let _ = w.maximize();
-    }
+    BOOT_MAX.store(plan.max, std::sync::atomic::Ordering::SeqCst);
     eprintln!("[winsize] restore pid={} why={} rect={}x{}@{:?} max={} mons={:?}", std::process::id(), plan.why, plan.w, plan.h, plan.pos, plan.max, mons);
 }
 
@@ -2171,6 +3058,40 @@ fn switch_ready(app: tauri::AppHandle, v: State<Vault>) {
     }
 }
 
+/// #281: map the vault-boot window (once; the caller won BOOT_GATE). Maximize first
+/// when the restored record says so, so no resize is ever on screen. The log line carries
+/// wall-clock ms (call / after show) so a startup trace can split boot time from map latency.
+fn boot_show(app: &tauri::AppHandle, why: reveal::Why) {
+    use tauri::Manager;
+    let ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let t0 = ms();
+    if let Some(w) = app.webview_windows().values().next() {
+        if BOOT_MAX.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = w.maximize();
+        }
+        let _ = w.show();
+    }
+    let t1 = ms();
+    match why {
+        reveal::Why::Ready => eprintln!("[reveal] pid={} shown: UI ready t_call_ms={} t_shown_ms={}", std::process::id(), t0, t1),
+        reveal::Why::Timeout => eprintln!(
+            "[reveal] pid={} UI did not report ready in {:?}; showing anyway (fail open) t_call_ms={} t_shown_ms={}",
+            std::process::id(),
+            reveal::FALLBACK,
+            t0,
+            t1
+        ),
+    }
+}
+
+/// #281: the UI has the vault in (enterVault: layout, vault theme + snippets, tree,
+/// restored tabs, the first note rendered). A switch-started window keeps its own
+/// path (switch_show / switch_ready); the picker's window was never hidden.
+#[tauri::command]
+fn boot_reveal(app: tauri::AppHandle) {
+    reveal::ready(&BOOT_GATE, |why| boot_show(&app, why));
+}
+
 /// vault_rules + the lock probe + spawn: the ONE path that starts a window on
 /// another vault, run in-process (unconfined) or by the spawner (confined).
 /// vaultbleed B: refuse up front instead of spawning a child that would refuse
@@ -2178,7 +3099,10 @@ fn switch_ready(app: tauri::AppHandle, v: State<Vault>) {
 fn spawn_checked(p: &Path, sw: Option<&spawn::Switch>) -> Result<u32, String> {
     vault_rules(p)?;
     if let Ok(c) = p.canonicalize() {
-        if vaultlock::held_in(&vaultlock::env_lock_dir(), &c) {
+        // #144 toggle 12 "Restart now": the window restarting onto its own vault still holds
+        // the lock; its child waits for it (boot) only while the pid the token names lives
+        let restart = sw.and_then(|s| spawn::restart_of(&s.token)).is_some_and(spawn::alive);
+        if !restart && vaultlock::held_in(&vaultlock::env_lock_dir(), &c) {
             return Err(format!("{} is {}", p.display(), vaultlock::DUP_MSG));
         }
     }
@@ -2233,8 +3157,11 @@ fn log_spans(spans: Vec<serde_json::Value>) -> bool {
 /// settleTest): one otel span per settle, numbers only. Unset, the UI keeps no trace.
 #[tauri::command]
 fn graph_renderer_pref() -> serde_json::Value {
+    // #144 toggle 5: WebGL off (or forced off by HTML canvas / lockdown) = the 2D path, named
+    let gl = security::effective(&cfg_value()).sec.webgl;
     serde_json::json!({
-        "renderer": std::env::var("OPENSIDIAN_GRAPH_RENDERER").ok(),
+        "renderer": if gl { std::env::var("OPENSIDIAN_GRAPH_RENDERER").ok() } else { Some("2d".to_string()) },
+        "security": if gl { serde_json::Value::Null } else { security::webgl_off_text().into() },
         "lose_ctx": std::env::var_os("OPENSIDIAN_GRAPH_LOSE_CTX").is_some(),
         "settle_trace": std::env::var("OPENSIDIAN_GRAPH_SETTLE_TRACE").as_deref() == Ok("1"),
     })
@@ -2289,14 +3216,38 @@ fn save_debounce_ms() -> u64 {
 /// Deny system trees and any dot-component (hidden dirs, `..`); /workspace
 /// and $HOME stay browsable even when they sit under a denied prefix (e.g.
 /// HOME=/root). /, /home, /mnt, /media, /run/media, /tmp remain open.
+///
+/// Windows: s::canonicalize yields \\?\D:\..., whose first component is a Prefix: that is how
+/// an absolute path looks there, so it is allowed (refusing it refused every vault argument). The
+/// system trees are the Windows ones, compared case-insensitively with the \\?\ form stripped.
 fn picker_allows(p: &Path) -> bool {
+    #[cfg(unix)]
     const DENY: [&str; 8] = ["/proc", "/sys", "/dev", "/etc", "/usr", "/boot", "/root", "/var"];
+    #[cfg(windows)]
+    const DENY: [&str; 4] = [r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\ProgramData"];
     if !p.is_absolute() {
         return false;
+    }
+    // macOS port: the system trees as canonicalize() spells them (/etc -> /private/etc, /var ->
+    // /private/var) plus the macOS-only ones. /private/var/folders is the per-user $TMPDIR, the
+    // twin of Linux's /tmp, which stays open like /tmp does.
+    #[cfg(target_os = "macos")]
+    {
+        const MAC_DENY: [&str; 6] = ["/private/etc", "/private/var", "/System", "/Library", "/bin", "/sbin"];
+        if MAC_DENY.iter().any(|d| p.starts_with(d)) && !p.starts_with("/private/var/folders") {
+            if let Ok(h) = std::env::var("HOME") {
+                if h.len() > 1 && p.starts_with(&h) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
     if p.components().any(|c| match c {
         Component::Normal(s) => s.to_string_lossy().starts_with('.'),
         Component::RootDir => false,
+        #[cfg(windows)]
+        Component::Prefix(_) => false,
         _ => true, // `..`, `.`, prefixes
     }) {
         return false;
@@ -2304,12 +3255,21 @@ fn picker_allows(p: &Path) -> bool {
     if p.starts_with("/workspace") {
         return true;
     }
-    if let Ok(h) = std::env::var("HOME") {
-        if h.len() > 1 && p.starts_with(&h) {
-            return true;
-        }
+    let h = user_home();
+    if h.len() > 1 && p.starts_with(&h) {
+        return true;
     }
-    !DENY.iter().any(|d| p.starts_with(d))
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        let lower = s.to_ascii_lowercase();
+        !DENY.iter().any(|d| lower.starts_with(&d.to_ascii_lowercase()))
+    }
+    #[cfg(not(windows))]
+    {
+        !DENY.iter().any(|d| p.starts_with(d))
+    }
 }
 
 /* ---- vaultarg: `opensidian <dir>` opens <dir> (contract docs/vaultarg/README.md) ----
@@ -2361,7 +3321,7 @@ fn resolve_vault_arg(a: &std::ffi::OsStr) -> Result<PathBuf, String> {
     if !sandbox::allows(&p) {
         return Err("outside the sandbox".into());
     }
-    Ok(p)
+    Ok(shown_vault_path(p)) // Windows: D:\notes, not \\?\D:\notes (the same directory)
 }
 
 /// the one-shot in-app reason for a rejected vault argument (README §5)
@@ -2404,7 +3364,27 @@ fn argv_vault(args: &[std::ffi::OsString], env_set: bool) -> Option<PathBuf> {
 
 #[tauri::command]
 fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    user_home()
+}
+
+/// Windows: ask for a folder with the system's own dialog (pick_win.rs), modal
+/// to this window. Ok(None) = cancelled. The answer is only a PROPOSAL: the
+/// page hands it to pick_vault / create_vault, where the vault rules decide.
+/// Elsewhere the in-app list is the picker; the page never calls this there
+/// (ui/main.js OS_WIN).
+#[tauri::command]
+async fn pick_folder(win: tauri::Window, title: Option<String>, start: Option<String>) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let owner = win.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+        let title = title.unwrap_or_else(|| "Choose a folder".into());
+        tauri::async_runtime::spawn_blocking(move || pick_win::pick_folder(owner, title, start)).await.map_err(|e| e.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (win, title, start);
+        Err("no system folder dialog on this platform".into())
+    }
 }
 
 /// S1: the only way an external URL leaves the app — the webview never
@@ -2414,19 +3394,68 @@ fn check_external(url: &str) -> Result<(), String> {
     if ext_ok(url, false) { Ok(()) } else { Err(format!("blocked scheme: {url}")) }
 }
 
+/* #144 toggle 3: while offline mode is on, a link still opens in the system browser
+   (operator decision) — after a NATIVE confirm naming the toggle, so a plugin calling this
+   command cannot open the browser silently. Online: exactly today's behaviour, no question. */
 #[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
+async fn open_external(win: tauri::Window, url: String) -> Result<(), String> {
+    check_external(&url)?;
+    if let Err(e) = net_allowed("open in browser") {
+        let slot = consent::admit()?;
+        if !consent::ask(slot, win, consent::Kind::OfflineOpen, consent::offline_open_question(&url)).await? {
+            eprintln!("[sec] open_external while offline: cancelled");
+            return Err(e);
+        }
+    }
+    open_external_now(url)
+}
+
+/// Windows: ShellExecuteW, the URL one LPCWSTR parameter, never a cmd.exe command line (&, `|` and
+/// quotes in a note link cannot be re-parsed as a command).
+#[cfg(windows)]
+fn open_external_now(url: String) -> Result<(), String> {
+    check_external(&url)?;
+    win_shell_execute(std::ffi::OsStr::new(&url), "open")
+}
+
+/// Open a path or URL with the Windows shell (no cmd.exe command line).
+#[cfg(windows)]
+fn win_shell_execute(target: &std::ffi::OsStr, op: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(hwnd: *mut core::ffi::c_void, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+    }
+    let wide = |s: &std::ffi::OsStr| {
+        let mut v: Vec<u16> = s.encode_wide().collect();
+        v.push(0);
+        v
+    };
+    let (file, operation) = (wide(target), wide(std::ffi::OsStr::new(op)));
+    // SAFETY: NUL-terminated wide strings outlive the call; the unused arguments are null.
+    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), operation.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1 /* SW_SHOWNORMAL */) };
+    // ShellExecute returns a value > 32 on success.
+    if (r as usize) <= 32 {
+        return Err(format!("ShellExecuteW: {r}"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_external_now(url: String) -> Result<(), String> {
     check_external(&url)?;
     // std::process::Command only — no shell, no opener plugin. Missing xdg-open
     // (headless smoke, minimal hosts) is a plain Err, never a fallback.
-    std::process::Command::new("xdg-open")
+    // macOS: /usr/bin/open hands the URL to the default browser (Launch Services)
+    let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+    std::process::Command::new(opener)
         .arg(&url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("xdg-open: {e}"))
+        .map_err(|e| format!("{opener}: {e}"))
 }
 
 #[tauri::command]
@@ -2510,6 +3539,14 @@ fn linkify(buf: &str, notes: &[String], imgs: &[String], reading: bool, urls: bo
             tagify_urls(&rest[..i - 1], urls, evs);
             let alt = if alias.is_empty() { note } else { alias };
             evs.push(Event::Html(pdf_html(imgs, note, anchor, alt).into()));
+            rest = &rest[i + 2 + j + 2..];
+            continue;
+        }
+        // #116 `![[Recording 20261115.webm]]`: an audio player (no anchor form), ui/editor.js fills it
+        if i > 0 && rest.as_bytes()[i - 1] == b'!' && anchor.is_empty() && is_audio_target(note) {
+            tagify_urls(&rest[..i - 1], urls, evs);
+            let alt = if alias.is_empty() { note } else { alias };
+            evs.push(Event::Html(audio_html(note, alt).into()));
             rest = &rest[i + 2 + j + 2..];
             continue;
         }
@@ -2882,6 +3919,150 @@ fn render_with(content: &str, notes: &[String], imgs: &[String], reading: bool) 
     render_with_br(content, notes, imgs, reading, false)
 }
 
+/// #348: Obsidian's `==highlight==` renders as `<mark>` in the reading view (stock DOM:
+/// a bare `<mark>`, painted by `--text-highlight-bg`). pulldown-cmark has no such syntax,
+/// so this pass runs over the FINAL event list (after linkify), splitting Text events.
+/// Rules mirror our live-preview inline scanner (ui/editor.js `["==", "hl", "mark"]`):
+/// an opener `==` is followed by a non-space, its closer is the FIRST later `==` and must
+/// follow a non-space (else the opener is given up and that `==` may open instead), and
+/// the content is never empty (`====` stays literal). Unmatched `==` stays literal text.
+/// A pair only forms at one inline depth inside one block (so `<mark>` always nests
+/// well-formed: `==a **b** c==` wraps the strong, `**==a** b==` does not pair), and never
+/// inside code: code spans are their own events, code/metadata block Text is skipped.
+fn mark_highlights(evs: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    // an Html event that is block structure (callout frame, embed div, paragraph seam)
+    fn html_block(h: &str) -> bool {
+        h.contains("<div") || h.contains("</div") || h.contains("<p>") || h.contains("</p>")
+    }
+    // an ext / internal md-link anchor opened by render_with_br (closed by its own "</a>" event)
+    fn html_a_open(h: &str) -> bool {
+        h.starts_with("<a ") && !h.contains("</a>")
+    }
+    // does the neighbour event put a non-space right against a `==` sitting at a Text edge
+    fn atom(ev: Option<&Event>, at_start: bool) -> bool {
+        match ev {
+            Some(Event::Text(n)) => {
+                let c = if at_start { n.chars().next() } else { n.chars().next_back() };
+                c.is_some_and(|c| !c.is_whitespace())
+            }
+            Some(Event::Code(_) | Event::InlineMath(_)) => true,
+            Some(Event::Html(h)) => !html_block(h),
+            Some(Event::Start(_)) => at_start,
+            Some(Event::End(_)) => !at_start,
+            _ => false,
+        }
+    }
+    fn inline_start(t: &Tag) -> bool {
+        matches!(t, Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Superscript | Tag::Subscript)
+    }
+    fn inline_end(t: &TagEnd) -> bool {
+        matches!(t, TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Superscript | TagEnd::Subscript)
+    }
+    // (event index, byte offset of the `==`, is opener)
+    let mut cuts: Vec<(usize, usize, bool)> = Vec::new();
+    let mut open: Vec<Option<(usize, usize)>> = vec![None];
+    let mut code = false;
+    for (k, ev) in evs.iter().enumerate() {
+        match ev {
+            Event::Start(Tag::CodeBlock(_) | Tag::MetadataBlock(_)) => {
+                code = true;
+                open = vec![None];
+            }
+            Event::End(TagEnd::CodeBlock | TagEnd::MetadataBlock(_)) => {
+                code = false;
+                open = vec![None];
+            }
+            _ if code => {}
+            Event::Start(t) if inline_start(t) => open.push(None),
+            Event::End(t) if inline_end(t) => {
+                if open.len() > 1 {
+                    open.pop();
+                }
+            }
+            Event::Html(h) if html_a_open(h) => open.push(None),
+            Event::Html(h) if &**h == "</a>" => {
+                if open.len() > 1 {
+                    open.pop();
+                }
+            }
+            Event::Html(h) if html_block(h) => open = vec![None],
+            Event::Start(_) | Event::End(_) | Event::Rule => open = vec![None],
+            Event::Text(t) => {
+                let s: &str = t;
+                let b = s.as_bytes();
+                let mut i = 0usize;
+                while i + 1 < b.len() {
+                    if !(b[i] == b'=' && b[i + 1] == b'=') {
+                        i += 1;
+                        continue;
+                    }
+                    let d = open.len() - 1;
+                    if let Some((ok, oo)) = open[d] {
+                        if ok == k && oo + 2 == i {
+                            // empty content: this opener fails, rescan from its second '='
+                            open[d] = None;
+                            i = oo + 1;
+                            continue;
+                        }
+                        // '=' is ASCII, so i and i + 2 are char boundaries
+                        let prev_ok = match s[..i].chars().next_back() {
+                            None => k > 0 && atom(evs.get(k - 1), false),
+                            Some(c) => !c.is_whitespace(),
+                        };
+                        open[d] = None;
+                        if prev_ok {
+                            cuts.push((ok, oo, true));
+                            cuts.push((k, i, false));
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    let next_ok = match s[i + 2..].chars().next() {
+                        None => atom(evs.get(k + 1), true),
+                        Some(c) => !c.is_whitespace(),
+                    };
+                    if next_ok {
+                        open[d] = Some((k, i));
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // code spans, math, breaks, task markers, inline html: content atoms, no seam
+            _ => {}
+        }
+    }
+    if cuts.is_empty() {
+        return evs;
+    }
+    cuts.sort_unstable();
+    let mut out = Vec::with_capacity(evs.len() + cuts.len() * 2);
+    let mut c = 0usize;
+    for (k, ev) in evs.into_iter().enumerate() {
+        if c >= cuts.len() || cuts[c].0 != k {
+            out.push(ev);
+            continue;
+        }
+        let Event::Text(t) = ev else { unreachable!("cuts only index Text events") };
+        let t: &str = &t;
+        let mut last = 0usize;
+        while c < cuts.len() && cuts[c].0 == k {
+            let (_, at, opener) = cuts[c];
+            if at > last {
+                out.push(Event::Text(t[last..at].to_string().into()));
+            }
+            out.push(Event::Html(if opener { "<mark>" } else { "</mark>" }.into()));
+            last = at + 2;
+            c += 1;
+        }
+        if last < t.len() {
+            out.push(Event::Text(t[last..].to_string().into()));
+        }
+    }
+    out
+}
+
 /// goal/linebreak REQ-3..14: `soft_br` = Obsidian's reading view with "Strict line
 /// breaks" OFF (its default): a SOFT break inside a paragraph, list item,
 /// quote or emphasis renders as `<br>`, i.e. its own row. Only `SoftBreak`
@@ -2911,6 +4092,17 @@ fn render_with_br(content: &str, notes: &[String], imgs: &[String], reading: boo
     let mut opts = Options::all();
     opts.remove(Options::ENABLE_WIKILINKS);
     opts.remove(Options::ENABLE_SMART_PUNCTUATION);
+    // #59: GFM "alerts" would eat a bare `> [!note]` line (5 types only, no fold, no
+    // title) into <blockquote class="markdown-alert-note">; callouts are ours (callout.rs).
+    // ENABLE_GFM gates nothing else in pulldown-cmark 0.13.
+    opts.remove(Options::ENABLE_GFM);
+    // #59 callout state: one frame per open blockquote, Some((head, content div open))
+    // for a callout. `hdr`: 0 = no header pending, 1 = header paragraph not yet open,
+    // 2 = in it with the `[!type]` marker still in `buf`, 3 = in the title text.
+    let mut co: Vec<Option<(callout::Head, bool)>> = Vec::new();
+    let mut hdr = 0u8;
+    let mut hdr_line: &str = "";
+    let mut hdr_empty = true;
     // rvtask R2: reading view only — every task checkbox carries the 0-based FILE line of
     // its "[" (duplicates / nested / quoted / numbered map exactly), custom statuses
     // ("[/]" "[-]" ...) are tasks too (Obsidian Q2), and the li gets data-task + is-checked (Q5).
@@ -2939,7 +4131,47 @@ fn render_with_br(content: &str, notes: &[String], imgs: &[String], reading: boo
                 }
                 buf.push_str(&t)
             }
+            // #185: a dollar pair with whitespace just inside it (`$ a$`, `$a $`) is text, not
+            // inline math (Obsidian's rule, observed on stock 1.13.7: "$ a$" renders literally)
+            Event::InlineMath(t) if !in_code && (t.starts_with(char::is_whitespace) || t.ends_with(char::is_whitespace)) => {
+                if buf.is_empty() {
+                    buf_at = range.start;
+                }
+                buf.push('$');
+                buf.push_str(&t);
+                buf.push('$');
+            }
             other => {
+                // #59: a callout's header is its first paragraph. Anything else first
+                // (no paragraph, e.g. a setext heading) leaves the title at its default.
+                if hdr == 1 {
+                    if matches!(other, Event::Start(Tag::Paragraph)) {
+                        hdr = 2;
+                        continue;
+                    }
+                    if let Some(Some((h, _))) = co.last() {
+                        evs.push(Event::Html(format!("{}{}", callout::default_title(&h.ty), callout::close_title(h)).into()));
+                    }
+                    hdr = 0;
+                }
+                // #59: the first event of a callout's body opens its content div
+                if hdr == 0 && !matches!(other, Event::End(TagEnd::BlockQuote(_))) {
+                    if let Some(Some((_, open))) = co.last_mut() {
+                        if !*open {
+                            *open = true;
+                            evs.push(Event::Html(callout::CONTENT_OPEN.into()));
+                        }
+                    }
+                }
+                // #59: the header text starts with the `[!type]f` marker: drop it, the
+                // rest of the line is the title (still linkified + escaped below)
+                if hdr == 2 && !buf.is_empty() {
+                    if let Some(Some((h, _))) = co.last() {
+                        callout::strip_marker(&mut buf, hdr_line, h);
+                    }
+                    hdr = 3;
+                    hdr_empty = buf.trim().is_empty();
+                }
                 // rvtask: a custom-status marker "[c] " opening a list item arrives as
                 // plain text — pulldown only knows ' ' / x / X. Strip it, emit the box.
                 if !buf.is_empty() {
@@ -2966,7 +4198,53 @@ fn render_with_br(content: &str, notes: &[String], imgs: &[String], reading: boo
                     }
                     buf.clear();
                 }
+                // #59: the title is the header's FIRST line. A line break closes it and
+                // the rest of that paragraph opens the body; the paragraph's end closes it
+                // with no body yet (the content div opens on the next block, if any).
+                if hdr == 3 {
+                    let brk = matches!(other, Event::SoftBreak | Event::HardBreak);
+                    if brk || matches!(other, Event::End(TagEnd::Paragraph)) {
+                        if let Some(Some((h, open))) = co.last_mut() {
+                            let t = if hdr_empty { callout::default_title(&h.ty) } else { String::new() };
+                            evs.push(Event::Html(format!("{t}{}", callout::close_title(h)).into()));
+                            if brk {
+                                *open = true;
+                                evs.push(Event::Html(format!("{}<p>", callout::CONTENT_OPEN).into()));
+                            }
+                        }
+                        hdr = 0;
+                        continue;
+                    }
+                    hdr_empty = false;
+                }
                 match other {
+                    // #59: a blockquote opening with `[!type]` is a callout (callout.rs)
+                    Event::Start(Tag::BlockQuote(_)) => {
+                        let line = callout::first_line(content, range.start);
+                        match callout::head(line) {
+                            Some(h) if hdr == 0 => {
+                                evs.push(Event::Html(callout::open(&h).into()));
+                                hdr = 1;
+                                hdr_line = line;
+                                hdr_empty = true;
+                                co.push(Some((h, false)));
+                                continue;
+                            }
+                            _ => co.push(None),
+                        }
+                    }
+                    Event::End(TagEnd::BlockQuote(_)) => {
+                        if let Some(Some((h, open))) = co.pop() {
+                            if hdr != 0 {
+                                // header never closed (an empty quote body): close it now
+                                let t = if hdr_empty { callout::default_title(&h.ty) } else { String::new() };
+                                evs.push(Event::Html(format!("{t}{}", callout::close_title(&h)).into()));
+                                hdr = 0;
+                            }
+                            evs.push(Event::Html(if open { "</div></div>\n" } else { "</div>\n" }.into()));
+                            continue;
+                        }
+                    }
                     Event::TaskListMarker(checked) if reading => {
                         tk.marker(if checked { 'x' } else { ' ' }, range.start, &mut evs);
                         continue;
@@ -3073,6 +4351,8 @@ fn render_with_br(content: &str, notes: &[String], imgs: &[String], reading: boo
     if !buf.is_empty() {
         linkify(&buf, notes, imgs, reading, demoted.iter().all(Option::is_some), &mut evs);
     }
+    // #348: ==highlight== -> <mark> (stock reading view), after linkify so link/tag html is never split
+    let evs = mark_highlights(evs);
     let mut out = String::new();
     html::push_html(&mut out, evs.into_iter());
     // R15.11: pulldown-cmark emits "<input .../>\n" for task markers; that newline is a rendered space (~4px) between the
@@ -3097,6 +4377,7 @@ fn block_lines_of(content: &str) -> Vec<u32> {
     let mut opts = Options::all();
     opts.remove(Options::ENABLE_WIKILINKS);
     opts.remove(Options::ENABLE_SMART_PUNCTUATION);
+    opts.remove(Options::ENABLE_GFM); // #59: same options as the renderer (callouts are ours)
     // byte offset -> 1-based line, walked once in step with the (monotonic) block starts
     let mut nl: Vec<usize> = vec![0];
     for (i, b) in content.bytes().enumerate() {
@@ -3154,7 +4435,7 @@ fn render(v: State<Vault>, content: String, otel: Option<perf::Ctx>) -> String {
     // ONE lock for both lists: two `v.index.lock()` calls in one expression is
     // a deadlock on a non-reentrant Mutex, not a style question.
     let ix = v.index.lock().unwrap();
-    span_timed!(otel => "render", render_with_br(&content, ix.names(), ix.images(), true, soft_br), serde_json::json!({"bytes": content.len()}))
+    span_timed!(otel => "render", with_page_sec(|| render_with_br(&content, ix.names(), ix.images(), true, soft_br)), serde_json::json!({"bytes": content.len()}))
 }
 
 /// modeswitch opt4: the reading view's two asks in ONE round trip. The cost of
@@ -3168,7 +4449,7 @@ fn render(v: State<Vault>, content: String, otel: Option<perf::Ctx>) -> String {
 fn render_view(v: State<Vault>, content: String, otel: Option<perf::Ctx>) -> (String, Vec<u32>) {
     let soft_br = !cur_vault(&v).is_some_and(|r| app_bool_in(&r, "strictLineBreaks"));
     let ix = v.index.lock().unwrap();
-    span_timed!(otel => "render_view", (render_with_br(&content, ix.names(), ix.images(), true, soft_br), reading_block_lines(&content)), serde_json::json!({"bytes": content.len()}))
+    span_timed!(otel => "render_view", (with_page_sec(|| render_with_br(&content, ix.names(), ix.images(), true, soft_br)), reading_block_lines(&content)), serde_json::json!({"bytes": content.len()}))
 }
 
 /// pure core of render_blocks: every block rendered against the same note list
@@ -3183,7 +4464,7 @@ fn render_blocks_with(blocks: &[String], notes: &[String], imgs: &[String]) -> V
 fn render_blocks(v: State<Vault>, blocks: Vec<String>, otel: Option<perf::Ctx>) -> Vec<String> {
     let n = blocks.len();
     let ix = v.index.lock().unwrap();
-    span_timed!(otel => "render_blocks", render_blocks_with(&blocks, ix.names(), ix.images()), serde_json::json!({"blocks": n}))
+    span_timed!(otel => "render_blocks", with_page_sec(|| render_blocks_with(&blocks, ix.names(), ix.images())), serde_json::json!({"blocks": n}))
 }
 
 /// R12 source mode: lp rows with every marker revealed (src/srcmode.rs)
@@ -3284,6 +4565,10 @@ struct Mention {
     len: u32,
     /// the mention's line, trimmed to 200 chars for the pane
     text: String,
+    /// issue #178: this hit inside `text` in UTF-16 units (what the pane's JS slices by), so each row
+    /// marks ITS occurrence like stock 1.13.7, not the first one on the line; None = not inside `text`
+    mcol: Option<u32>,
+    mlen: u32,
 }
 
 /// R10.5 Backlinks pane "Unlinked mentions": every other note's plain-text
@@ -3311,8 +4596,20 @@ fn unlinked_in(ix: &Index, name: &str) -> Vec<Mention> {
         // one line table per note, not a lines().nth() walk per hit (editordos #12)
         let lines: Vec<&str> = c.lines().collect();
         for (line, col, len) in hits {
-            let text = lines.get(line as usize).copied().unwrap_or("").trim().chars().take(200).collect();
-            out.push(Mention { note: n.to_string(), line, col, len, text });
+            let raw = lines.get(line as usize).copied().unwrap_or("");
+            let text: String = raw.trim().chars().take(200).collect();
+            // issue #178: col/len are BYTES of the untrimmed line; the pane marks `text` (trimmed, UTF-16).
+            // `text` is a prefix of raw[lead..] (<= 200 chars), so only a hit inside it gets a mark and the
+            // UTF-16 count walks at most those bytes (a 25k-hit line stays linear: editordos_unlinked_in_hostile_note)
+            let lead = raw.len() - raw.trim_start().len();
+            let (a, b) = (col as usize, (col + len) as usize);
+            let (mcol, mlen) = match (raw.get(lead.min(a)..a), raw.get(a..b)) {
+                (Some(pre), Some(hit)) if a >= lead && b <= lead + text.len() => {
+                    (Some(pre.encode_utf16().count() as u32), hit.encode_utf16().count() as u32)
+                }
+                _ => (None, 0),
+            };
+            out.push(Mention { note: n.to_string(), line, col, len, text, mcol, mlen });
         }
     }
     out
@@ -3360,9 +4657,8 @@ fn link_mention_in(
 const LS: &str = "localStorage";
 
 fn mint_vault_id() -> Option<String> {
-    use std::io::Read;
     let mut b = [0u8; 8];
-    fs::File::open("/dev/urandom").ok()?.read_exact(&mut b).ok()?;
+    vaultfs::os_random(&mut b).ok()?;
     Some(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
@@ -3519,7 +4815,7 @@ fn set_snippet_enabled(v: State<Vault>, label: String, on: bool) -> Result<(), S
        is added — community plugins eval, new Function and spawn blob workers,
        as in stock. Never set in the config: a global unsafe-eval is refused.
        af-fix 1a: media-src 'self' blob: is added too (canvas media cards play
-       from a media_read blob); a restricted canvas media card cannot play.
+       from a media_read blob); #196: a restricted page plays them CLICK-TO-PLAY (canvas-cards.js mediaLazy).
    Tauri builds the header per page response; page_csp rewrites it after, from
    the trust flag in ~/.opensidian.json (outside the vault). A page already
    loaded keeps its header, so PAGE_EVAL says which one it got and the loader
@@ -3528,7 +4824,24 @@ static PAGE_EVAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 fn csp_by_trust(header: &str, trusted: bool) -> String {
     if !trusted {
-        return header.to_string();
+        // #139 (operator 2026-11-16): a restricted page plays audio embeds CLICK-TO-PLAY (editor.js audioFill:
+        // preload none, media_read + blob: only after the user presses play), and WebKitGTK plays only from a
+        // blob: URL — so the restricted header gains media-src 'self' blob: and NOTHING else: no 'unsafe-eval',
+        // no blob: in script-src / worker-src, every other directive byte-identical to the config CSP
+        let mut out: Vec<String> = Vec::new();
+        let mut media = false;
+        for d in header.split(';').map(str::trim).filter(|d| !d.is_empty()) {
+            if d.split_whitespace().next() == Some("media-src") {
+                media = true;
+                out.push(if d.split_whitespace().any(|t| t == "blob:") { d.to_string() } else { format!("{d} blob:") });
+            } else {
+                out.push(d.to_string());
+            }
+        }
+        if !media {
+            out.push("media-src 'self' blob:".into());
+        }
+        return out.join("; ");
     }
     let mut out: Vec<String> = Vec::new();
     let (mut worker, mut media) = (false, false);
@@ -3553,12 +4866,248 @@ fn csp_by_trust(header: &str, trusted: bool) -> String {
         out.push("worker-src 'self' blob:".into());
     }
     // af-fix 1a (operator ruling 2026-10-26): the config CSP has no media-src (media = default-src
-    // 'self', no blob:), so only the trusted branch names blob: for media
+    // 'self', no blob:); both branches add media-src 'self' blob: (#139: the restricted one ONLY that)
     if !media {
         out.push("media-src 'self' blob:".into());
     }
     out.join("; ")
 }
+
+/// #144 toggle 1 layer 1, per render call: the renderer mints a remote element only
+/// when THIS page's CSP carries https: (security::PAGE_REMOTE, set in page_csp from the
+/// effective value). Renderer and CSP therefore always agree, and a render costs no
+/// config read; a change of the setting reloads the page (ui/security.js), which
+/// re-runs page_csp.
+fn remote_media_now() -> bool {
+    security::PAGE_REMOTE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// #144 toggle 4, per render call: vault media elements are minted only while THIS page's
+/// CSP still carries opensidian-img: / blob: (security::PAGE_MEDIA, set in page_csp)
+fn vault_media_now() -> bool {
+    security::PAGE_MEDIA.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// a render under THIS page's toggle 1 + toggle 4 state (the render commands' one wrapper)
+fn with_page_sec<T>(f: impl FnOnce() -> T) -> T {
+    security::with_remote(remote_media_now(), || security::with_media(vault_media_now(), f))
+}
+
+/// #144 toggle 5 (docs §1 "5 — WebGL"): set the page webview's WebKitSettings enable-webgl.
+/// Called at window creation and from security_set when the effective value moves; with it
+/// off getContext("webgl" | "webgl2" | "experimental-webgl") is null for app and plugins.
+#[cfg(target_os = "linux")]
+fn sec_webgl<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>, on: bool) {
+    // recorded first: the report security_set returns right after says what was asked for
+    security::PAGE_WEBGL.store(on, std::sync::atomic::Ordering::SeqCst);
+    let r = w.with_webview(move |pw| {
+        use webkit2gtk::{SettingsExt, WebViewExt};
+        if let Some(st) = WebViewExt::settings(&pw.inner()) {
+            st.set_enable_webgl(on);
+            eprintln!("[sec] webgl={} (WebKitSettings enable-webgl)", if on { "on" } else { "off" });
+        }
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] webgl={on} not applied: {e}");
+    }
+}
+/// macOS: WKPreferences' WebGL switch (WebKit SPI `_setWebGLEnabled:`) on the live page webview
+#[cfg(target_os = "macos")]
+fn sec_webgl<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>, on: bool) {
+    security::PAGE_WEBGL.store(on, std::sync::atomic::Ordering::SeqCst);
+    let r = w.with_webview(move |pw| match macos::webview_pref(pw.inner(), "_setWebGLEnabled:", "_webGLEnabled", on) {
+        Ok(_) => eprintln!("[sec] webgl={} (WKPreferences _webGLEnabled)", if on { "on" } else { "off" }),
+        Err(e) => eprintln!("[sec] webgl={on} not applied: {e}"),
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] webgl={on} not applied: {e}");
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sec_webgl<R: tauri::Runtime>(_w: &tauri::WebviewWindow<R>, on: bool) {
+    eprintln!("[sec] webgl={on}: no WebKitSettings on this platform, not enforced");
+}
+
+/// #144 toggle 6 (docs §1 "6 — HTML canvas"), the LIVE half: canvas turned off after the window
+/// was built adds OUR UserScript (all frames, document start) to the page webview's content
+/// manager; back on removes exactly that script (never remove_all_scripts: Tauri's own IPC init
+/// scripts live there too). Either applies at the next page load (security.js reloads while
+/// pageCanvas disagrees). The script object stays on the GTK main thread (with_webview).
+#[cfg(target_os = "linux")]
+fn sec_canvas<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>, add: bool) {
+    // recorded first (like PAGE_WEBGL): a load that starts right after security_set already counts it
+    security::CANVAS_LIVE.store(add, std::sync::atomic::Ordering::SeqCst);
+    let r = w.with_webview(move |pw| {
+        use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        thread_local! {
+            static OURS: std::cell::RefCell<Option<webkit2gtk::UserScript>> = const { std::cell::RefCell::new(None) };
+        }
+        let Some(ucm) = WebViewExt::user_content_manager(&pw.inner()) else {
+            eprintln!("[sec] canvas: the page webview has no content manager, not applied");
+            return;
+        };
+        OURS.with(|o| {
+            let mut o = o.borrow_mut();
+            if let Some(old) = o.take() {
+                ucm.remove_script(&old);
+            }
+            if add {
+                let us = webkit2gtk::UserScript::new(
+                    &security::canvas_script(),
+                    webkit2gtk::UserContentInjectedFrames::AllFrames,
+                    webkit2gtk::UserScriptInjectionTime::Start,
+                    &[],
+                    &[],
+                );
+                ucm.add_script(&us);
+                *o = Some(us);
+            }
+        });
+        eprintln!("[sec] canvas={} (live user script {}, next page load)", if add { "off" } else { "on" }, if add { "added" } else { "removed" });
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] canvas live change not applied: {e}");
+    }
+}
+/// macOS: OUR WKUserScript (all frames, document start) added to / removed from the page's
+/// WKUserContentController (macos::user_script keeps tauri's own scripts); next page load
+#[cfg(target_os = "macos")]
+fn sec_canvas<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>, add: bool) {
+    security::CANVAS_LIVE.store(add, std::sync::atomic::Ordering::SeqCst);
+    let src = add.then(security::canvas_script);
+    let r = w.with_webview(move |pw| match macos::user_script(pw.controller(), src.as_deref()) {
+        Ok(()) => eprintln!("[sec] canvas={} (live user script {}, next page load)", if add { "off" } else { "on" }, if add { "added" } else { "removed" }),
+        Err(e) => eprintln!("[sec] canvas live change not applied: {e}"),
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] canvas live change not applied: {e}");
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sec_canvas<R: tauri::Runtime>(_w: &tauri::WebviewWindow<R>, add: bool) {
+    eprintln!("[sec] canvas off={add}: no user content manager on this platform, applies at the next start");
+}
+
+/// #144 toggle 9 (docs §1 "8 + 9"): what the page webview enforces natively. Off: WebKitSettings
+/// javascript-can-access-clipboard = false (execCommand copy/cut/paste refuse); on: the value the
+/// webview had before we first touched it (wry's choice, today's behaviour). The key / middle-click
+/// gate (sec_clip_gate) reads security::PAGE_APPCLIP at each event, so it follows at once.
+#[cfg(target_os = "linux")]
+fn sec_clip<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>, on: bool) {
+    security::PAGE_APPCLIP.store(on, std::sync::atomic::Ordering::SeqCst);
+    let r = w.with_webview(move |pw| {
+        use webkit2gtk::{SettingsExt, WebViewExt};
+        static ORIG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if let Some(st) = WebViewExt::settings(&pw.inner()) {
+            let orig = *ORIG.get_or_init(|| st.is_javascript_can_access_clipboard());
+            st.set_javascript_can_access_clipboard(on && orig);
+            eprintln!("[sec] appClipboard={} (javascript-can-access-clipboard={}, clipboard keys {})", if on { "on" } else { "off" }, on && orig, if on { "pass" } else { "swallowed" });
+        }
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] appClipboard={on} not applied: {e}");
+    }
+}
+/// macOS: WKPreferences' JS clipboard access (SPI `_setJavaScriptCanAccessClipboard:`): off = false,
+/// on = the value the webview had before we first touched it; the key gate (sec_clip_gate) reads
+/// PAGE_APPCLIP at each key press
+#[cfg(target_os = "macos")]
+fn sec_clip<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>, on: bool) {
+    security::PAGE_APPCLIP.store(on, std::sync::atomic::Ordering::SeqCst);
+    let r = w.with_webview(move |pw| {
+        static ORIG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let set = |v: bool| macos::webview_pref(pw.inner(), "_setJavaScriptCanAccessClipboard:", "_javaScriptCanAccessClipboard", v);
+        let orig = match ORIG.get() {
+            Some(o) => *o,
+            None => match set(false) {
+                Ok(b) => *ORIG.get_or_init(|| b.unwrap_or(false)),
+                Err(e) => return eprintln!("[sec] appClipboard={on} not applied: {e}"),
+            },
+        };
+        match set(on && orig) {
+            Ok(_) => eprintln!("[sec] appClipboard={} (javascript-can-access-clipboard={}, clipboard keys {})", if on { "on" } else { "off" }, on && orig, if on { "pass" } else { "swallowed" }),
+            Err(e) => eprintln!("[sec] appClipboard={on} not applied: {e}"),
+        }
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] appClipboard={on} not applied: {e}");
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sec_clip<R: tauri::Runtime>(_w: &tauri::WebviewWindow<R>, on: bool) {
+    security::PAGE_APPCLIP.store(on, std::sync::atomic::Ordering::SeqCst);
+    eprintln!("[sec] appClipboard={on}: no native key gate on this platform, commands still refuse");
+}
+
+/// #144 toggle 9: GTK handlers on the page webview, connected once. GTK runs these BEFORE
+/// WebKit's own key-press / button-press class handlers (both signals are RUN_LAST), and no
+/// page script can reach them. While PAGE_APPCLIP is off a clipboard binding (security::clip_key)
+/// and a middle-click (PRIMARY paste) are swallowed and the page is told why ("security-clip",
+/// shown as a notice naming the toggle). On: every event passes untouched.
+#[cfg(target_os = "linux")]
+fn sec_clip_gate(w: &tauri::WebviewWindow) {
+    let win = w.clone();
+    let r = w.with_webview(move |pw| {
+        use gtk::glib::translate::IntoGlib;
+        use gtk::prelude::*;
+        let wv: gtk::Widget = pw.inner().upcast();
+        let off = || !security::PAGE_APPCLIP.load(std::sync::atomic::Ordering::SeqCst);
+        let say = move |w: &tauri::WebviewWindow, what: &str| {
+            use tauri::Emitter;
+            eprintln!("[sec] refused {what}: {}", security::clip_key_text());
+            let _ = w.emit("security-clip", security::clip_key_text());
+        };
+        {
+            let win = win.clone();
+            wv.connect_key_press_event(move |_, e| {
+                let m = e.state();
+                let k = e.keyval().into_glib();
+                if off() && security::clip_key(k, m.contains(gdk::ModifierType::CONTROL_MASK), m.contains(gdk::ModifierType::SHIFT_MASK)) {
+                    say(&win, &format!("clipboard key {k:#x}"));
+                    return gtk::glib::Propagation::Stop;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+        }
+        wv.connect_button_press_event(move |_, e| {
+            if off() && e.button() == 2 {
+                say(&win, "middle-click paste");
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] could not wire the clipboard key gate: {e}");
+    }
+}
+/// macOS: an NSEvent key-down monitor (macos::clip_key_monitor) — AppKit runs it before the Edit
+/// menu's key equivalents and before WebKit, and no page script can reach it. While PAGE_APPCLIP
+/// is off, Cmd+C/X/V for this window are swallowed and the page told why ("security-clip").
+#[cfg(target_os = "macos")]
+fn sec_clip_gate(w: &tauri::WebviewWindow) {
+    let nsw = match w.ns_window() {
+        Ok(p) => p as usize,
+        Err(e) => return eprintln!("[sec] could not wire the clipboard key gate: {e}"),
+    };
+    let win = w.clone();
+    let r = w.run_on_main_thread(move || {
+        macos::clip_key_monitor(
+            nsw,
+            || !security::PAGE_APPCLIP.load(std::sync::atomic::Ordering::SeqCst),
+            move |what| {
+                use tauri::Emitter;
+                eprintln!("[sec] refused {what}: {}", security::clip_key_text());
+                let _ = win.emit("security-clip", security::clip_key_text());
+            },
+        )
+    });
+    if let Err(e) = r {
+        eprintln!("[sec] could not wire the clipboard key gate: {e}");
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sec_clip_gate(_w: &tauri::WebviewWindow) {}
 
 /// the response hook of the page window: an HTML page (the only responses
 /// Tauri gives a CSP header) gets the header of the vault's trust state
@@ -3568,16 +5117,37 @@ fn page_csp(h: &tauri::AppHandle, res: &mut tauri::http::Response<std::borrow::C
         return;
     };
     let trusted = cur_vault(&h.state::<Vault>()).is_some_and(|r| plugins::is_trusted(&cfg_value(), &r));
-    let csp = csp_by_trust(&base, trusted);
+    // #144 toggle 1 layer 2: https: in img-src / media-src only while the EFFECTIVE value is on
+    // (offline and lockdown force it off in security::effective_with)
+    let eff = security::effective(&cfg_value());
+    let remote = eff.sec.remote_media;
+    // #144 toggle 4 layer 2: off drops opensidian-img: (img-src) and blob: (media-src)
+    let media = eff.sec.vault_media;
+    // #144 toggle 6 CSP layer: off drops blob: from worker-src
+    // #144 toggle 12: lockdown (trusted is already false there: plugins::is_trusted_key) also
+    // drops 'wasm-unsafe-eval' from the restricted header
+    let csp = security::csp_lockdown(
+        &security::csp_canvas(&security::csp_media(&security::csp_remote(&csp_by_trust(&base, trusted), remote), media), eff.sec.canvas),
+        eff.lockdown,
+    );
     match tauri::http::HeaderValue::from_str(&csp) {
         Ok(v) => {
             res.headers_mut().insert("Content-Security-Policy", v);
             PAGE_EVAL.store(trusted, std::sync::atomic::Ordering::SeqCst);
+            security::PAGE_REMOTE.store(remote, std::sync::atomic::Ordering::SeqCst);
+            security::PAGE_MEDIA.store(media, std::sync::atomic::Ordering::SeqCst);
         }
         // keep Tauri's (restricted) header: never widen on a failure
-        Err(_) => PAGE_EVAL.store(false, std::sync::atomic::Ordering::SeqCst),
+        Err(_) => {
+            PAGE_EVAL.store(false, std::sync::atomic::Ordering::SeqCst);
+            security::PAGE_REMOTE.store(false, std::sync::atomic::Ordering::SeqCst);
+            security::PAGE_MEDIA.store(media, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     eprintln!("[csp] page trusted={trusted} Content-Security-Policy: {}", res.headers()["Content-Security-Policy"].to_str().unwrap_or("?"));
+    eprintln!("[sec] page remoteMedia={remote}");
+    eprintln!("[sec] page vaultMedia={media}");
+    eprintln!("[sec] page lockdown={}", eff.lockdown);
 }
 
 /* ---- cp-unrestricted: synchronous fs for plugins (fs.existsSync, readFileSync, ...).
@@ -3635,24 +5205,98 @@ fn vfs_sync(h: &tauri::AppHandle, req: &tauri::http::Request<Vec<u8>>) -> PageRe
         .expect("vfs sync response")
 }
 
+/// #144 toggle 11: the answer for an engine's bytes while its switch is off
+fn engine_off_response(why: &str) -> PageResponse {
+    tauri::http::Response::builder()
+        .status(403)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(std::borrow::Cow::Owned(format!("403: {why}\n").into_bytes()))
+        .expect("engine off response")
+}
+
 /// the app window, from the config entry, with page_csp on its responses
 fn page_window(app: &tauri::AppHandle, wc: &tauri::utils::config::WindowConfig) -> tauri::Result<()> {
     let h = app.clone();
     let b = tauri::WebviewWindowBuilder::from_config(app, wc)?;
+    // #220: translations are ready before the first script runs (ui/i18n.js)
+    let b = b.initialization_script(&i18n_init_js());
+    // #281: the boot theme is on <html> before the first paint (style.css keys the pre-JS palette on it)
+    let b = b.initialization_script(&theme_init_js(get_theme().as_deref()));
     // census-gate: the title census exists only when opted in (census.rs); off = no script, no flag
     let b = if census::on() { b.initialization_script(census::INIT_JS) } else { b };
     #[cfg(feature = "devui")]
     let b = if devui::root().is_some() { b.initialization_script(devui::INIT_JS) } else { b };
-    b.on_web_resource_request(move |req, res| {
+    // #51: Tauri's own handler claims EVERY drag offering text/uri-list — a browser link drag
+    // too — so the link never reached the editor (attach_drop: Refused::Remote). xdnd owns the
+    // transport instead: a drop naming a local file still goes drop-files -> attach_drop, the rest
+    // is WebKit's (the DOM drop -> Ed.htmlDrop converts its text/html, like stock)
+    let b = b.disable_drag_drop_handler();
+    // macOS port: the native traffic lights over the app's top-left corner (title bar overlaid on
+    // the webview, no title text); the app's own min/max/close and resize strips are hidden by
+    // ui/style.css html.os-mac. AppKit also gives the window its native resize edges back.
+    #[cfg(target_os = "macos")]
+    let b = b.decorations(true).title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true);
+    // #144 toggle 6: canvas off at creation = the stubs as an ALL-FRAMES initialization script,
+    // guaranteed before the first document (it lives as long as the window: back on = restart)
+    let b = if security::effective(&cfg_value()).sec.canvas {
+        b
+    } else {
+        security::CANVAS_FIXED.store(true, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("[sec] canvas=off (all-frames user script at window creation)");
+        b.initialization_script_for_all_frames(security::canvas_script())
+    };
+    let w = b.on_web_resource_request(move |req, res| {
         if req.uri().path() == VFS_SYNC_PATH {
             *res = vfs_sync(&h, &req);
+        // (the config is read only for an engine path, not for every asset)
+        } else if let Some(why) = security::engine_of(req.uri().path())
+            .and_then(|_| security::engine_refusal(&security::effective(&cfg_value()), req.uri().path()))
+        {
+            // #144 toggle 11: the engine's parser bytes never reach the page (403, whoever asks)
+            eprintln!("[sec] refused {}: {why} (403)", req.uri().path());
+            *res = engine_off_response(&why);
         } else {
+            // #144 toggle 11: an engine's bytes are never cached, so a reload after its switch
+            // went off cannot be fed the parser from WebKit's memory cache
+            if security::engine_of(req.uri().path()).is_some() {
+                res.headers_mut().insert("Cache-Control", tauri::http::HeaderValue::from_static("no-store"));
+            }
             #[cfg(feature = "devui")]
             devui::serve(req.uri().path(), res);
             page_csp(&h, res)
         }
     })
+    // #116: a (re)load voids the old page's recorder token and any arm
+    // (#136: and ends a recording the old page started: its recorder webview is closed)
+    .on_page_load(|w, p| {
+        if p.event() == tauri::webview::PageLoadEvent::Started {
+            audiorec::page_started(w.label());
+            use tauri::Manager;
+            rec_close(w.app_handle(), w.label());
+            // #144 toggles 8 + 9: a MAIN-FRAME load = a fresh realm, no community code in it
+            // yet. Not page_csp: that also runs for an iframe's HTML, which a plugin could load
+            // to wash the taint; load-changed is the webview's main frame only.
+            security::REALM_PLUGIN.store(false, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("[sec] realm clean (page load started)");
+            // #144 toggle 6: this document gets the canvas stubs iff they are in the content manager now
+            let cv = !security::canvas_installed();
+            security::PAGE_CANVAS.store(cv, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("[sec] page canvas={}", if cv { "on" } else { "off" });
+        }
+    })
     .build()?;
+    // #116: the microphone gate (audio-only, armed by the core recorder; audiorec.rs)
+    audiorec::install(&w);
+    xdnd::attach(&w);
+    // #144 toggle 5: WebGL as the effective value says, before the page's first script runs
+    // (the setting is read by getContext, not at load, so a later security_set applies live too)
+    sec_webgl(&w, security::effective(&cfg_value()).sec.webgl);
+    // #144 toggle 9: the native clipboard gate (always wired; it passes everything while on)
+    // and javascript-can-access-clipboard as the effective value says
+    sec_clip_gate(&w);
+    sec_clip(&w, security::effective(&cfg_value()).sec.app_clipboard);
     Ok(())
 }
 
@@ -3661,35 +5305,174 @@ fn plugins_state_of(root: &Path) -> serde_json::Value {
         // which CSP the loaded page got (page_csp): eval allowed or not
         "pageEval": PAGE_EVAL.load(std::sync::atomic::Ordering::SeqCst),
         "trusted": plugins::is_trusted(&cfg_value(), root),
+        // #144 toggle 12: why a trusted vault reads restricted right now
+        "lockdown": security::trust_blocked(),
         "enabled": plugins::enabled_ids(root),
         "installed": plugins::installed(root),
+        // #251: per installed plugin "ok" | "new" | "changed" | "damaged" | "unreadable" (plugin_pins::Status)
+        "pins": pins_state_of(root),
     })
+}
+
+/// #251: {status: {id: word}, changed: {id: [file]}, error: null | text} — re-measured from disk
+fn pins_state_of(root: &Path) -> serde_json::Value {
+    let cfg = cfg_value();
+    let vid = plugins::trust_key(root).id;
+    let mut status = serde_json::Map::new();
+    let mut changed = serde_json::Map::new();
+    for p in plugins::installed(root) {
+        let Some(id) = p["id"].as_str() else { continue };
+        let s = plugin_pins::status(&cfg, vid.as_deref(), root, id);
+        if let plugin_pins::Status::Changed(d) = &s {
+            changed.insert(id.into(), serde_json::json!(d));
+        }
+        status.insert(id.into(), serde_json::json!(s.word()));
+    }
+    let error = match (plugin_pins::table(&cfg, vid.as_deref()), &vid) {
+        (Err(e), _) => serde_json::json!(e),
+        (Ok(_), None) => serde_json::json!(plugin_pins::NO_IDENTITY),
+        _ => serde_json::Value::Null,
+    };
+    serde_json::json!({ "status": status, "changed": changed, "error": error })
+}
+
+/* #251 (F-40): the ONLY page-reachable way to pin a plugin found on disk. The page names ids;
+   Rust keeps those that are installed in this vault and not matching a pin now (new / changed /
+   damaged store), measures their files, and asks ONE native question listing all of them (on the
+   first start after the upgrade that is every enabled plugin of a trusted vault, in one dialog).
+   Allow = exactly the measured pins are written (cfgstore Op::PluginPinSet); a file that changes
+   after the measurement does not match and stays refused. Cancel / any failure = nothing written.
+   Restricted mode and lockdown: refused before anything is asked (no plugin runs there anyway). */
+#[tauri::command]
+async fn plugins_pin_ack(win: tauri::Window, v: State<'_, Vault>, ids: Vec<String>) -> Result<serde_json::Value, String> {
+    let root = cur_vault(&v).ok_or("no vault open")?;
+    if !plugins::is_trusted(&cfg_value(), &root) {
+        return Err("restricted mode is on: no plugin code runs in this vault, nothing to allow".into());
+    }
+    let slot = consent::admit()?;
+    let tk = plugins::trust_key(&root);
+    let vid = tk.id.clone().ok_or(plugins::NO_IDENTITY)?;
+    let cfg = cfg_value();
+    let damaged = plugin_pins::table(&cfg, Some(&vid)).is_err();
+    let installed: Vec<String> = plugins::installed(&root).iter().filter_map(|p| p["id"].as_str().map(String::from)).collect();
+    let mut items: Vec<plugin_pins::AckItem> = Vec::new();
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    for id in ids {
+        if items.len() >= plugin_pins::MAX_ACK || !installed.contains(&id) || items.iter().any(|i| i.id == id) {
+            continue;
+        }
+        let Ok(f) = plugin_pins::read_files(&root, &id) else { continue };
+        let was = plugin_pins::status_of(&cfg, Some(&vid), &id, &f);
+        if was == plugin_pins::Status::Ok {
+            continue;
+        }
+        let old_version = plugin_pins::pin(&cfg, Some(&vid), &id).ok().flatten().map(|p| p.version);
+        items.push(plugin_pins::AckItem { pin: plugin_pins::pin_of(&f, "ack", at), id, was, old_version });
+    }
+    if items.is_empty() {
+        return Ok(plugins_state_of(&root));
+    }
+    let text = plugin_pins::ack_text(&tk.path, &items, damaged);
+    if !consent::ask(slot, win, consent::Kind::PluginAck, consent::plugin_ack_question(text)).await? {
+        eprintln!("[plugin-pins] {} plugin(s) not allowed (cancelled), nothing written", items.len());
+        return Ok(plugins_state_of(&root));
+    }
+    let ops: Vec<cfgstore::Op> =
+        items.iter().map(|i| cfgstore::Op::PluginPinSet { vault: vid.clone(), plugin: i.id.clone(), pin: i.pin.clone() }).collect();
+    cfg_update(&ops);
+    for i in &items {
+        eprintln!("[plugin-pins] allowed {} {} (main.js {})", i.id, i.pin.version, &i.pin.main[..16]);
+    }
+    Ok(plugins_state_of(&root))
 }
 
 /// {trusted, enabled:[id], installed:[{id, manifest, hasMain, hasStyles}]}
 #[tauri::command]
 fn plugins_state(v: State<Vault>, otel: Option<perf::Ctx>) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
+    // #127 migration: a trust entry from before the identity binding is bound to the directory
+    // this boot finds at its path (plugins::bind_legacy); every later boot compares against it.
+    // InsertIn (review #129): written only if still absent under the config lock, so this stale
+    // snapshot never overwrites an identity a concurrent trust-ON recorded
+    if let Some((p, k, id)) = plugins::bind_legacy(&cfg_value(), &plugins::trust_key(&root)) {
+        eprintln!("[plugins] trust {k:?}: bound to directory {id}");
+        cfg_update(&[cfgstore::Op::InsertIn(p, k, id)]);
+    }
     Ok(span_timed!(otel => "plugins_state", plugins_state_of(&root)))
 }
 
-/// restricted mode (trusted) and/or one enable toggle; answers the new state
+/// restricted mode (trusted) and/or one enable toggle; answers the new state.
+/// spawn-consent (a): any page script can invoke this, so turning trust ON
+/// for a vault that is not trusted yet is asked natively first
+/// (consent::TRUST_TITLE, the canonical vault path from Rust). Cancel = this
+/// call writes NOTHING (neither the flag nor an enable toggle in the same
+/// call) and answers the unchanged state. Turning trust OFF is never asked.
+/// G1 (PR #41): the trust epoch is read before the dialog opens and checked under the
+/// lifecycle lock the flag is written under — a Trust answer from a dialog that was open
+/// across another flip (a trust-OFF: kill_all + close_all) is discarded with an
+/// error, nothing written (desk_proc::trust_write).
+/// async: tauri runs it off the main thread, which the open dialog needs.
 #[tauri::command]
-fn plugins_set(
-    v: State<Vault>,
+async fn plugins_set(
+    win: tauri::Window,
+    v: State<'_, Vault>,
     trusted: Option<bool>,
     id: Option<String>,
     on: Option<bool>,
     otel: Option<perf::Ctx>,
 ) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
+    // G1: the epoch before anything is read or asked (the guard is dropped before the await)
+    let seen = {
+        let life = desk_proc::lifecycle();
+        desk_proc::trust_epoch(&life)
+    };
+    // #144 toggle 12: under lockdown every vault is restricted (plugins::is_trusted_key); a trust-ON
+    // would only be written and not apply, so it is refused before anything is asked or written
+    if trusted == Some(true) && security::trust_blocked() {
+        return Err(format!("turning restricted mode off: every vault is restricted while lockdown is on {}", security::named("lockdown")));
+    }
+    // P1 (PR #42): every ON write carries `seen`, also when the vault was already trusted and
+    // nothing is asked — a trust-OFF landing after the is_trusted read makes it EAGAIN
+    let (ask, carries) = desk_proc::trust_plan(trusted == Some(true), seen, || plugins::is_trusted(&cfg_value(), &root));
+    if ask {
+        // BB2 (PR #42 round 11): the place in the question queue before trust_key (a lookup)
+        let slot = consent::admit()?;
+        let key = plugins::trust_key(&root);
+        // #127 (review #129): a root without an identity cannot be trusted — say so, do not ask
+        if trusted == Some(true) && key.id.is_none() {
+            return Err(plugins::NO_IDENTITY.into());
+        }
+        if !consent::ask(slot, win, consent::Kind::Trust, consent::trust_question(&key)).await? {
+            eprintln!("[consent] trust {key:?}: cancelled, nothing written");
+            return Ok(plugins_state_of(&root));
+        }
+    }
+    let asked = carries;
     span_timed!(otel => "plugins_set", (|| -> Result<serde_json::Value, String> {
         if let Some(t) = trusted {
+            // F5/N5: held across (flag write, kill_all, close_all), the lock desk_proc_spawn holds
+            // across (trust recheck, start, register) and desk_net_listen across (check, bind, register) — no spawn can land between the write and the kill
+            // CC1 (PR #42 round 12): the trust key (canonicalize of the vault root, a path lookup)
+            // before the lock, so a stalled vault mount cannot hold up the lock this write takes
             let key = plugins::trust_key(&root);
-            cfg_update(&[cfgstore::Op::SetIn(plugins::TRUST_KEY.into(), key, serde_json::json!(t))]);
+            // #127: ON binds the entry to this directory (plugins::trust_bind: the identity written with
+            // the flag, one update); a root without an identity is refused here, before the lock, nothing written
+            let bind = plugins::trust_bind(&key, t)?;
+            let life = desk_proc::lifecycle();
+            // G1: a Trust answer that went stale while its dialog was open writes nothing
+            if let Err(e) = desk_proc::trust_write(asked, &life) {
+                eprintln!("[consent] trust {key:?}: answer from before another flip, discarded, nothing written");
+                return Err(e);
+            }
+            let mut ops = vec![cfgstore::Op::SetIn(plugins::TRUST_KEY.into(), key.path.clone(), serde_json::json!(t))];
+            if let Some(id) = bind {
+                ops.push(cfgstore::Op::SetIn(plugins::TRUST_ID_KEY.into(), key.path.clone(), serde_json::json!(id)));
+            }
+            cfg_update(&ops);
             if !t {
-                desk_proc::kill_all();   // flip OFF: what plugins started stops with them
-                desk_net::close_all();
+                desk_proc::kill_all(&life); // flip OFF: what plugins started stops with them
+                desk_net::close_all(&life); // N5: so do its listeners, under the lock desk_net_listen binds under
             }
         }
         if let (Some(id), Some(on)) = (id.as_deref(), on) {
@@ -3713,7 +5496,9 @@ fn plugin_io(
         "load" => plugins::read_data(&root, &id),
         "save" => plugins::write_data(&root, &id, data.as_ref().unwrap_or(&serde_json::Value::Null))
             .map(|_| serde_json::Value::Null),
-        "styles" => plugins::read_styles(&root, &id).map(|s| s.map_or(serde_json::Value::Null, serde_json::Value::String)),
+        // #251: a plugin's css is applied only while the plugin matches its pin
+        "styles" => plugins::read_styles_pinned(&root, &id, &cfg_value(), plugins::trust_key(&root).id.as_deref())
+            .map(|s| s.map_or(serde_json::Value::Null, serde_json::Value::String)),
         _ => Err(format!("plugin_io: unknown op {op:?}")),
     })
 }
@@ -3742,25 +5527,279 @@ fn plugin_vfs(
 /* ---- cp-unrestricted: child_process for plugins (desk_proc.rs). Stock lets a
    plugin spawn with the user's rights once community plugins are on; the gate
    here is the same flip, checked on every spawn: an untrusted vault starts
-   nothing. read/write/end/kill act only on ids a spawn handed out. */
+   nothing. read/write/end/kill act only on ids a spawn handed out.
+   spawn-consent (b): on top of the flip, EVERY spawn is asked natively
+   (consent::SPAWN_TITLE) with the Spec desk_proc::start will run — program,
+   args after map_arg, cwd after map_cwd, env keys. Deny = EPERM, nothing
+   forked. #74: the one exception is a spawn the user answered "Always allow this
+   program" for earlier — same vault, same plugin with the same main.js + manifest.json
+   on disk, same program with the same bytes (spawn_want, spawn_allow.rs); the grant
+   is written only by the Remember.grant closure built here, after that button.
+   scripts/consent-nobypass.sh fails the build if any path reaches
+   desk_proc::start without that question. */
+/// #74: what a plugin's spawn is, measured HERE (never taken from the page beyond the plugin
+/// id): the canonical vault, the plugin id (a valid id, enabled in this vault) with the sha256
+/// of its main.js + manifest.json on disk, the absolute program and the sha256 of the pinned
+/// file the exec will run. None = no "Always" offered (the reason is logged).
+fn spawn_want(root: &Path, plugin: Option<&str>, sp: &desk_proc::Spec) -> Option<spawn_allow::Want> {
+    let id = plugin?;
+    let why = |e: String| eprintln!("[desk] spawn {}: no Always offered for plugin {id:?}: {e}", sp.file);
+    if !plugins::valid_id(id) || !plugins::enabled_ids(root).iter().any(|e| e == id) {
+        why("not an enabled plugin of this vault".into());
+        return None;
+    }
+    let (plugin_sha256, plugin_version) = spawn_allow::plugin_fingerprint(root, id).map_err(why).ok()?;
+    let prog = sp.prog.as_ref()?;
+    let program_sha256 = spawn_allow::program_sha256(prog.stat_key(), || prog.open_read()).map_err(why).ok()?;
+    Some(spawn_allow::Want { vault: plugins::trust_key(root).path, plugin: id.to_string(), plugin_sha256, plugin_version, program: sp.file.clone(), program_sha256 })
+}
+
+/* #74 Settings > Allowed programs. The webview may LIST and REVOKE grants, never add one:
+   these two commands are the only spawnAllow surface it can reach (a grant is written only by
+   the Always answer of a native spawn dialog, desk_proc_spawn -> consent::ask). The list is
+   every grant in ~/.opensidian.json with its status re-measured from disk ("ok" | "outdated"
+   | "unknown": spawn_allow::status) and the ALWAYS_NOTE the pane shows above it.
+   async: status() reads plugin files and may hash a program; not on the main thread. */
 #[tauri::command]
-fn desk_proc_spawn(
-    v: State<Vault>,
+async fn spawn_allow_list() -> Result<serde_json::Value, String> {
+    let rows: Vec<serde_json::Value> = spawn_allow::grants(&cfg_value())
+        .iter()
+        .map(|g| {
+            let mut x = serde_json::to_value(g).unwrap_or(serde_json::Value::Null);
+            x["status"] = serde_json::Value::from(spawn_allow::status(g));
+            x
+        })
+        .collect();
+    Ok(serde_json::json!({ "note": consent::ALWAYS_NOTE, "grants": rows }))
+}
+
+/// #74: drop the grant for (vault, plugin, program); the next spawn asks again. Revoking a
+/// grant that is not there is not an error. Answers the list as it is after the revoke.
+#[tauri::command]
+async fn spawn_allow_revoke(vault: String, plugin: String, program: String) -> Result<serde_json::Value, String> {
+    cfg_update(&[cfgstore::Op::SpawnAllowRevoke { vault, plugin, program }]);
+    spawn_allow_list().await
+}
+
+/* #144 Settings › Security (security.rs, docs/security-section.md §0/§2). security_get answers
+   the stored + effective values, what forces a row and which restart-bound fields wait for a
+   restart. security_set changes ONE known boolean field: a change that LOWERS a protection
+   (security::weakens) is asked in a native dialog first (consent Kind::Security) — plugin code
+   shares this page and this command, and page script cannot answer that window. A change that
+   raises a protection is written at once. Only Op::SecuritySet writes the key. */
+#[tauri::command]
+fn security_get() -> serde_json::Value {
+    let mut r = security::report(&cfg_value());
+    // #293: the sandbox state of THIS process (off / enforced / not-enforced), shown read-only
+    r["sandbox"] = sandbox::state_json();
+    r
+}
+
+/* #144 toggle 12 "Restart now" (also JIT / canvas "Applies after restart"): a switch onto THIS
+   window's own vault. The UI has flushed every buffer (leaveVault) before calling. The child
+   gets this window's rect and a restart token naming this pid (spawn::restart_token): the
+   spawner's lock probe lets it through and the child waits for our lock (bind_vault_boot_after)
+   — so this process exits as soon as the child exists, not after it is ready. Refused while
+   nothing waits for a restart: page code cannot bounce the app at will. */
+#[tauri::command]
+async fn security_restart(app: tauri::AppHandle, win: tauri::Window, v: State<'_, Vault>) -> Result<u32, String> {
+    let pending = security::report(&cfg_value())["restartPending"].as_array().map_or(0, Vec::len);
+    if pending == 0 {
+        return Err("no Security setting is waiting for a restart".into());
+    }
+    let p = cur_vault(&v).ok_or("no vault is open in this window")?;
+    let r = switch_rect(&win)?;
+    let mut sw = switch_of(&win)?;
+    sw.token = spawn::restart_token();
+    sw.check()?;
+    let (p2, sw2) = (p.clone(), sw.clone());
+    let pid = tauri::async_runtime::spawn_blocking(move || match spawner::client() {
+        Some(c) => c.open(&p2, Some(&sw2)),
+        None => spawn_checked(&p2, Some(&sw2)),
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    eprintln!("[sec] restart: pid={} hands {} to pid={pid} token={}", std::process::id(), p.display(), sw.token);
+    // app.exit fires no CloseRequested: save this vault's rect here (as await_switch does)
+    winsize_save(&win, r, "restart");
+    app.exit(0);
+    Ok(pid)
+}
+
+#[tauri::command]
+async fn security_set(win: tauri::Window, field: String, on: bool) -> Result<serde_json::Value, String> {
+    let (field, on) = security::validate(&field, on)?;
+    let stored = security::Sec::from_cfg(&cfg_value());
+    if security::weakens(stored, field, on) {
+        let slot = consent::admit()?;
+        if !consent::ask(slot, win.clone(), consent::Kind::Security, consent::security_question(field, on)).await? {
+            eprintln!("[sec] set {field}={on}: cancelled in the confirm, nothing written");
+            return Ok(security::report(&cfg_value()));
+        }
+    }
+    cfg_update(&[cfgstore::Op::SecuritySet(field.into(), on)]);
+    eprintln!("[sec] set {field}={on}");
+    // toggle 11 (and the plugin-visible snapshot): the page re-reads security_get whoever called
+    // this; ui/security.js unloads an engine that just went off while it is in the page
+    {
+        use tauri::Emitter;
+        let _ = win.emit("security-changed", field);
+    }
+    // toggle 5 live: WebGL itself, HTML canvas (forces it off) — the webview follows at once
+    let applied = security::PAGE_WEBGL.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(gl) = security::webgl_change(&security::effective(&cfg_value()), applied) {
+        use tauri::{Emitter, Manager};
+        match win.app_handle().get_webview_window(win.label()) {
+            Some(w) => sec_webgl(&w, gl),
+            None => eprintln!("[sec] webgl={gl}: no webview window {}", win.label()),
+        }
+        // whoever moved it (the pane, or a script calling the command): the page's graphs follow
+        let _ = win.emit("security-webgl", gl);
+    }
+    // toggle 6 live: add / remove OUR canvas user script (next page load; security.js reloads)
+    let fixed = security::CANVAS_FIXED.load(std::sync::atomic::Ordering::SeqCst);
+    let live = security::CANVAS_LIVE.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(add) = security::canvas_change(&security::effective(&cfg_value()), fixed, live) {
+        use tauri::Manager;
+        match win.app_handle().get_webview_window(win.label()) {
+            Some(w) => sec_canvas(&w, add),
+            None => eprintln!("[sec] canvas off={add}: no webview window {}", win.label()),
+        }
+    }
+    // toggle 9 live: the native gate + the WebKit setting follow the effective value at once
+    let clip = security::effective(&cfg_value()).sec.app_clipboard;
+    if clip != security::PAGE_APPCLIP.load(std::sync::atomic::Ordering::SeqCst) {
+        use tauri::Manager;
+        match win.app_handle().get_webview_window(win.label()) {
+            Some(w) => sec_clip(&w, clip),
+            None => eprintln!("[sec] appClipboard={clip}: no webview window {}", win.label()),
+        }
+    }
+    Ok(security::report(&cfg_value()))
+}
+
+/// #295 Settings › Security › Microphone = "ask" | "always" | "off": validated; a change that lowers
+/// a protection (off -> ask, off / ask -> always) asks the native Security confirm first and is
+/// written only after Lower protection (security::mic_decide); a revoke (always -> ask / off,
+/// ask -> off) is written at once with no dialog; only Op::SecurityMic writes it
+#[tauri::command]
+async fn security_mic_set(win: tauri::Window, value: String) -> Result<serde_json::Value, String> {
+    let m = security::mic_validate(&value)?;
+    let stored = security::mic_stored(&cfg_value());
+    let mut confirmed = false;
+    if security::mic_weakens(stored, m) {
+        let slot = consent::admit()?;
+        confirmed = consent::ask(slot, win.clone(), consent::Kind::Security, consent::security_mic_question(m)).await?;
+    }
+    let Some(m) = security::mic_decide(stored, m, confirmed) else {
+        eprintln!("[sec] set microphone={}: cancelled in the confirm, nothing written", m.as_str());
+        return Ok(security::report(&cfg_value()));
+    };
+    cfg_update(&[cfgstore::Op::SecurityMic(m.as_str().into())]);
+    eprintln!("[sec] set microphone={}", m.as_str());
+    {
+        use tauri::Emitter;
+        let _ = win.emit("security-changed", security::MIC_FIELD);
+    }
+    Ok(security::report(&cfg_value()))
+}
+
+/// devaccess: one Settings › Security › Device access row (security::DEV_ROWS) = "ask" | "always" |
+/// "off": validated (known row, known value); a weakening change (off -> ask, off / ask -> always)
+/// asks the native Security confirm first and is written only after Lower protection
+/// (security::dev_decide); a revoke is written at once with no dialog; only Op::SecurityDev writes it.
+/// Keyed by the row alone: nothing the page reports (plugin id, vault, origin) enters the decision.
+#[tauri::command]
+async fn security_dev_set(win: tauri::Window, field: String, value: String) -> Result<serde_json::Value, String> {
+    let (f, m) = security::dev_validate(&field, &value)?;
+    let stored = security::dev_stored(&cfg_value(), f);
+    let mut confirmed = false;
+    if security::mic_weakens(stored, m) {
+        let slot = consent::admit()?;
+        confirmed = consent::ask(slot, win.clone(), consent::Kind::Security, consent::security_dev_question(f, m)).await?;
+    }
+    let Some(m) = security::dev_decide(stored, m, confirmed) else {
+        eprintln!("[sec] set {f}={}: cancelled in the confirm, nothing written", m.as_str());
+        return Ok(security::report(&cfg_value()));
+    };
+    cfg_update(&[cfgstore::Op::SecurityDev(f.into(), m.as_str().into())]);
+    eprintln!("[sec] set {f}={}", m.as_str());
+    {
+        use tauri::Emitter;
+        let _ = win.emit("security-changed", f);
+    }
+    Ok(security::report(&cfg_value()))
+}
+
+#[tauri::command]
+async fn desk_proc_spawn(
+    win: tauri::Window,
+    v: State<'_, Vault>,
     file: String,
     args: Option<Vec<String>>,
     cwd: Option<String>,
     env: Option<std::collections::BTreeMap<String, String>>,
+    plugin: Option<String>,
+    verbatim: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
     if !plugins::is_trusted(&cfg_value(), &root) {
         return Err("EPERM: restricted mode, plugins cannot start programs".into());
     }
+    spawn_allowed("spawn", plugin.as_deref())?;
+    // Windows only (Spec::verbatim): Node ignores windowsVerbatimArguments elsewhere, so do we
+    let verbatim = cfg!(windows) && verbatim.unwrap_or(false); // #144 toggle 10: before admit = no dialog
+    // BB2 (PR #42 round 11): the place in the question queue FIRST — beyond MAX_IN_FLIGHT this is
+    // EBUSY before any lookup or pin (resolve), no fs work, no fd opened; ask demands the slot
+    let slot = consent::admit()?;
     let args: Vec<String> = args.unwrap_or_default().iter().map(|a| desk_proc::map_arg(&root, a)).collect();
-    let sp = desk_proc::Spec { file, args, cwd: desk_proc::map_cwd(&root, cwd.as_deref()), env: env.unwrap_or_default().into_iter().collect() };
+    let sp = desk_proc::Spec { file, args, cwd: desk_proc::map_cwd(&root, cwd.as_deref()), root: root.clone(), env: env.unwrap_or_default().into_iter().collect(), argv0: None, verbatim, path: None, prog: None, dir: None };
+    consent::check_env(&sp)?; // F6 + Q4: an env, or program + args + cwd, over the cap is refused, nothing asked
+    let sp = consent::resolve(sp)?; // F1: file = the absolute path the dialog names and exec runs
+    // #74: "Always allow this program" is offered only when the spawn names an enabled plugin of
+    // this vault whose main.js + manifest.json fingerprint from disk, and the pinned program
+    // hashes. Anything less = the question is asked as before, Deny / Allow once only.
+    let q = match spawn_want(&root, plugin.as_deref(), &sp) {
+        Some(want) => {
+            let (w1, w2) = (want.clone(), want.clone());
+            let remember = consent::Remember {
+                granted: Box::new(move || spawn_allow::granted(&cfg_value(), &w1)),
+                grant: Box::new(move || {
+                    let added = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    eprintln!("[desk] spawn {}: always allowed for plugin {} (vault {})", w2.program, w2.plugin, w2.vault);
+                    cfg_update(&[cfgstore::Op::SpawnAllowAdd(w2.grant(added))]);
+                }),
+            };
+            consent::spawn_question_always(&sp, &want.plugin, &want.plugin_version, remember)
+        }
+        None => consent::spawn_question(&sp),
+    };
+    if !consent::ask(slot, win, consent::Kind::Spawn, q).await? {
+        eprintln!("[desk] spawn {} {:?} cwd={}: denied by the user", sp.file, sp.args, sp.cwd.display());
+        return Err(format!("EPERM: spawn {} denied by the user", sp.file));
+    }
+    // Q1 (PR #42 round 4): every filesystem lookup of a PATH entry (the child PATH is
+    // canonicalized entry by entry) happens HERE, before the lock: a stalled mount in a
+    // plugin's PATH cannot hold up a trust-OFF waiting on the lifecycle lock
+    let sp = desk_proc::prepare(sp, std::env::var_os("PATH"));
+    // CC1 (PR #42 round 12): so is the vault's trust key (canonicalize of the root). DD1 (round 13):
+    // the trust epoch is read BEFORE that key; a trust write since (a trust-OFF for a root retargeted
+    // in between, its kill_all already run) makes this EAGAIN under the lock, nothing started
+    let seen = desk_proc::trust_epoch_now();
+    let key = plugins::trust_key(&root);
+    // F5: (recheck, start, register) under the lock plugins_set holds across a trust-OFF
+    // (flag write, kill_all): the flip may have gone OFF while the question was open
+    let life = desk_proc::lifecycle();
+    seen.unmoved(&life)?;
+    if !plugins::is_trusted_key(&cfg_value(), &key) {
+        return Err("EPERM: restricted mode, plugins cannot start programs".into());
+    }
     eprintln!("[desk] spawn {} {:?} cwd={}", sp.file, sp.args, sp.cwd.display());
-    let run = span_timed!("desk_proc_spawn", desk_proc::start(sp))?;
+    let run = span_timed!("desk_proc_spawn", desk_proc::start(sp, &life))?;
     let pid = run.pid();
-    Ok(serde_json::json!({ "id": desk_proc::register(run), "pid": pid }))
+    let id = desk_proc::register(run, &life);
+    drop(life);
+    Ok(serde_json::json!({ "id": id, "pid": pid }))
 }
 
 #[tauri::command]
@@ -3794,14 +5833,24 @@ fn desk_proc_kill(id: u64, signal: Option<String>) -> Result<bool, String> {
 /* ---- cp-unrestricted: TCP listeners for plugins (desk_net.rs) — node net /
    http servers (slides preview, local-rest-api). Same gate as child_process:
    the vault's trust flip, checked on every listen; socket ops act only on ids
-   a listener of this app handed out. */
+   a listener of this app handed out. N5 (PR #41): the check, the bind and the
+   register run under the lifecycle lock plugins_set holds across a trust-OFF
+   (flag write, close_all), so a listen that passed its check cannot register
+   after close_all and stay bound (desk_net::listen_trusted). */
 #[tauri::command]
-fn desk_net_listen(v: State<Vault>, host: Option<String>, port: u16) -> Result<serde_json::Value, String> {
+fn desk_net_listen(v: State<Vault>, host: Option<String>, port: u16, plugin: Option<String>) -> Result<serde_json::Value, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
-    if !plugins::is_trusted(&cfg_value(), &root) {
-        return Err("EPERM: restricted mode, plugins cannot open servers".into());
-    }
-    let (id, s) = span_timed!("desk_net_listen", desk_net::listen(host.as_deref().unwrap_or(""), port))?;
+    plugin_net_allowed("net.createServer", plugin.as_deref())?; // #144 toggles 3+2: a listener is a network surface too
+    // CC1 (PR #42 round 12, CodeAnt): listen_trusted calls `trusted` a second time UNDER the
+    // lifecycle lock (desk_net::listen_trusted_via). The trust key canonicalizes the vault root (a
+    // path lookup: a stalled FUSE/NFS vault stands still in it), so it is computed HERE, before
+    // listen_trusted; the closure only reads the config and compares keys — the lock walks no path.
+    // DD1 (round 13): the trust epoch read BEFORE the key; listen_trusted refuses under the lock
+    // (EAGAIN, nothing bound) when a trust write landed since — e.g. a trust-OFF for a retargeted root
+    let seen = desk_proc::trust_epoch_now();
+    let key = plugins::trust_key(&root);
+    let trusted = || plugins::is_trusted_key(&cfg_value(), &key);
+    let (id, s) = span_timed!("desk_net_listen", desk_net::listen_trusted(seen, trusted, host.as_deref().unwrap_or(""), port))?;
     eprintln!("[desk] listen {}:{} id={id}", s.address, s.port);
     Ok(serde_json::json!({ "id": id, "port": s.port, "address": s.address }))
 }
@@ -3852,11 +5901,12 @@ fn desk_sock_destroy(id: u64) -> Result<(), String> {
    every request. Stock requestUrl reaches any host without CORS; ours does that
    for http://, https:// is refused until a TLS client is a pinned dependency. */
 #[tauri::command]
-async fn desk_http_request(v: State<'_, Vault>, req: desk_http::Req) -> Result<desk_http::Resp, String> {
+async fn desk_http_request(v: State<'_, Vault>, req: desk_http::Req, plugin: Option<String>) -> Result<desk_http::Resp, String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
     if !plugins::is_trusted(&cfg_value(), &root) {
         return Err("EPERM: restricted mode, plugins cannot make requests".into());
     }
+    plugin_net_allowed("requestUrl", plugin.as_deref())?; // #144 toggles 3+2
     let what = format!("{} {}", req.method.as_deref().unwrap_or("GET"), req.url.split('?').next().unwrap_or(""));
     let r = tauri::async_runtime::spawn_blocking(move || desk_http::request(&req)).await.map_err(|e| e.to_string())?;
     match &r {
@@ -3871,45 +5921,78 @@ async fn desk_http_request(v: State<'_, Vault>, req: desk_http::Req) -> Result<d
    opener with the user's rights; so does this (xdg-open, no shell). "/vault/x"
    is the vault's real path (getBasePath), as for child_process cwd. op "vault"
    (top5-func: app.openWithDefaultApp) takes a vault path and is confined to the
-   vault (desk_proc::vault_open_target). */
+   vault (desk_proc::vault_open_target). G3 (PR #41): xdg-open runs whatever a local
+   target maps to (.desktop Exec=, scripts, executables, custom scheme handlers), so every
+   target but an http(s)/mailto URL is asked first through the spawn dialog — program
+   xdg-open (resolved like any spawn), the target in full, asked every time — and Deny is
+   EPERM with nothing started (desk_proc::shell_target says which). async: the dialog.
+   P4 (PR #42): the dialog shows the target's final path (symlinks resolved), its identity
+   (dev/ino/mode/size/mtime/ctime) is recorded before asking, and desk_proc::shell_open re-checks
+   it right before the exec: a file replaced or swapped for a symlink while the dialog was
+   open is refused (EPERM), not opened. RESIDUAL WINDOW: from that recheck to xdg-open's own
+   open of the path (fork/exec of xdg-open, then its handler opens by name) a swap is still
+   possible — xdg-open has no open-by-fd interface; see desk_proc::ShellOpen.
+   R1: a directory target is the same directory while (dev, ino, mode) are — a sibling saved
+   meanwhile does not refuse it. R4: xdg-open (asked or not) runs in "/" with PATH cut to its
+   absolute entries (desk_proc::Launch). R5: the question is consent::open_question — it names
+   the target, says opening it may run it, and does not claim a plugin asks. */
 #[tauri::command]
-fn desk_shell(v: State<Vault>, op: String, target: String) -> Result<(), String> {
+async fn desk_shell(win: tauri::Window, v: State<'_, Vault>, op: String, target: String) -> Result<(), String> {
     let root = cur_vault(&v).ok_or("no vault open")?;
     if !plugins::is_trusted(&cfg_value(), &root) {
         return Err("EPERM: restricted mode, plugins cannot use the shell".into());
     }
-    let arg = match op.as_str() {
-        "external" => {
-            let scheme = target.split(':').next().unwrap_or("");
-            let ok = target.contains(':') && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-            if !ok {
-                return Err(format!("EINVAL: not a URL: {target}"));
-            }
-            std::ffi::OsString::from(&target)
+    spawn_allowed(&format!("shell {}", security::plugin_label(&op)), None)?; // #144 toggle 10: every op execs xdg-open
+    if ext_ok(&target, false) {
+        net_allowed("openExternal")?; // #144 toggle 3: a plugin's URL open is the browser's network; no confirm path from a plugin
+    }
+    // BB2 (PR #42 round 11): the place in the question queue FIRST, then the target and the
+    // opener (resolved + pinned) — beyond MAX_IN_FLIGHT, EBUSY with no lookup and no fd opened
+    let desk_proc::ShellPrep { slot, opener, target: t, ask } = desk_proc::shell_prepare(&root, &op, &target)?;
+    if ask {
+        // Y1/AA1: resolve pinned xdg-open; it is exec'd through THAT open file (its fd), never the
+        // pathname again — a file swapped in at the path during the dialog is never run (EPERM)
+        // R5: the open question (names the target, says it may run it; neutral about who asks)
+        if !consent::ask(slot, win, consent::Kind::Spawn, consent::open_question(&opener, &t.arg)).await? {
+            eprintln!("[desk] shell {op} {:?}: denied by the user", t.arg);
+            return Err(format!("EPERM: open {} denied by the user", t.arg));
         }
-        "path" => desk_proc::map_cwd(&root, Some(&target)).into_os_string(),
-        // app.openWithDefaultApp: vault paths only, symlinks resolved and confined to the vault
-        "vault" => desk_proc::vault_open_target(&root, &target)?.into_os_string(),
-        "reveal" => {
-            let p = desk_proc::map_cwd(&root, Some(&target));
-            p.parent().map(|d| d.to_path_buf()).unwrap_or(p).into_os_string()
-        }
-        _ => return Err(format!("EINVAL: unknown shell op {op}")),
-    };
-    eprintln!("[desk] shell {op} {}", arg.to_string_lossy());
-    std::process::Command::new("xdg-open")
-        .arg(&arg)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|mut c| {
-            std::thread::spawn(move || {
-                let _ = c.wait();   // reap it, no zombie
-            });
-        })
-        .map_err(|e| format!("ENOENT: xdg-open: {e}"))
+    } else {
+        drop(slot); // an http(s)/mailto URL: nothing asked, the place is given back
+    }
+    // Q1 (PR #42 round 4): the opener's cleaned PATH (canonicalize of every entry) before the lock;
+    // BB1: so is the vault's trust key (canonicalize of the root) — the lock walks no path
+    let opener_path = desk_proc::opener_path(std::env::var_os("PATH"), &root);
+    // DD1 (round 13): the trust epoch BEFORE the key; shell_open refuses under the lock (EAGAIN,
+    // nothing opened) when a trust write landed since
+    let seen = desk_proc::trust_epoch_now();
+    let key = plugins::trust_key(&root);
+    eprintln!("[desk] shell {op} {}", t.arg);
+    // BB1: shell_open = the target's identity recheck (a path lookup) BEFORE the lifecycle lock,
+    // then under it the trust recheck (the flip may have gone OFF while the question was open, F5),
+    // the opener's fd-only check and the exec. P4: R4: cwd "/", PATH absolute entries only.
+    // AA1: the opener is exec'd by its held fd (l.program()), rechecked in pre_exec (l.apply)
+    #[cfg(windows)]
+    let r = desk_proc::shell_open(seen, &t, &opener, opener_path, || plugins::is_trusted_key(&cfg_value(), &key), |_l| {
+        // ShellExecuteW: the approved target is ONE LPCWSTR, never cmd.exe (the opener the question named
+        // is explorer.exe, pinned and rechecked above; the shell, not that file, performs the open)
+        win_shell_execute(std::ffi::OsStr::new(&t.arg), "open")
+    });
+    #[cfg(unix)]
+    let r = desk_proc::shell_open(seen, &t, &opener, opener_path, || plugins::is_trusted_key(&cfg_value(), &key), |l| {
+        let mut cmd = std::process::Command::new(l.program());
+        l.apply(&mut cmd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        cmd.spawn().map_err(|e| desk_proc::opener_err(&opener.file, &e))
+    })
+    .map(|mut c| {
+        std::thread::spawn(move || {
+            let _ = c.wait();   // reap it, no zombie
+        });
+    });
+    if let Err(e) = &r {
+        eprintln!("[desk] shell {op} {}: {e}", t.arg);
+    }
+    r
 }
 
 /* ---- themefs R5 (themes): the listing predicate is the oracle's, verbatim
@@ -4280,6 +6363,20 @@ fn lines_with_offsets(content: &str) -> impl Iterator<Item = (usize, &str, u32)>
 }
 
 fn search_docs<'a>(docs: impl IntoIterator<Item = (&'a str, &'a str, &'a [String])>, query: &str) -> Vec<SearchHit> {
+    // #119: `[key]` / `[key:value]` (stock's property search; the Properties view's click)
+    // -> one hit per note on its frontmatter line for the key
+    if let Some((key, val)) = props::prop_query(query) {
+        let mut out = Vec::new();
+        for (name, content, _) in docs {
+            let Some(ln) = props::prop_hit(content, &key, val.as_deref()) else { continue };
+            let Some((_, l, base)) = lines_with_offsets(content).nth(ln) else { continue };
+            out.push(SearchHit { note: name.to_string(), line: ln as u32, snippet: l.trim().chars().take(200).collect(), offset: base, len: 0 });
+            if out.len() >= 500 {
+                break;
+            }
+        }
+        return out;
+    }
     let (want, text) = split_query(query);
     let q = text.to_lowercase();
     let mut out = Vec::new();
@@ -4437,6 +6534,16 @@ enum BmNode {
     /// is Obsidian's `path` = name + ".md". `title` is Obsidian's optional display
     /// alias — we never author one, we never lose one.
     File { name: String, title: Option<String>, x: BmExtra },
+    /// issue #44: a bookmarked PDF. `path` is Obsidian's `path` verbatim (it
+    /// keeps its extension). Painted, and a click opens it in the PDF view; it
+    /// is never a note NAME, so list_bookmarks and the rename walk skip it.
+    /// issue #31: every other FILE path stock bookmarks the same way — a canvas, a base, any
+    /// plugin file (docs/recon-bm31 D3). One variant: a PDF is the `.pdf` case of it.
+    Path { path: String, title: Option<String>, x: BmExtra },
+    /// issue #31: stock's `{"type":"graph","ctime","title","options"}` (D1), plus our `local`
+    /// key for a local graph (D2). `options`/`local` ride in `x.keys`, in file order, so a
+    /// stock item is re-emitted byte-for-byte; the pane reads them off `graph_spec`.
+    Graph { title: Option<String>, x: BmExtra },
     Group { title: String, items: Vec<BmNode>, x: BmExtra },
     /// an entry our model cannot express — Obsidian's `search`, a non-.md path,
     /// a future type. Not painted, not addressable, written back verbatim.
@@ -4456,7 +6563,7 @@ impl BmNode {
    `depth`, so the UI never walks a tree and cannot invent an order the file
    does not have; `kind` is "f" or "g" and R4X.5 `[bmt:]` publishes exactly
    this pair per row. */
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 struct BmRow {
     kind: String,
     depth: usize,
@@ -4471,6 +6578,16 @@ struct BmRow {
     /// for a group without a numeric ctime (folds in memory only, not persisted).
     #[serde(skip_serializing_if = "Option::is_none")]
     ctime: Option<String>,
+    /// issue #44: a PDF bookmark (`name` = its vault path, extension kept)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pdf: bool,
+    /// issue #31: a non-note FILE row (canvas, base, plugin file; a PDF too): `name` is its vault
+    /// path, extension kept, and the click opens it in its own view
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    path: bool,
+    /// issue #31: a GRAPH row — `{options, local}` off the item, what the click reopens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph: Option<serde_json::Value>,
 }
 
 /* the ONE parser, and it is TOLERANT by construction: a body that is not
@@ -4501,16 +6618,13 @@ fn bm_node_of(v: &serde_json::Value) -> BmNode {
     match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "file" => {
             // Obsidian's `path` is our name + ".md" (recon §6); any other path
-            // (canvas, pdf, bare) is not expressible as an R9.4 name -> opaque
-            let name = match obj
-                .get("path")
-                .and_then(|p| p.as_str())
-                .and_then(|p| p.strip_suffix(".md"))
-                .filter(|n| !n.is_empty())
-            {
-                Some(n) => n.to_string(),
-                None => return BmNode::Opaque(v.clone()),
-            };
+            // (canvas, bare) is not expressible as an R9.4 name -> opaque; a
+            // `.pdf` path is a Pdf node (issue #44)
+            let path = obj.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let name = path.strip_suffix(".md").filter(|n| !n.is_empty());
+            if name.is_none() && !bm_is_file_path(path) {
+                return BmNode::Opaque(v.clone());
+            }
             let title = obj.get("title").and_then(|t| t.as_str()).map(str::to_string);
             let keys = obj
                 .iter()
@@ -4522,7 +6636,11 @@ fn bm_node_of(v: &serde_json::Value) -> BmNode {
                 })
                 .map(|(k, val)| (k.clone(), val.clone()))
                 .collect();
-            BmNode::File { name, title, x: BmExtra { ctime, keys } }
+            let x = BmExtra { ctime, keys };
+            match name {
+                Some(n) => BmNode::File { name: n.to_string(), title, x },
+                None => BmNode::Path { path: path.to_string(), title, x },
+            }
         }
         "group" => {
             // a group whose title is not a string or whose items is not an
@@ -4547,12 +6665,54 @@ fn bm_node_of(v: &serde_json::Value) -> BmNode {
                 .collect();
             BmNode::Group { title, items, x: BmExtra { ctime, keys } }
         }
+        "graph" => {
+            // a non-string title or a non-object options/local is not ours to reshape
+            let title = match obj.get("title") {
+                None => None,
+                Some(serde_json::Value::String(t)) => Some(t.clone()),
+                Some(_) => return BmNode::Opaque(v.clone()),
+            };
+            if ["options", "local"].iter().any(|k| obj.get(*k).is_some_and(|o| !o.is_object())) {
+                return BmNode::Opaque(v.clone());
+            }
+            let keys = obj
+                .iter()
+                .filter(|(k, _)| {
+                    !(k.as_str() == "type" || k.as_str() == "title" || (k.as_str() == "ctime" && ctime.is_some()))
+                })
+                .map(|(k, val)| (k.clone(), val.clone()))
+                .collect();
+            BmNode::Graph { title, x: BmExtra { ctime, keys } }
+        }
         _ => BmNode::Opaque(v.clone()),
     }
 }
 
+/// issue #31: a file path stock bookmarks as `{"type":"file","path"}` that is not a note:
+/// a basename with a stem and an extension (`Board.canvas`, `Notes.base`, `a/Paper.pdf`).
+/// A bare `.pdf` or an extensionless path stays opaque, as before.
+fn bm_is_file_path(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(base.rfind('.'), Some(i) if i > 0 && i + 1 < base.len()) && !path.ends_with(".md")
+}
+
+/// issue #31: the default label stock gives a graph bookmark (recon-bmactive Q4, s1-bookmarks.json)
+const BM_GRAPH_TITLE: &str = "Untitled Graph";
+
+/// the graph item's `options` + `local` as the pane needs them to reopen it, plus the item's own
+/// `ctime` + `title` as read (null when absent): issue #118's write-back key (bm_graph_patch)
+fn bm_graph_spec(title: Option<&str>, x: &BmExtra) -> serde_json::Value {
+    let get = |k: &str| x.keys.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    serde_json::json!({
+        "options": get("options").unwrap_or_else(|| serde_json::json!({})),
+        "local": get("local").unwrap_or(serde_json::Value::Null),
+        "ctime": x.ctime.clone(),
+        "title": title,
+    })
+}
+
 fn read_bm_tree(root: &Path) -> Vec<BmNode> {
-    match fs::read_to_string(root.join(BM_FILE)) {
+    match vaultfs::read_string(root, Path::new(BM_FILE), vaultfs::CFG_MAX) {
         // Obsidian's file exists: it is THE store, and every dotfile is ignored
         Ok(body) => parse_bm_tree(&body),
         // no Obsidian file yet: a vault that only ever saw v0.12..v0.15 bookmarks
@@ -4562,7 +6722,8 @@ fn read_bm_tree(root: &Path) -> Vec<BmNode> {
         // Nothing is written to .obsidian/ here — the first bookmark EDIT
         // writes Obsidian's file, and from then on Obsidian's file wins.
         Err(_) => migrate::vault_bookmarks(root)
-            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|p| vaultfs::rel_of(root, &p).ok())
+            .and_then(|r| vaultfs::read_string(root, &r, vaultfs::CFG_MAX).ok())
             .map(|b| parse_legacy_bm(&b))
             .unwrap_or_default(),
     }
@@ -4623,13 +6784,33 @@ fn bm_value_of(n: &BmNode) -> serde_json::Value {
     use serde_json::{Map, Value};
     match n {
         BmNode::Opaque(v) => v.clone(),
-        BmNode::File { name, title, x } => {
+        BmNode::File { title, x, .. } | BmNode::Path { title, x, .. } => {
+            let path = match n {
+                BmNode::File { name, .. } => format!("{name}.md"),
+                BmNode::Path { path, .. } => path.clone(),
+                _ => unreachable!(),
+            };
             let mut m = Map::new();
             m.insert("type".into(), Value::String("file".into()));
             if let Some(c) = &x.ctime {
                 m.insert("ctime".into(), Value::Number(c.clone()));
             }
-            m.insert("path".into(), Value::String(format!("{name}.md")));
+            m.insert("path".into(), Value::String(path));
+            if let Some(t) = title {
+                m.insert("title".into(), Value::String(t.clone()));
+            }
+            for (k, v) in &x.keys {
+                m.insert(k.clone(), v.clone());
+            }
+            Value::Object(m)
+        }
+        BmNode::Graph { title, x } => {
+            // stock's key order: type, ctime, title, options (s1-bookmarks.json), then ours/unknown keys as read
+            let mut m = Map::new();
+            m.insert("type".into(), Value::String("graph".into()));
+            if let Some(c) = &x.ctime {
+                m.insert("ctime".into(), Value::Number(c.clone()));
+            }
             if let Some(t) = title {
                 m.insert("title".into(), Value::String(t.clone()));
             }
@@ -4670,7 +6851,7 @@ fn bm_emit(tree: &[BmNode], top: &[(String, serde_json::Value)]) -> String {
 /// write preserves them. Obsidian DROPS these (recon §5); we keep them — the
 /// strictly more conservative choice — re-emitted after `items`.
 fn bm_top_extra(root: &Path) -> Vec<(String, serde_json::Value)> {
-    let body = fs::read_to_string(root.join(BM_FILE)).unwrap_or_default();
+    let body = vcfg_read(root, BM_FILE).unwrap_or_default();
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(serde_json::Value::Object(o)) => o.into_iter().filter(|(k, _)| k != "items").collect(),
         _ => Vec::new(),
@@ -4691,7 +6872,7 @@ fn bm_names(nodes: &[BmNode], out: &mut Vec<String>) {
         match n {
             BmNode::File { name, .. } => out.push(name.clone()),
             BmNode::Group { items, .. } => bm_names(items, out),
-            BmNode::Opaque(_) => {} // not a name — carried, not listed
+            BmNode::Opaque(_) | BmNode::Path { .. } | BmNode::Graph { .. } => {} // not a name — carried, not listed
         }
     }
 }
@@ -4716,16 +6897,32 @@ fn bm_rows_in(nodes: &[BmNode], depth: usize, out: &mut Vec<BmRow>) {
         match n {
             BmNode::File { name, title, .. } => {
                 // R4X.17 (recon-bmcompat §5, 30-afterinject.png): title when
-                // typed, else basename minus ".md" — never the full path
+                // typed, else basename minus ".md" — never the full path.
+                // issue #101: an empty title (stock writes `"title": ""`) is no title
                 let label = title
                     .clone()
+                    .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                out.push(BmRow { kind: "f".into(), depth, name: name.clone(), label, ctime: None });
+                out.push(BmRow { kind: "f".into(), depth, name: name.clone(), label, ..Default::default() });
+            }
+            BmNode::Path { path, title, .. } => {
+                // issue #44: `name` is the vault path the click opens in the PDF view
+                // PR #57 review: stock writes `"title": ""` (STOCK.md) — an empty title paints the basename
+                let label = title
+                    .clone()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
+                out.push(BmRow { kind: "f".into(), depth, name: path.clone(), label, pdf: is_pdf_target(path), path: true, ..Default::default() });
             }
             BmNode::Group { title, items, x } => {
                 let ctime = x.ctime.as_ref().map(|c| c.to_string());
-                out.push(BmRow { kind: "g".into(), depth, name: title.clone(), label: title.clone(), ctime });
+                out.push(BmRow { kind: "g".into(), depth, name: title.clone(), label: title.clone(), ctime, ..Default::default() });
                 bm_rows_in(items, depth + 1, out);
+            }
+            BmNode::Graph { title, x } => {
+                // issue #31: stock paints the title; "Untitled Graph" is stock's default (D1)
+                let label = title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| BM_GRAPH_TITLE.to_string());
+                out.push(BmRow { kind: "f".into(), depth, name: label.clone(), label, graph: Some(bm_graph_spec(title.as_deref(), x)), ..Default::default() });
             }
             BmNode::Opaque(_) => {} // preserved on disk, never painted
         }
@@ -4837,6 +7034,26 @@ fn bm_group_rename_in(tree: &mut Vec<BmNode>, ix: usize, title: &str) -> Result<
             Ok(())
         }
         _ => Err("that row is not a group".to_string()),
+    }
+}
+
+
+/* issue #101 — a FILE bookmark's "Rename" (stock 1.13.7, docs/recon-bmmenu 06..08):
+   it edits the bookmark's DISPLAY TITLE in bookmarks.json — the file on disk and
+   every tab on it are untouched. Addressed by ROW INDEX, like the group verbs.
+   An empty (or all-blank) title CLEARS the key, so the row paints the basename
+   again (R4X.17) instead of an empty label. A group row is bm_group_rename's. */
+fn bm_title_in(tree: &mut Vec<BmNode>, ix: usize, title: &str) -> Result<(), String> {
+    let p = bm_path_of(tree, ix).ok_or("no such row")?;
+    let t = title.trim();
+    let new = if t.is_empty() { None } else { Some(t.to_string()) };
+    match bm_at_mut(tree, &p) {
+        Some(BmNode::File { title: tt, .. }) | Some(BmNode::Path { title: tt, .. }) | Some(BmNode::Graph { title: tt, .. }) => {
+            *tt = new;
+            Ok(())
+        }
+        Some(BmNode::Group { .. }) => Err("that row is a group (bm_group_rename)".to_string()),
+        _ => Err("that row has no title".to_string()),
     }
 }
 
@@ -5047,6 +7264,213 @@ fn bm_add_at_in(tree: &mut Vec<BmNode>, parent: Option<usize>, pos: usize, name:
     Ok(())
 }
 
+/* issue #31 — a VIEW bookmark: the item the UI built for a tab ({"type":"graph","options",
+   "local"?} for a graph, {"type":"file","path"} for a canvas / plugin file / note) as ONE
+   node, through the one parser so it is exactly what a read of the same bytes gives. Keys
+   come out in stock's order (type, ctime, title, then the rest as sent); the ctime is
+   minted here. A graph always carries a title (stock D1: "Untitled Graph" when none typed);
+   anything the model would carry as Opaque is refused — the pane could not paint it. */
+/// #250 (audit F-3 B): a graph bookmark's `options` / `local` keep only the
+/// graph option keys (graph.json's own: GRAPH_NUM_KEYS, GRAPH_BOOL_KEYS,
+/// scale, search, colorGroups; plus the local graph's depth / link toggles,
+/// and the local graph's `file`). The UI builds `options` from the whole
+/// graph_settings() object, so without this any foreign key in graph.json
+/// would be copied into bookmarks.json, a file that leaves with the next sync.
+const BM_GRAPH_LOCAL_KEYS: [&str; 4] = ["localJumps", "localBacklinks", "localForelinks", "localInterlinks"];
+fn bm_graph_keep(k: &str, v: &serde_json::Value) -> serde_json::Value {
+    let known = |x: &str| {
+        GRAPH_NUM_KEYS.contains(&x) || GRAPH_BOOL_KEYS.contains(&x) || BM_GRAPH_LOCAL_KEYS.contains(&x) || matches!(x, "scale" | "search" | "colorGroups")
+    };
+    let keep = |o: &serde_json::Map<String, serde_json::Value>, file: bool| {
+        serde_json::Value::Object(o.iter().filter(|(x, _)| known(x) || (file && *x == "file")).map(|(x, y)| (x.clone(), y.clone())).collect())
+    };
+    match (k, v) {
+        ("options", serde_json::Value::Object(o)) => keep(o, false),
+        ("local", serde_json::Value::Object(o)) => keep(o, true),
+        _ => v.clone(),
+    }
+}
+
+fn bm_view_node(item: &serde_json::Value, title: Option<&str>) -> Result<BmNode, String> {
+    use serde_json::{Map, Value};
+    let o = item.as_object().ok_or("a bookmark item is an object")?;
+    let ty = o.get("type").and_then(Value::as_str).unwrap_or("");
+    if ty != "graph" && ty != "file" {
+        return Err(format!("cannot bookmark a {ty:?} item"));
+    }
+    let mut m = Map::new();
+    m.insert("type".into(), Value::String(ty.into()));
+    if let Some(c) = BmExtra::now().ctime {
+        m.insert("ctime".into(), Value::Number(c));
+    }
+    let typed = title.filter(|t| !t.is_empty()).map(str::to_string);
+    let t = typed.or_else(|| o.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string));
+    match (ty, t) {
+        ("graph", t) => {
+            m.insert("title".into(), Value::String(t.unwrap_or_else(|| BM_GRAPH_TITLE.to_string())));
+        }
+        (_, Some(t)) => {
+            m.insert("title".into(), Value::String(t));
+        }
+        _ => {}
+    }
+    for (k, v) in o {
+        if !matches!(k.as_str(), "type" | "ctime" | "title") {
+            m.insert(k.clone(), if ty == "graph" { bm_graph_keep(k, v) } else { v.clone() });
+        }
+    }
+    let n = bm_node_of(&Value::Object(m));
+    if matches!(n, BmNode::Opaque(_) | BmNode::Group { .. }) {
+        return Err("this item cannot be shown in the bookmarks pane".to_string());
+    }
+    Ok(n)
+}
+
+/// the vault path a node's file item names (a note -> name + ".md"), for the drag's dup refusal
+fn bm_node_path(n: &BmNode) -> Option<String> {
+    match n {
+        BmNode::File { name, .. } => Some(format!("{name}.md")),
+        BmNode::Path { path, .. } => Some(path.clone()),
+        _ => None,
+    }
+}
+fn bm_has_path(nodes: &[BmNode], p: &str) -> bool {
+    nodes.iter().any(|n| match n {
+        BmNode::Group { items, .. } => bm_has_path(items, p),
+        _ => bm_node_path(n).as_deref() == Some(p),
+    })
+}
+
+/* issue #31: the Add bookmark modal's Save for a view (bm_add_in's placement: the end of
+   the top level, or the LAST child of group row `into`). */
+fn bm_add_view_in(tree: &mut Vec<BmNode>, into: Option<usize>, item: &serde_json::Value, title: Option<&str>) -> Result<(), String> {
+    let node = bm_view_node(item, title)?;
+    match into {
+        None => {
+            tree.push(node);
+            Ok(())
+        }
+        Some(ix) => {
+            let p = bm_path_of(tree, ix).ok_or("no such group")?;
+            match bm_at_mut(tree, &p) {
+                Some(BmNode::Group { items, .. }) => {
+                    items.push(node);
+                    Ok(())
+                }
+                _ => Err("target row is not a group".to_string()),
+            }
+        }
+    }
+}
+
+/* issue #31: a VIEW tab dropped on the pane (bm_add_at_in's slot vocabulary). A file item
+   already bookmarked anywhere is refused like a note (the drag means "remember this tab");
+   a graph item never is — two graph bookmarks with different settings are two views. */
+fn bm_add_view_at_in(tree: &mut Vec<BmNode>, parent: Option<usize>, pos: usize, item: &serde_json::Value) -> Result<(), String> {
+    let node = bm_view_node(item, None)?;
+    if let Some(p) = bm_node_path(&node) {
+        if bm_has_path(tree, &p) {
+            return Err("already bookmarked".to_string());
+        }
+    }
+    let items: &mut Vec<BmNode> = match parent {
+        None => tree,
+        Some(g) => {
+            let p = bm_path_of(tree, g).ok_or("no such group")?;
+            match bm_at_mut(tree, &p) {
+                Some(BmNode::Group { items, .. }) => items,
+                _ => return Err("target row is not a group".to_string()),
+            }
+        }
+    };
+    let raw = bm_raw_slot(items, pos);
+    items.insert(raw, node);
+    Ok(())
+}
+
+/* issue #118 (operator ruling 2026-11-15): a graph tab OPENED FROM a graph bookmark writes its
+   parameter edits back to THAT item. The item is addressed by what the row carried when it
+   was clicked — ctime + title + global/local — never by row index (a drag moves it, the
+   index shifts; the item is still the same one). Exactly one match or nothing: a deleted,
+   renamed or re-created bookmark refuses, and the UI stops writing back (never re-creates).
+   `opts` merges into `options`, `lopts` (only stock's four local keys) into `local`, each key
+   overwritten in place; every other key, the title and the position are kept. */
+const BM_LG_KEYS: [&str; 4] = ["localJumps", "localBacklinks", "localForelinks", "localInterlinks"];
+fn bm_graph_find(nodes: &[BmNode], ctime: Option<&serde_json::Number>, title: Option<&str>, local: bool, at: &mut Vec<usize>, hits: &mut Vec<Vec<usize>>) {
+    for (i, n) in nodes.iter().enumerate() {
+        at.push(i);
+        match n {
+            BmNode::Group { items, .. } => bm_graph_find(items, ctime, title, local, at, hits),
+            BmNode::Graph { title: t, x } => {
+                let is_local = x.keys.iter().any(|(k, v)| k == "local" && v.is_object());
+                if x.ctime.as_ref() == ctime && t.as_deref() == title && is_local == local {
+                    hits.push(at.clone());
+                }
+            }
+            _ => {}
+        }
+        at.pop();
+    }
+}
+fn bm_merge_key(x: &mut BmExtra, key: &str, patch: &serde_json::Map<String, serde_json::Value>) {
+    if patch.is_empty() {
+        return;
+    }
+    match x.keys.iter_mut().find(|(k, _)| k == key) {
+        Some((_, serde_json::Value::Object(m))) => {
+            for (k, v) in patch {
+                m.insert(k.clone(), v.clone()); // preserve_order: an existing key keeps its slot
+            }
+        }
+        Some((_, v)) => *v = serde_json::Value::Object(patch.clone()),
+        None => x.keys.push((key.to_string(), serde_json::Value::Object(patch.clone()))),
+    }
+}
+fn bm_graph_patch_in(
+    tree: &mut Vec<BmNode>,
+    ctime: Option<&serde_json::Number>,
+    title: Option<&str>,
+    local: bool,
+    opts: &serde_json::Map<String, serde_json::Value>,
+    lopts: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(k) = lopts.keys().find(|k| !BM_LG_KEYS.contains(&k.as_str())) {
+        return Err(format!("not a local graph key: {k:?}"));
+    }
+    if let Some(k) = opts.keys().find(|k| BM_LG_KEYS.contains(&k.as_str())) {
+        return Err(format!("{k:?} belongs in local"));
+    }
+    if !local && !lopts.is_empty() {
+        return Err("a global graph bookmark has no local keys".to_string());
+    }
+    let mut hits = Vec::new();
+    bm_graph_find(tree, ctime, title, local, &mut Vec::new(), &mut hits);
+    if hits.len() != 1 {
+        return Err("the graph bookmark is gone".to_string());
+    }
+    match bm_at_mut(tree, &hits[0]) {
+        Some(BmNode::Graph { x, .. }) => {
+            bm_merge_key(x, "options", opts);
+            bm_merge_key(x, "local", lopts);
+            Ok(())
+        }
+        _ => Err("the graph bookmark is gone".to_string()),
+    }
+}
+
+/* issue #31: the canvas / plugin-file toggle (tab menu, explorer menu): OFF drops the first
+   node with that path at any depth, ON appends a Path node at the top level. */
+fn bm_toggle_path_in(tree: &mut Vec<BmNode>, path: &str) -> Result<(), String> {
+    if bm_drop_first_path(tree, path) {
+        return Ok(());
+    }
+    if !bm_is_file_path(path) {
+        return Err("not a file path".to_string());
+    }
+    tree.push(BmNode::Path { path: path.to_string(), title: None, x: BmExtra::now() });
+    Ok(())
+}
+
 /* R9.8 — a bookmark IS a vault-relative name, so the note that changes its
    name takes its bookmark with it. Called from move_note_in and nowhere else:
    that is the one function that knows both ends, and it is the function BOTH
@@ -5094,7 +7518,7 @@ fn rename_bookmark_in(root: &Path, old: &str, new: &str) {
    is the stale-bookmark collapse R9.8 already required. Returns whether the
    old name was found at all, because "not bookmarked" means NO write. */
 fn bm_rename_walk(tree: &mut Vec<BmNode>, old: &str, new: &str) -> bool {
-    fn walk(nodes: &mut Vec<BmNode>, old: &str, new: &str, done: &mut bool) {
+    fn walk(nodes: &mut Vec<BmNode>, old: &str, new: &str, done: &mut bool, moved: &mut bool) {
         let mut i = 0;
         while i < nodes.len() {
             let mut drop = false;
@@ -5107,8 +7531,19 @@ fn bm_rename_walk(tree: &mut Vec<BmNode>, old: &str, new: &str) -> bool {
                         drop = true;
                     }
                 }
-                BmNode::Group { items, .. } => walk(items, old, new, done),
-                BmNode::Opaque(_) => {} // not a name; never followed, never dropped
+                BmNode::Group { items, .. } => walk(items, old, new, done, moved),
+                // issue #31 (D2): a local-graph bookmark follows its renamed CENTRE note; every one
+                // of them does (stock keeps no second rule), and none is ever dropped
+                BmNode::Graph { x, .. } => {
+                    let (o, n) = (format!("{old}.md"), format!("{new}.md"));
+                    for (k, v) in x.keys.iter_mut() {
+                        if k == "local" && v.get("file").and_then(|f| f.as_str()) == Some(o.as_str()) {
+                            v["file"] = serde_json::Value::String(n.clone());
+                            *moved = true;
+                        }
+                    }
+                }
+                BmNode::Opaque(_) | BmNode::Path { .. } => {} // not a name; never followed, never dropped
             }
             if drop {
                 nodes.remove(i);
@@ -5117,9 +7552,36 @@ fn bm_rename_walk(tree: &mut Vec<BmNode>, old: &str, new: &str) -> bool {
             }
         }
     }
-    let mut done = false;
-    walk(tree, old, new, &mut done);
-    done
+    let (mut done, mut moved) = (false, false);
+    walk(tree, old, new, &mut done, &mut moved);
+    done || moved
+}
+
+/* issue #31 — a non-note FILE that changes its path (a canvas renamed or moved through
+   canvas_io) takes its bookmarks with it, IN PLACE, every match at any depth: stock
+   follows the rename (FINDINGS rename). No match = no write, as rename_bookmark_in. */
+fn bm_rename_path_walk(nodes: &mut [BmNode], old: &str, new: &str) -> bool {
+    let mut hit = false;
+    for n in nodes.iter_mut() {
+        match n {
+            BmNode::Path { path, .. } if path == old => {
+                *path = new.to_string();
+                hit = true;
+            }
+            BmNode::Group { items, .. } => hit |= bm_rename_path_walk(items, old, new),
+            _ => {}
+        }
+    }
+    hit
+}
+fn rename_bookmark_path_in(root: &Path, old: &str, new: &str) {
+    if old == new || !root.join(BM_FILE).is_file() {
+        return;
+    }
+    let mut tree = read_bm_tree(root);
+    if bm_rename_path_walk(&mut tree, old, new) {
+        let _ = write_bm_tree(root, &tree); // best-effort: the file is already moved (R9.8 rationale)
+    }
 }
 
 /* toggle_bookmark keeps its by-NAME signature (R9.4/R20.4): toggling ON
@@ -5127,9 +7589,27 @@ fn bm_rename_walk(tree: &mut Vec<BmNode>, old: &str, new: &str) -> bool {
    WHATEVER DEPTH IT SITS — a bookmark inside a group is un-bookmarked from
    inside that group, and the group stays. */
 fn bm_toggle_in(tree: &mut Vec<BmNode>, name: &str) {
-    if !bm_drop_first_name(tree, name) {
+    // issue #44 (PR #57 review): a PDF row's "Remove" toggles its vault PATH. A note bookmark of
+    // that name still wins (unchanged behaviour); only when there is none is a Pdf node with that
+    // exact path dropped — never appended as a bogus "x.pdf.md" note bookmark.
+    if !bm_drop_first_name(tree, name) && !(is_pdf_target(name) && bm_drop_first_path(tree, name)) {
         tree.push(BmNode::file(name));
     }
+}
+
+fn bm_drop_first_path(nodes: &mut Vec<BmNode>, path: &str) -> bool {
+    for i in 0..nodes.len() {
+        if matches!(&nodes[i], BmNode::Path { path: p, .. } if p == path) {
+            nodes.remove(i);
+            return true;
+        }
+        if let BmNode::Group { items, .. } = &mut nodes[i] {
+            if bm_drop_first_path(items, path) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn bm_drop_first_name(nodes: &mut Vec<BmNode>, name: &str) -> bool {
@@ -5159,11 +7639,22 @@ fn bookmark_rows(v: State<Vault>) -> Vec<BmRow> {
 }
 
 #[tauri::command]
-fn toggle_bookmark(v: State<Vault>, name: String) -> Result<Vec<String>, String> {
+fn toggle_bookmark(v: State<Vault>, name: String, pdf: Option<bool>, path: Option<bool>) -> Result<Vec<String>, String> {
     span_timed!("toggle_bookmark", {
         let root = cur_vault(&v).ok_or("no vault open")?;
         let mut tree = read_bm_tree(&root);
-        bm_toggle_in(&mut tree, &name);
+        // issue #44 (PR #57 review, qodo High on 340c2fb): a PDF row's Remove says so explicitly
+        // (`pdf: true`) and drops ONLY the Pdf node with that path — a note bookmark of the same
+        // logical name (note "x.pdf.md" = File{name:"x.pdf"}) is never touched. Every other caller
+        // omits the flag and keeps the by-NAME toggle unchanged.
+        if path == Some(true) {
+            // issue #31: a canvas / plugin file toggles by its vault PATH (Path node, never a note name)
+            bm_toggle_path_in(&mut tree, &name)?;
+        } else if pdf == Some(true) {
+            bm_drop_first_path(&mut tree, &name);
+        } else {
+            bm_toggle_in(&mut tree, &name);
+        }
         write_bm_tree(&root, &tree)?;
         let mut out = Vec::new();
         bm_names(&tree, &mut out);
@@ -5191,6 +7682,12 @@ fn bm_group_new(v: State<Vault>, parent: Option<usize>) -> Result<Vec<BmRow>, St
 #[tauri::command]
 fn bm_group_rename(v: State<Vault>, ix: usize, title: String) -> Result<Vec<BmRow>, String> {
     span_timed!("bm_group_rename", bm_apply(&v, |t| bm_group_rename_in(t, ix, &title)))
+}
+
+/* issue #101: the FILE row's Rename — the bookmark title, never the file (bm_title_in). */
+#[tauri::command]
+fn bm_title(v: State<Vault>, ix: usize, title: String) -> Result<Vec<BmRow>, String> {
+    span_timed!("bm_title", bm_apply(&v, |t| bm_title_in(t, ix, &title)))
 }
 
 #[tauri::command]
@@ -5222,6 +7719,47 @@ fn bm_drag(v: State<Vault>, ix: usize, parent: Option<usize>, pos: usize) -> Res
 #[tauri::command]
 fn bm_add_at(v: State<Vault>, parent: Option<usize>, pos: usize, name: String) -> Result<Vec<BmRow>, String> {
     span_timed!("bm_add_at", bm_apply(&v, |t| bm_add_at_in(t, parent, pos, &name)))
+}
+
+/* issue #31: the Add bookmark modal's Save for a graph / local graph (bm_add_view_in). */
+#[tauri::command]
+fn bm_add_view(v: State<Vault>, into: Option<usize>, item: serde_json::Value, title: Option<String>) -> Result<Vec<BmRow>, String> {
+    span_timed!("bm_add_view", bm_apply(&v, |t| bm_add_view_in(t, into, &item, title.as_deref())))
+}
+
+/* issue #31: a graph / canvas / plugin-view tab dropped on the pane (bm_add_view_at_in). */
+#[tauri::command]
+fn bm_add_view_at(v: State<Vault>, parent: Option<usize>, pos: usize, item: serde_json::Value) -> Result<Vec<BmRow>, String> {
+    span_timed!("bm_add_view_at", bm_apply(&v, |t| bm_add_view_at_in(t, parent, pos, &item)))
+}
+
+/* issue #118: the write-back of a bookmark-opened graph tab's edits (bm_graph_patch_in) */
+#[tauri::command]
+fn bm_graph_patch(
+    v: State<Vault>,
+    ctime: Option<serde_json::Number>,
+    title: Option<String>,
+    lg: bool,
+    opts: serde_json::Map<String, serde_json::Value>,
+    lopts: serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<BmRow>, String> {
+    span_timed!("bm_graph_patch", bm_apply(&v, |t| bm_graph_patch_in(t, ctime.as_ref(), title.as_deref(), lg, &opts, &lopts)))
+}
+
+/* issue #31: the row menu's Remove for a row that has no NAME to toggle (a graph item; a
+   canvas / plugin-file path): THAT row's node leaves, wherever it sits. A group row is refused
+   here (bm_group_delete owns it, with its subtree). */
+fn bm_remove_in(tree: &mut Vec<BmNode>, ix: usize) -> Result<(), String> {
+    let p = bm_path_of(tree, ix).ok_or("no such row")?;
+    if matches!(bm_at(tree, &p), Some(BmNode::Group { .. })) {
+        return Err("a group row is deleted with Delete".to_string());
+    }
+    bm_take(tree, &p).map(|_| ()).ok_or_else(|| "no such row".to_string())
+}
+
+#[tauri::command]
+fn bm_remove(v: State<Vault>, ix: usize) -> Result<Vec<BmRow>, String> {
+    span_timed!("bm_remove", bm_apply(&v, |t| bm_remove_in(t, ix)))
 }
 
 /* R11 watcher thread: every TICK_MS walk the vault (stat only), diff against
@@ -5291,7 +7829,11 @@ fn watch_tick(v: &Vault, prev: &mut Option<(PathBuf, watcher::Snapshot)>) -> wat
             } else {
                 vault_hook("watch_tick:pre_lock");
                 let mut ix = v.index.lock().unwrap();
-                span_timed!("watcher_reconcile", watcher::reconcile(&root, &d, &mut ix))
+                let c = span_timed!("watcher_reconcile", watcher::reconcile(&root, &d, &mut ix));
+                // #289 review: an added note whose read failed is retried next tick (no log:
+                // a note that stays unreadable would print on every tick)
+                watcher::forget_unread(&d, &ix, &mut cur);
+                c
             };
             // GHOSTS (media CVR-B-063): our own create that an outside delete
             // removed before any walk listed it is in no Diff; ask the Index.
@@ -5709,6 +8251,45 @@ struct PosProbe {
     honoured: Option<bool>,
 }
 
+/* #144 toggle 7 (security.rs JIT_OFF_ENV has the why): apply the latched effective JIT value
+   to this process's env BEFORE the first webview (the web process inherits it, JSC reads it
+   at its start). Runs in main() right after security::boot(), single-threaded like
+   present_dmabuf_scope's set_var. The only env reader of toggle 7. */
+fn sec_jit_env(jit: bool) {
+    let (set, rm) = security::jit_plan(jit, std::env::var_os(security::JIT_MARK).is_some());
+    for (k, v) in set {
+        std::env::set_var(k, v);
+    }
+    for k in rm {
+        std::env::remove_var(k);
+    }
+    eprintln!("{}", security::jit_log(jit));
+}
+
+/* #79 (E3, scoped): WebKitGTK's DMA-BUF renderer is kept ON (WebKit's default) everywhere except an X11
+   display with NO compositing manager (no owner of _NET_WM_CM_S<n>; gdk_screen_is_composited reads exactly
+   that). There the box measured the bug: the Excalidraw canvas is painted in the page but the window keeps
+   the old frame until the next event (develop 23/60 opens). UI-side redraws (E1/E1b/E1c) and page-side
+   trailing frames (E2/E2b) did not bring it to 0, so only on that display the renderer falls back to WebKit's
+   non-DMA-BUF path. Wayland (always composited) and composited X11 keep DMA-BUF. An explicit
+   WEBKIT_DISABLE_DMABUF_RENDERER (any value, also =0) is the user's choice and is never overridden.
+   Runs before Tauri creates the first webview (WebKit reads the variable then; the web process inherits it). */
+#[cfg(target_os = "linux")]
+fn present_dmabuf_scope() {
+    use gdk::prelude::*;
+    const VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    if std::env::var_os(VAR).is_some() || gtk::init().is_err() {
+        return;
+    }
+    let Some(display) = gdk::Display::default() else { return };
+    let screen = display.default_screen();
+    if screen.downcast_ref::<gdkx11::X11Screen>().is_none() || screen.is_composited() {
+        return; // Wayland, or X11 with a compositor: DMA-BUF on
+    }
+    eprintln!("[present] #79: X11 without a compositing manager -> {VAR}=1 for this window (DMA-BUF stays on elsewhere)");
+    std::env::set_var(VAR, "1");
+}
+
 #[cfg(target_os = "linux")]
 fn probe_drag_proto() -> DragProto {
     use gdk::prelude::*;
@@ -5748,7 +8329,23 @@ fn probe_drag_proto() -> DragProto {
 #[tauri::command]
 fn win_move_proto(proto: tauri::State<'_, DragProto>) -> String {
     let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
-    drag_path(proto.x11, proto.moveresize, honoured).to_string()
+    drag_path_here(drag_path(proto.x11, proto.moveresize, honoured)).to_string()
+}
+
+/// macOS port: AppKit owns the window move (NSWindow performWindowDragWithEvent behind
+/// tauri's start_dragging), so every press is handed over: "wm".
+/// Windows: the same. start_dragging hands the press to the system's own move loop
+/// (WM_NCLBUTTONDOWN on the caption), which is what gives Aero Snap, Snap Layouts and
+/// drag-to-top-maximises; moving the window ourselves (the "none" path, what the Linux
+/// probe's defaults pick off Linux) works but offers none of them. Nothing is measured
+/// there: a top-level window is always moved by the system.
+/// Elsewhere (Linux) the measured path.
+fn drag_path_here(measured: &'static str) -> &'static str {
+    if cfg!(any(target_os = "macos", windows)) {
+        "wm"
+    } else {
+        measured
+    }
 }
 
 /// R33.6b: hand the press to the WM/compositor when this session will not let the
@@ -5779,7 +8376,7 @@ fn win_drag_start(win: tauri::Window, proto: tauri::State<'_, DragProto>) -> Res
         "win_drag_start",
         {
             let honoured = proto.pos.lock().map(|p| p.honoured).unwrap_or(None);
-            let p = drag_path(proto.x11, proto.moveresize, honoured);
+            let p = drag_path_here(drag_path(proto.x11, proto.moveresize, honoured));
             taken = p;
             // Written by the process that actually asks, for the same reason
             // win_gesture logs: a title census that stops updating looks exactly
@@ -5789,7 +8386,11 @@ fn win_drag_start(win: tauri::Window, proto: tauri::State<'_, DragProto>) -> Res
             // jump over the measurement, so the FAILING handover — the slow one
             // worth seeing — would be the one case that emits no span.
             if p != "none" {
-                win.start_dragging().map_err(|e| e.to_string()).map(|()| p.to_string())
+                let r = win.start_dragging().map_err(|e| e.to_string()).map(|()| p.to_string());
+                if r.is_ok() {
+                    drag_release_guard(&win);
+                }
+                r
             } else {
                 Ok(p.to_string())
             }
@@ -5797,6 +8398,96 @@ fn win_drag_start(win: tauri::Window, proto: tauri::State<'_, DragProto>) -> Res
         serde_json::json!({"path": taken})
     )
 }
+
+/// #71 "when dragging window not working all of the time" — on native Wayland
+/// EVERY OTHER header drag was dead (wldrag, native sway: A=ynynynynyn; stock
+/// Obsidian on the same rig: 10/10).
+///
+/// MECHANISM. ui/main.js wfBegin hands the press over: win_drag_start ->
+/// start_dragging -> tao begin_move_drag -> xdg_toplevel.move. The compositor's
+/// move grab owns the pointer from then on and CONSUMES the button release, so
+/// the webview never gets a release for a press it already delivered to the page.
+/// WebCore keeps that pointer "pressed" (PointerCaptureController pointerIsPressed,
+/// set by mousedown, cleared ONLY by mouseup). The next real press is then a second
+/// press of an already-pressed pointer, which the Pointer Events chord rule turns
+/// into a pointermove (buttons=1), not a pointerdown — ui/main.js never sees the
+/// press, wfBegin never runs, the window does not move. That press's release IS
+/// delivered (no grab is active), un-sticking the pointer, so the drag after it
+/// works: the alternation. Measured in the [wfd:dn,up,..,mvb] census: after 15
+/// drags dn=8 up=7 — every dead drag produced a pointerup with no pointerdown.
+/// (GDK's own event state is clean: stripping BUTTON1_MASK from the next press,
+/// 822212f, changed nothing — the stale bit lives in the web process.)
+///
+/// FIX. Give the webview the release the compositor ate: right after a
+/// successful handover, synthesize a button-1 release at the pointer's position
+/// on the WebKitWebView (widget.event -> WebKit's own release handler -> WebCore
+/// mouseup), which clears the pressed state before any later press arrives. It is
+/// a GTK widget event only — the compositor never sees it, its move grab is
+/// untouched. The page sees one pointerup for the handed-over press (wfEnd is a
+/// no-op without a gesture). Only sessions that hand over (wm / wayland) reach
+/// this; the X11 "none" path is untouched.
+#[cfg(target_os = "linux")]
+fn drag_release_guard(win: &tauri::Window) {
+    let w2 = win.clone();
+    let _ = win.run_on_main_thread(move || {
+        use gtk::glib::translate::{ToGlibPtr, ToGlibPtrMut};
+        use gtk::prelude::*;
+        thread_local! { static WV: std::cell::RefCell<Option<gtk::Widget>> = const { std::cell::RefCell::new(None) }; }
+        fn find(w: &gtk::Widget) -> Option<gtk::Widget> {
+            if w.type_().name() == "WebKitWebView" {
+                return Some(w.clone());
+            }
+            let c = w.downcast_ref::<gtk::Container>()?;
+            c.children().iter().find_map(find)
+        }
+        let wv = WV.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.is_none() {
+                *c = w2.gtk_window().ok().and_then(|g| find(g.upcast_ref::<gtk::Widget>()));
+            }
+            c.clone()
+        });
+        let Some(wv) = wv else {
+            eprintln!("[win_drag] release-guard: no WebKitWebView under the window");
+            return;
+        };
+        let Some(gw) = wv.window() else {
+            eprintln!("[win_drag] release-guard: webview not realized");
+            return;
+        };
+        let Some(dev) = gw.display().default_seat().and_then(|s| s.pointer()) else {
+            eprintln!("[win_drag] release-guard: no seat pointer");
+            return;
+        };
+        let (_, x, y, _) = gw.device_position(&dev);
+        let (rx, ry) = gw.root_coords(x, y);
+        let mut ev = gdk::Event::new(gdk::EventType::ButtonRelease);
+        ev.set_device(Some(&dev));
+        {
+            let p: *mut gdk::ffi::GdkEvent = ev.to_glib_none_mut().0;
+            // SAFETY: gdk_event_new(GDK_BUTTON_RELEASE) allocated a GdkEventButton;
+            // every field written is a plain member of it, and `window` takes a
+            // full reference that gdk_event_free drops with the event.
+            unsafe {
+                let b = p as *mut gdk::ffi::GdkEventButton;
+                (*b).window = gw.to_glib_full();
+                (*b).send_event = 1;
+                (*b).time = 0; // GDK_CURRENT_TIME
+                (*b).x = x as f64;
+                (*b).y = y as f64;
+                (*b).x_root = rx as f64;
+                (*b).y_root = ry as f64;
+                (*b).state = gdk::ffi::GDK_BUTTON1_MASK as _;
+                (*b).button = 1;
+            }
+        }
+        let handled = wv.event(&ev);
+        eprintln!("[win_drag] release-guard: synthetic release at {x},{y} handled={handled}");
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drag_release_guard(_win: &tauri::Window) {}
 
 #[tauri::command]
 fn win_minimize(win: tauri::Window) -> Result<(), String> {
@@ -5845,6 +8536,7 @@ static QUIT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static QUIT_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static QUIT_T0: OnceLock<std::time::Instant> = OnceLock::new();
 /// write end of the SIGTERM self-pipe (-1 = no handler installed)
+#[cfg(unix)]
 static TERM_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5866,11 +8558,18 @@ fn quit_step(armed: bool, already_asked: bool) -> QuitStep {
 
 /// SIGTERM back to its default disposition and re-raised: the exit status a
 /// TERM'd process has always had
+#[cfg(unix)]
 fn term_default() -> ! {
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::raise(libc::SIGTERM);
     }
+    std::process::exit(143)
+}
+
+/// Windows has no SIGTERM to re-raise: the status a TERM'd process has on unix, as a plain exit
+#[cfg(windows)]
+fn term_default() -> ! {
     std::process::exit(143)
 }
 
@@ -5911,6 +8610,43 @@ fn quit_request(app: &tauri::AppHandle, why: &str) -> bool {
     }
 }
 
+/// macOS port: the app menu's predefined Quit is NSApp terminate:, which tao turns into a final
+/// exit (no CloseRequested, no preventable ExitRequested): the editor's debounced tail would be
+/// lost. Swap it for our own "Quit Opensidian" (Cmd+Q) that goes through quit_request.
+#[cfg(target_os = "macos")]
+const MAC_QUIT: &str = "os-quit";
+#[cfg(target_os = "macos")]
+fn mac_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu};
+    // the macOS-facing name is "Opensidian" (bundle.macOS.bundleName: the menu bar, Dock, About);
+    // productName stays "opensidian" for the binary and the Linux packages
+    const NAME: &str = "Opensidian";
+    let menu = Menu::default(app)?;
+    if let Some(MenuItemKind::Submenu(old)) = menu.items()?.into_iter().next() {
+        let quit = MenuItem::with_id(app, MAC_QUIT, format!("Quit {NAME}"), true, Some("CmdOrCtrl+Q"))?;
+        let appm = Submenu::with_items(
+            app,
+            NAME,
+            true,
+            &[
+                &PredefinedMenuItem::about(app, Some(&format!("About {NAME}")), None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::services(app, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::hide(app, Some(&format!("Hide {NAME}")))?,
+                &PredefinedMenuItem::hide_others(app, None)?,
+                &PredefinedMenuItem::show_all(app, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &quit,
+            ],
+        )?;
+        menu.remove(&old)?;
+        menu.insert(&appm, 0)?;
+    }
+    app.set_menu(menu)?;
+    Ok(())
+}
+
 /// CloseRequested (close button -> win_close, Alt+F4, a WM close): held while the UI flushes
 fn quit_event(w: &tauri::Window, e: &tauri::WindowEvent) {
     use tauri::Manager;
@@ -5935,6 +8671,7 @@ fn quit_ready(app: tauri::AppHandle, dirty: Option<u32>) {
     app.exit(0);
 }
 
+#[cfg(unix)]
 extern "C" fn on_term(_: libc::c_int) {
     // async-signal-safe: one write(2) to the self-pipe, nothing else
     let fd = TERM_FD.load(std::sync::atomic::Ordering::SeqCst);
@@ -5947,9 +8684,19 @@ extern "C" fn on_term(_: libc::c_int) {
 /// SIGTERM -> self-pipe -> a plain thread -> quit_request. The handler itself
 /// only writes one byte; a caught disposition resets to default across exec, so
 /// processes we spawn (desk_proc) keep the stock SIGTERM.
+#[cfg(unix)]
 fn install_term(app: tauri::AppHandle) {
     let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    #[cfg(target_os = "linux")]
+    let failed = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0;
+    // no pipe2 on macOS: pipe, then FD_CLOEXEC on both ends (single-threaded at this point)
+    #[cfg(not(target_os = "linux"))]
+    let failed = unsafe {
+        libc::pipe(fds.as_mut_ptr()) != 0
+            || libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) != 0
+            || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) != 0
+    };
+    if failed {
         eprintln!("[quit] SIGTERM flush unavailable: pipe2 failed");
         return;
     }
@@ -5977,6 +8724,10 @@ fn install_term(app: tauri::AppHandle) {
         }
     });
 }
+
+/// Windows: no SIGTERM; the window close (CloseRequested) is the quit path that flushes
+#[cfg(windows)]
+fn install_term(_app: tauri::AppHandle) {}
 
 /* ---------- R36 INTERFACE ZOOM (operator, 2026-09-14: "interface wide zoom,
    not only text") ----------------------------------------------------------
@@ -6079,14 +8830,110 @@ fn set_zoom_cfg(level: f64) {
     cfg_set("zoom", serde_json::json!(level));
 }
 
+/* #220 Language. ~/.opensidian.json "language" = "auto" (absent = auto) or a
+   locales/ code. The webview formats its own text (ui/i18n.js) from the .ftl this
+   hands over; Rust-side text calls i18n::tr(ui_lang(), ..) on the same bytes. */
+fn lang_setting() -> String {
+    cfg_value()["language"].as_str().filter(|s| i18n::valid_setting(s)).unwrap_or(i18n::AUTO).to_string()
+}
+
+/// the language native (Rust-side) text renders in right now
+#[allow(dead_code)]
+fn ui_lang() -> &'static str {
+    i18n::resolve(&lang_setting())
+}
+
+#[derive(serde::Serialize)]
+struct I18nState {
+    /// the persisted setting: "auto" or a language code
+    setting: String,
+    /// what LC_ALL > LC_MESSAGES > LANG of this process maps to
+    system: &'static str,
+    /// [code, native name] in list order
+    langs: Vec<[&'static str; 2]>,
+}
+
+#[tauri::command]
+fn i18n_state() -> I18nState {
+    I18nState {
+        setting: lang_setting(),
+        system: i18n::system_lang(),
+        langs: i18n::LANGS.iter().map(|l| [l.0, l.1]).collect(),
+    }
+}
+
+/// the .ftl source of `lang` plus the English one (the fallback bundle)
+#[tauri::command]
+fn i18n_load(lang: String) -> Result<serde_json::Value, String> {
+    let src = i18n::source(&lang).ok_or_else(|| format!("unknown language {lang:?}"))?;
+    Ok(serde_json::json!({ "lang": lang, "ftl": src, "en": i18n::ftl("en") }))
+}
+
+#[tauri::command]
+fn i18n_set(setting: String) -> Result<(), String> {
+    if !i18n::valid_setting(&setting) {
+        return Err(format!("unknown language {setting:?}"));
+    }
+    cfg_set("language", serde_json::json!(setting));
+    Ok(())
+}
+
+/* #281 (startup flicker): style.css paints body DARK until main.js applyTheme() adds
+   body.theme-light, and main.js is the LAST of ~45 scripts at the end of <body>, so on a
+   light desktop a launch painted a dark shell first (frame timeline vs boot marks: see the
+   #281 PR). This init script runs at document start, before any stylesheet or page script,
+   and puts the SAME decision bootTheme() makes onto <html data-theme>: the stored choice
+   when there is one, else prefers-color-scheme. style.css paints the light palette from that
+   attribute until body carries its own class. `stored` is matched against a closed set
+   (get_theme: "dark" | "light" | None), so no file text ever reaches the script. */
+fn theme_init_js(stored: Option<&str>) -> String {
+    let s = match stored {
+        Some("dark") => "\"dark\"",
+        Some("light") => "\"light\"",
+        _ => "null",
+    };
+    format!(
+        "(function(){{var s={s};var t=s||(window.matchMedia&&matchMedia(\"(prefers-color-scheme: dark)\").matches?\"dark\":\"light\");document.documentElement.setAttribute(\"data-theme\",t);}})();"
+    )
+}
+
+/// #220: the window's i18n boot data, run before any page script (ui/i18n.js): the
+/// setting, the env's language, the list, and the English + resolved .ftl sources,
+/// so the first paint is already translated without an IPC round trip.
+fn i18n_init_js() -> String {
+    let setting = lang_setting();
+    let lang = i18n::resolve(&setting);
+    let v = serde_json::json!({
+        "setting": setting,
+        "system": i18n::system_lang(),
+        "lang": lang,
+        "langs": i18n::LANGS.iter().map(|l| [l.0, l.1]).collect::<Vec<_>>(),
+        "en": i18n::ftl("en"),
+        "ftl": i18n::source(lang),
+    });
+    format!("window.__OS_I18N={v};")
+}
+
 /// S1: the one origin the window may navigate to. Tauri v2 on Linux serves
 /// frontendDist as `tauri://localhost` — exact scheme, exact host, no port.
 /// Matching on the host alone admitted http(s)://tauri.localhost:<any port>
 /// (any local server answering that name), and matching on the scheme alone
 /// admitted tauri://<any host>. The image scheme is a subresource (<img src>),
 /// never a navigation target, so it is not listed.
+///
+/// Windows (WebView2): the app origin is http(s)://tauri.localhost, and refusing it left a blank
+/// document because the first load was blocked. Windows only: elsewhere *.localhost is loopback and
+/// would admit any local server answering that name on 80/443.
 fn nav_allowed(u: &tauri::Url) -> bool {
-    u.scheme() == "tauri" && u.host_str() == Some("localhost") && u.port().is_none()
+    if u.port().is_some() {
+        return false;
+    }
+    match (u.scheme(), u.host_str()) {
+        ("tauri", Some("localhost")) => true,
+        #[cfg(windows)]
+        ("http" | "https", Some("tauri.localhost")) => true,
+        _ => false,
+    }
 }
 
 fn main() {
@@ -6109,6 +8956,9 @@ fn main() {
     // BEFORE GTK starts, so GNOME groups every window under the launcher; the X11
     // class follows after gtk_init via appid::plugin() (appid.rs).
     appid::apply();
+    // #79 (E3): DMA-BUF stays on, except where it is proven to drop frames — see present_dmabuf_scope.
+    #[cfg(target_os = "linux")]
+    present_dmabuf_scope();
     // RENAME MIGRATION (goal opensidian): old -> new table in migrate.rs —
     //   ~/.rustidian.json -> ~/.opensidian.json,
     //   <vault>/.rustidian-bookmarks -> <vault>/.opensidian-bookmarks (per vault, read_bm_tree),
@@ -6131,7 +8981,13 @@ fn main() {
     //   RUSTIDIAN_LL_ALONE          -> OPENSIDIAN_LL_ALONE (test only)
     //   RUSTIDIAN_OTELSINK_CHILD    -> OPENSIDIAN_OTELSINK_CHILD (test only)
     //   localStorage rustidian.graphRenderer -> opensidian.graphRenderer (hidden dev knob)
-    migrate::run_home(&PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())));
+    migrate::run_home(&PathBuf::from(user_home()));
+    // #144: latch the restart-bound Security fields (JIT, lockdown) once, before any window
+    // exists and before the sandbox closes: the running process keeps these values
+    let sec_cfg = cfg_value();
+    let sec_boot = security::boot(&sec_cfg);
+    eprintln!("[sec] boot jit={} lockdown={} lockdownClipboard={}", sec_boot.jit, sec_boot.lockdown, sec_boot.lockdown_clipboard);
+    sec_jit_env(security::effective(&sec_cfg).sec.jit);
     // VAULT_DIR (probes/tests) wins; else the argv vault (vaultarg, README §2) —
     // resolved HERE, before sandbox::enforce below; else last persisted vault if
     // still a dir (R1.6)
@@ -6159,9 +9015,11 @@ fn main() {
             // vaultbleed D: the unconfined spawner, started BEFORE the ruleset
             // closes (an exec after enforce() is confined for life)
             let helper = spawner::start();
-            match sandbox::enforce(p) {
-                Ok(s) => eprintln!("landlock: {s:?}"),
-                Err(e) => eprintln!("landlock: off ({e})"),
+            // #293: the answer is published (sandbox::outcome) and decides the bind below
+            let o = sandbox::record(sandbox::enforce(p));
+            eprintln!("{}", o.log_line());
+            if let sandbox::Outcome::Partial { dropped } = o {
+                eprintln!("[sandbox] partially enforced: this kernel lacks {dropped:?}");
             }
             match helper {
                 // only a CONFINED window routes through it; otherwise the
@@ -6179,14 +9037,22 @@ fn main() {
     // writes inside the vault, so it must survive the same confinement a
     // user's own write does. If it does not, the failure is on the console and
     // in the [bseed:] census token, and the vault still opens.
-    // perf-index: one walk + read now, so the first note_open is already warm.
+    // perf-index: one walk + read at boot, so the first note_open is already warm.
+    // issue #106: on a worker thread (bind_vault_boot), overlapped with the
+    // webview start; every reader blocks on the index lock until it is in.
     // vaultbleed: the argv/last-vault boot binds through the SAME set-once
     // bind_vault the picker uses (seed + index build happen inside it).
-    let vault = Vault { root: OnceLock::new(), index: Mutex::new(Index::default()), lock: OnceLock::new(), seed: Mutex::new(None) };
+    let vault = Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) };
     if let Some(p) = &init {
         // vaultbleed B: a vault already open in another process is refused —
         // no second backend, no window; the other window stays the only one.
-        match bind_vault_locked(&vault, p, &vaultlock::env_lock_dir()) {
+        let restart = switched.as_ref().and_then(|s| spawn::restart_of(&s.token));
+        // #293 (audit F-7): fail closed. The sandbox was asked for and is not in force => the
+        // vault is NOT bound: a native dialog says why, the process exits non-zero.
+        if let sandbox::BootBind::Refuse(why) = sandbox::boot_may_bind(sandbox::landlock_enabled(), sandbox::outcome()) {
+            sandbox::refuse_and_exit(&why, p);
+        }
+        match bind_vault_boot_after(&vault, p, &vaultlock::env_lock_dir(), restart) {
             Ok(()) => {}
             Err(BindErr::Lock(e @ vaultlock::LockErr::Busy(_))) => {
                 eprintln!("opensidian: {e}; not starting a second backend on it (exit {})", vaultlock::DUP_EXIT);
@@ -6216,10 +9082,15 @@ fn main() {
     } else if let Some(p) = &init {
         // goal winsize: a saved record for this vault => start hidden, setup
         // places it (winsize_restore). No record => the config default, as before.
+        // #281: hidden in EITHER case — the window is shown once, when the UI is in
+        // (boot_reveal) or at reveal::FALLBACK (setup arms the timer), never filling in on screen.
         let rec = cfg_value()[winsize::KEY].get(winsize_key(p)).cloned();
-        if let (Some(rec), Some(wc)) = (rec, ctx.config_mut().app.windows.first_mut()) {
+        if let Some(wc) = ctx.config_mut().app.windows.first_mut() {
             wc.visible = false;
-            let _ = WIN_REC.set((rec, (wc.width, wc.height)));
+            BOOT_GATE.arm();
+            if let Some(rec) = rec {
+                let _ = WIN_REC.set((rec, (wc.width, wc.height)));
+            }
         }
     }
     // cp-unrestricted: the window is built in setup (page_window), not by Tauri
@@ -6232,7 +9103,16 @@ fn main() {
         .plugin(appid::plugin())
         .manage(vault)
         .manage(ZoomLevel(Mutex::new(read_zoom_cfg())))
+        .on_menu_event(|_app, _ev| {
+            // macOS port: our Quit (mac_menu) asks the UI to flush like a window close
+            #[cfg(target_os = "macos")]
+            if _ev.id().as_ref() == MAC_QUIT && quit_request(_app, "app quit") {
+                _app.exit(0); // not armed: nothing to wait for
+            }
+        })
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            mac_menu(app.handle())?;
             if let Some(wc) = &page_conf {
                 page_window(app.handle(), wc)?;
             }
@@ -6242,6 +9122,12 @@ fn main() {
             install_term(app.handle().clone()); // tab-dataloss: SIGTERM flushes, bounded
             // item 14: a switch-started window whose UI never calls switch_ready
             // is still shown (and frees the old window) after SWITCH_FALLBACK
+            // #281: the vault-boot window is hidden until boot_reveal; fail open after
+            // reveal::FALLBACK so a hung plugin / a stalled UI can never keep it blank
+            if BOOT_GATE.armed() {
+                let h = app.handle().clone();
+                reveal::arm_fallback(&BOOT_GATE, reveal::FALLBACK, move |why| boot_show(&h, why));
+            }
             if SWITCHED.get().is_some() {
                 let h = app.handle().clone();
                 std::thread::spawn(move || {
@@ -6264,7 +9150,7 @@ fn main() {
                     "[win_drag] session: x11={} _NET_WM_MOVERESIZE={} -> path {}",
                     proto.x11,
                     proto.moveresize,
-                    drag_path(proto.x11, proto.moveresize, None)
+                    drag_path_here(drag_path(proto.x11, proto.moveresize, None))
                 );
                 let wayland = !proto.x11;
                 app.manage(proto);
@@ -6289,30 +9175,28 @@ fn main() {
             }
             Ok(())
         })
-        // R31.1 THE DROP HANDLER — 4 lines of body, no behaviour, no I/O, no policy.
-        // Proven end to end by gate phase `osdrop` (a real XDND drag, real pointer).
-        // wry delivers a real XDND drop to Rust and Tauri hands it to us as
-        // WindowEvent::DragDrop (tauri-runtime-wry-2.11.4:4889: for a window's
-        // own content webview the drop is a SYNTHESIZED WINDOW event, not a
-        // webview one), so the DOM never sees a DataTransfer carrying files —
-        // faking a DOM drop in JS would test a path production does not have.
-        // Which note is open and where the caret sits is webview state, so this
-        // re-emits [paths, x, y] under ONE name the UI owns (`drop-files`; x/y =
-        // where it landed, physical px, so the embed goes at the drop point) and
-        // stops: every rule — source checks, name checks, the cap, containment,
-        // no-overwrite — lives in `attach_drop`, reached through `attach_files`.
-        // Caveat, stated because it is real: `emit` serializes to JSON, so a
-        // source path whose bytes are not UTF-8 cannot be carried. It is then
-        // dropped here and the user sees nothing — the same hole Tauri's own
-        // `tauri://drag-drop` payload has. Such a file is never attached, never
-        // half-attached; R31.10.
+        // R31.1 THE DROP TRANSPORT lives in xdnd.rs since #51 (page_window disables
+        // Tauri's own drag-drop handler, so WindowEvent::DragDrop never fires here).
+        // Proven end to end by gate phase `osdrop` (a real XDND drag, real pointer)
+        // and, for the link drag Tauri's handler used to swallow, `droplink`.
+        // A file drop still re-emits [paths, x, y] under ONE name the UI owns
+        // (`drop-files`) and stops: every rule — source checks, name checks, the
+        // cap, containment, no-overwrite — lives in `attach_drop`, reached through
+        // `attach_files`. Caveat, stated because it is real: `emit` serializes to
+        // JSON, so a source path whose bytes are not UTF-8 cannot be carried; such
+        // a file is never attached, never half-attached; R31.10.
         .on_window_event(|w, e| {
+            // #136: the hidden recorder webview is no app window (no size to keep, no quit flow);
+            // an app window that is gone takes its recorder webview (and the mic) with it
+            if audiorec::is_rec(w.label()) {
+                return;
+            }
+            if let tauri::WindowEvent::Destroyed = e {
+                use tauri::Manager;
+                rec_close(w.app_handle(), w.label());
+            }
             winsize_event(w, e); // goal winsize: track + save on close (not the drop)
             quit_event(w, e); // tab-dataloss: a close waits (bounded) for the UI flush
-            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = e {
-                use tauri::Emitter;
-                let _ = w.emit(DROP_EVENT, (paths, position.x, position.y));
-            }
         })
         // S1: the window is the app, never a browser — every navigation off the
         // app origin (remote http(s), javascript:, file:, ...) is denied here.
@@ -6335,16 +9219,22 @@ fn main() {
         // still answer inline exactly as before.
         .register_asynchronous_uri_scheme_protocol(IMG_SCHEME, |ctx, req, responder| {
             use tauri::Manager;
+            // #144 toggle 4: off = a bodiless 403 for every vault image and PDF page,
+            // before the vault is resolved or the pdf worker queued (nothing is decoded)
+            if let Err(why) = media_allowed(IMG_SCHEME) {
+                eprintln!("[sec] refused {IMG_SCHEME}:{}: {why}", req.uri().path());
+                return responder.respond(tauri::http::Response::builder().status(403).body(Vec::new()).expect("img 403"));
+            }
             let root = cur_vault(&ctx.app_handle().state::<Vault>());
             let target = req.uri().path().trim_start_matches('/').to_string();
             if is_pdf_target(&target) {
                 let not_found = || tauri::http::Response::builder().status(404).body(Vec::new()).expect("pdf 404");
                 let q = pdf::parse_query(req.uri().query());
-                let p = root.as_deref().and_then(|r| pdf_path_in(r, &target));
+                let p = root.as_deref().and_then(|r| pdf_open_in(r, &target));
                 let (Some((page, w)), Some(p)) = (q, p) else {
                     return responder.respond(not_found());
                 };
-                return pdf::queue_render(p, page, w, Box::new(move |png| {
+                return pdf::queue_render_file(p, page, w, Box::new(move |png| {
                     responder.respond(match png {
                         Some(b) => tauri::http::Response::builder()
                             .status(200)
@@ -6358,12 +9248,14 @@ fn main() {
                 }));
             }
             let res = match root.as_deref().and_then(|r| serve_image(r, &target)) {
-                Some((mime, body)) => tauri::http::Response::builder()
-                    .status(200)
-                    .header("Content-Type", mime)
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Cache-Control", "no-store")
-                    .body(body),
+                Some((mime, body)) => {
+                    // an SVG is a document format: inert even if opened as one (img_headers)
+                    let mut b = tauri::http::Response::builder().status(200);
+                    for (k, v) in img_headers(mime) {
+                        b = b.header(k, v);
+                    }
+                    b.body(body)
+                }
                 None => tauri::http::Response::builder().status(404).body(Vec::new()),
             }
             .expect("img response");
@@ -6375,9 +9267,18 @@ fn main() {
         .register_uri_scheme_protocol(plugins::SCHEME, |ctx, req| {
             use tauri::Manager;
             let root = cur_vault(&ctx.app_handle().state::<Vault>());
-            let trusted = root.as_deref().is_some_and(|r| plugins::is_trusted(&cfg_value(), r));
+            // #251: ONE config read for the trust flag and the pins; the folder identity keys the pins
+            let cfg = cfg_value();
+            let trusted = root.as_deref().is_some_and(|r| plugins::is_trusted(&cfg, r));
+            let vid = root.as_deref().and_then(|r| plugins::trust_key(r).id);
             let b = tauri::http::Response::builder();
-            match plugins::serve(root.as_deref(), req.uri().path(), trusted) {
+            let served = plugins::serve_pinned(root.as_deref(), req.uri().path(), trusted, &cfg, vid.as_deref());
+            // #144 toggles 8 + 9: community code is about to enter this page's realm — tainted
+            // until the next HTML page (page_csp clears it); set BEFORE the body leaves
+            if matches!(served, plugins::Served::Js(_)) && !security::REALM_PLUGIN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("[sec] realm has community code ({})", req.uri().path());
+            }
+            match served {
                 plugins::Served::Js(body) => b
                     .status(200)
                     .header("Content-Type", "text/javascript; charset=utf-8")
@@ -6394,38 +9295,135 @@ fn main() {
             .map(std::borrow::Cow::Owned)
         })
         .invoke_handler(tauri::generate_handler![
-            list_notes, list_images, canvas_io, canvas_attach, paste_image, read_note, write_note, create_note, render, render_blocks, block_lines, render_view, highlight_blocks, graph, graph_local, graph_view, vault_get, pick_vault,
-            create_vault, create_vault_dir, open_vault_window, switch_show, switch_ready, boot_notice, home_dir, list_dirs, list_folders, create_dir, backlinks, search,
-            list_bookmarks, toggle_bookmark, bookmark_rows, bm_group_new, bm_group_rename, bm_group_delete, bm_move, bm_add, bm_drag, bm_add_at, recent_vaults, rename_note, media_rename, media_read, move_note, update_links, delete_note, link_consent, set_link_consent, strict_line_breaks, set_strict_line_breaks, qs_new_name, readable_line_length, graph_settings, set_graph_settings, tags, tag_counts,
+            list_notes, list_images, canvas_io, canvas_attach, paste_image, audio_token, audio_rec_start, audio_rec_go, audio_rec_log, audio_rec_started, audio_rec_data, audio_rec_stop, read_note, write_note, create_note, render, render_blocks, block_lines, render_view, highlight_blocks, graph, graph_local, graph_view, vault_get, pick_vault,
+            create_vault, create_vault_dir, open_vault_window, switch_show, switch_ready, boot_reveal, boot_notice, home_dir, pick_folder, list_dirs, list_folders, create_dir, backlinks, search,
+            list_bookmarks, toggle_bookmark, bookmark_rows, bm_group_new, bm_group_rename, bm_title, bm_group_delete, bm_move, bm_add, bm_drag, bm_add_at, bm_add_view, bm_add_view_at, bm_remove, bm_graph_patch, recent_vaults, rename_note, media_rename, media_read, move_note, update_links, delete_note, link_consent, set_link_consent, strict_line_breaks, set_strict_line_breaks, qs_new_name, readable_line_length, graph_settings, set_graph_settings, tags, tag_counts, props_index, props_mode, props_notes, props_types, set_prop_type, set_props_mode,
             get_sidebar_w, set_sidebar_w, log_spans, graph_renderer_pref, type_probe, nob_probe, psg_probe, vb_probe, smoke_css,
-            read_workspace, write_workspace,
+            read_workspace, write_workspace, wsm_list, wsm_get, wsm_op,
             outline, outgoing, backlinks_ctx, unlinked_mentions, link_mention, get_rside_tab, set_rside_tab, vault_id, ls_get, ls_set, get_theme, set_theme,
             snippets_scan, snippets_enabled, snippet_css, set_snippet_enabled,
-            plugins_state, plugins_set, plugin_io, plugin_vfs, desk_proc_spawn, desk_proc_read, desk_proc_write, desk_proc_end, desk_proc_kill,
+            plugins_state, plugins_set, plugins_pin_ack, plugin_io, plugin_vfs, desk_proc_spawn, spawn_allow_list, spawn_allow_revoke, security_get, security_set, security_restart, security_mic_set, security_dev_set, desk_proc_read, desk_proc_write, desk_proc_end, desk_proc_kill,
             desk_net_listen, desk_net_accept, desk_net_close, desk_sock_read, desk_sock_write, desk_sock_end, desk_sock_destroy,
             desk_http_request, desk_shell,
             plugin_store::store_list, plugin_store::store_detail, plugin_store::store_install, plugin_store::store_uninstall,
             updates::update_check,
             themes_scan, theme_css, get_css_theme, set_css_theme, theme_seed_report, vault_css_watch,
             get_quickfont, set_quickfont, get_fonts, set_font, font_families,
-            get_hotkeys, set_hotkeys, open_external, save_debounce_ms, attach_files,
+            get_hotkeys, set_hotkeys, open_external, save_debounce_ms, attach_files, attach_typed, clip::clip_text, clip::clip_has_text, clip::clip_set_text, mdtable::table_op,
             win_rect, win_gesture, win_move_proto, win_drag_start, win_minimize, win_toggle_max, win_close, quit_arm, quit_ready,
             tab_removed, insert_datetime,
-            zoom, zoom_get, pdf_info,
+            zoom, zoom_get, i18n_state, i18n_load, i18n_set, pdf_info,
             // cp-secrets
             secrets::secrets_op,
             settings::settings_model
         ])
-        .run(ctx)
-        .expect("tauri run");
+        .build(ctx)
+        .expect("tauri build")
+        .run(|_app, _ev| {
+            // macOS port: the app menu's Quit (Cmd+Q) is NSApp terminate:, which closes no window —
+            // CloseRequested never fires, so without this the debounced tail of the typing is lost.
+            // A USER exit (code None) asks the UI to flush exactly like a window close; quit_ready's
+            // own app.exit(0) (code Some) and the grace exit pass through.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = &_ev {
+                if !quit_request(_app, "app quit") {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Windows: a PDF card's frame fills the card instead of following its width, or the
+    /// 15 px WebView2 scrollbar makes it loop between two sizes (the card flickers). The
+    /// rule is added only where navigator.platform says Win: Linux keeps its layout.
+    #[test]
+    fn windows_pdf_card_fills_the_card_and_only_there() {
+        let js = include_str!("../../ui/plugins/canvas-files.js");
+        let rule = "(/Win/.test(navigator.platform) ? \".canvas-node-container > .canvas-file-pdf { height: 100% !important }\\n\" : \"\")";
+        assert!(js.contains(rule), "the Windows-only PDF card rule is missing");
+        assert_eq!(js.matches(".canvas-file-pdf { height: 100% !important }").count(), 1, "only the Windows branch sets it");
+    }
+
+    /* CC1 (PR #42 round 12, CodeAnt): the trust key is canonicalize(vault root) — a path lookup
+       that stands still on a stalled FUSE/NFS vault. Whatever runs while the lifecycle lock is
+       held (the trust recheck under it in desk_net::listen_trusted_via and desk_proc::shell_open,
+       the tail of desk_proc_spawn and of plugins_set's write after `lifecycle()`) must not do it,
+       or that mount holds up every trust-OFF, kill_all, close_all and spawn. The commands take a
+       tauri State and open native dialogs, so this reads their source: (a) desk_net_listen and
+       desk_shell compute the key before the call that takes the lock, and the closure handed to
+       it only compares keys (is_trusted_key); (b) desk_proc_spawn and plugins_set do no lookup
+       from their last `lifecycle()` to the end of the command. Comments are not code. */
+    #[test]
+    fn cc1_no_trust_key_path_lookup_under_the_lifecycle_lock() {
+        let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let code = |l: &str| -> String {
+            let t = l.trim_start();
+            if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                return String::new();
+            }
+            match l.find(" // ") { Some(i) => l[..i].to_string(), None => l.to_string() }
+        };
+        let body = |name: &str| -> Vec<String> {
+            let lines: Vec<&str> = src.lines().collect();
+            let head = format!("fn {name}(");
+            let i = lines.iter().position(|l| l.contains(&head) && !l.trim_start().starts_with("//")).unwrap_or_else(|| panic!("no fn {name}"));
+            let j = i + lines[i..].iter().position(|l| *l == "}").unwrap_or_else(|| panic!("fn {name} unterminated"));
+            lines[i..=j].iter().map(|l| code(l)).collect()
+        };
+        const LOOKUP: [&str; 3] = ["plugins::is_trusted(", "trust_key(", "canonicalize"];
+        let looks_up = |l: &str| LOOKUP.iter().find(|p| l.contains(*p)).copied();
+        // (a) the lock is taken inside the callee; the closure runs under it
+        for (name, call) in [("desk_net_listen", "desk_net::listen_trusted("), ("desk_shell", "desk_proc::shell_open(")] {
+            let b = body(name);
+            let k = b.iter().position(|l| l.contains("let key = plugins::trust_key(&root);")).unwrap_or_else(|| panic!("{name}: the trust key is not computed up front"));
+            let c = b.iter().position(|l| l.contains(call)).unwrap_or_else(|| panic!("{name}: no {call}"));
+            assert!(k < c, "{name}: the trust key is computed after {call} (under the lock it takes)");
+            assert!(b.iter().any(|l| l.contains("|| plugins::is_trusted_key(&cfg_value(), &key)")), "{name}: the trust closure does not compare the precomputed key");
+            for l in b.iter().filter(|l| l.contains("||")) {
+                assert!(looks_up(l).is_none(), "{name}: a closure does a path lookup ({:?}): {}", looks_up(l), l.trim());
+            }
+        }
+        // (b) the lock is taken in the command itself: nothing after it looks a path up
+        for name in ["desk_proc_spawn", "plugins_set"] {
+            let b = body(name);
+            let at = b.iter().rposition(|l| l.contains("desk_proc::lifecycle()")).unwrap_or_else(|| panic!("{name}: takes no lifecycle lock"));
+            for l in &b[at..] {
+                assert!(looks_up(l).is_none(), "{name}: a path lookup ({:?}) after the lifecycle lock: {}", looks_up(l), l.trim());
+            }
+        }
+    }
+
     fn nav(s: &str) -> bool {
         nav_allowed(&tauri::Url::parse(s).unwrap())
+    }
+
+    /* #74: the webview can LIST and REVOKE grants, never add one. Read the source: the only
+       code line that builds Op::SpawnAllowAdd is inside desk_proc_spawn (the grant closure run
+       after the native dialog's Always), and the two Settings commands are registered while no
+       other spawn_allow_* command exists. Comments are not code. */
+    #[test]
+    fn a74_only_the_spawn_dialog_adds_a_grant() {
+        let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let tests_at = src.find("#[cfg(test)]\nmod tests").expect("tests module");
+        let lines: Vec<&str> = src[..tests_at].lines().collect();
+        let is_code = |l: &str| {
+            let t = l.trim_start();
+            !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+        };
+        let head = lines.iter().position(|l| l.starts_with("async fn desk_proc_spawn(")).expect("fn desk_proc_spawn");
+        let end = head + lines[head..].iter().position(|l| *l == "}").expect("desk_proc_spawn unterminated");
+        let adds: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| is_code(l) && l.contains("SpawnAllowAdd")).map(|(i, _)| i).collect();
+        assert_eq!(adds.len(), 1, "expected exactly one SpawnAllowAdd in main.rs, found {adds:?}");
+        assert!(adds.iter().all(|i| (head..=end).contains(i)), "SpawnAllowAdd outside desk_proc_spawn at {adds:?}");
+        let cmds: Vec<&str> = lines.iter().filter(|l| l.contains("fn spawn_allow_")).copied().collect();
+        assert_eq!(cmds.len(), 2, "spawn_allow commands: {cmds:?}");
+        assert!(cmds.iter().any(|l| l.contains("fn spawn_allow_list(")) && cmds.iter().any(|l| l.contains("fn spawn_allow_revoke(")));
+        let reg = &src[src.find("generate_handler![").unwrap()..];
+        assert!(reg.contains("spawn_allow_list, spawn_allow_revoke"), "the Settings commands are not registered");
     }
 
     // tab-dataloss: the slow-write hook is inert unless set to a sane value
@@ -6450,6 +9448,25 @@ mod tests {
         assert!(QUIT_GRACE <= std::time::Duration::from_secs(5));
     }
 
+    /// Windows folder picker: the command is registered, the page reaches it from ONE place
+    /// (winBrowse) and enters that mode only on Windows; Linux and macOS keep the in-app list.
+    /// The dialog only fills the path: opening still goes through pickerGo -> pick_vault.
+    #[test]
+    fn windows_folder_dialog_is_wired_on_windows_only() {
+        let src = include_str!("main.rs");
+        let reg = &src[src.find("generate_handler![").unwrap()..];
+        assert!(reg.contains("home_dir, pick_folder, list_dirs,"), "pick_folder is not registered");
+        let ui = include_str!("../../ui/main.js");
+        assert!(ui.contains("const OS_WIN = /Win/.test(navigator.platform);"));
+        assert_eq!(ui.matches("inv(\"pick_folder\"").count(), 1, "the dialog is opened from one place");
+        let wb = &ui[ui.find("async function winBrowse() {").expect("winBrowse")..];
+        let wb = &wb[..wb.find("\n}\n").unwrap()];
+        assert!(wb.contains("inv(\"pick_folder\""), "pick_folder is called outside winBrowse");
+        assert!(!wb.contains("pick_vault") && !wb.contains("create_vault"), "the dialog must only fill the path");
+        assert_eq!(ui.matches("winFolderMode(").count(), 2, "one definition, one call");
+        assert!(ui.contains("  if (OS_WIN) return winFolderMode(m);\n"), "winFolderMode only on Windows");
+    }
+
     #[test]
     fn tabdl_quit_is_wired() {
         // both quit paths reach quit_request, and the UI side answers it
@@ -6469,14 +9486,22 @@ mod tests {
         assert!(nav("tauri://localhost"));
         assert!(nav("tauri://localhost/index.html"));
         assert!(nav("tauri://localhost/#/note"));
+        // http(s)://tauri.localhost is the Windows/WebView2 origin only (gated in nav_allowed)
+        if cfg!(windows) {
+            assert!(nav("http://tauri.localhost"));
+            assert!(nav("http://tauri.localhost/index.html"));
+            assert!(nav("https://tauri.localhost"));
+        } else {
+            assert!(!nav("http://tauri.localhost"));
+            assert!(!nav("https://tauri.localhost"));
+        }
     }
 
     #[test]
     fn appguard_nav_lookalikes_refused() {
         for u in [
-            "http://tauri.localhost",
-            "https://tauri.localhost",
             "https://tauri.localhost:1234",
+            "http://tauri.localhost:8080",
             "tauri://evil",
             "tauri://localhost:8080",
             "tauri://localhost.evil",
@@ -6610,13 +9635,17 @@ mod tests {
         assert_eq!(vfs_sync_answer(Some(&root), true, true, &q("exists", "zz.md")), (200, serde_json::json!({ "ok": false })));
         let (s, v) = vfs_sync_answer(Some(&root), true, true, &q("read", "a.md"));
         assert_eq!((s, v["ok"].as_str()), (200, Some("aGk=")));
-        let (s, v) = vfs_sync_answer(Some(&root), true, true, &q("read", "/etc/passwd"));
+        // an absolute host path: unix "/etc/passwd", on Windows a drive-letter path (a leading "/" is
+        // vault-relative there, see vaultfs::plugin_rel)
+        let host = if cfg!(windows) { "C:/Windows/win.ini" } else { "/etc/passwd" };
+        let (s, v) = vfs_sync_answer(Some(&root), true, true, &q("read", host));
         assert_eq!(s, 200);
         assert!(v["err"].as_str().is_some_and(|e| e.starts_with("EPERM")), "{v}");
         let _ = fs::remove_dir_all(&root);
     }
 
     /// git-chmod: chmod rides the trusted sync route only, mode masked to 0o777
+    #[cfg(unix)]
     #[test]
     fn vfs_sync_chmod_is_trusted_masked_and_confined() {
         use std::os::unix::fs::PermissionsExt;
@@ -6710,6 +9739,7 @@ mod tests {
     /// W5 + audit #5: a write that FAILS must leave the previous layout
     /// byte-identical. The failure is forced by a symlinked `.obsidian`: the
     /// no-follow walk refuses it, so the layout it points at is never touched.
+    #[cfg(unix)]
     #[test]
     fn w5_a_failed_layout_write_leaves_the_old_file_intact() {
         use std::os::unix::fs::symlink;
@@ -6730,6 +9760,7 @@ mod tests {
     /// W5 + audit #2: a leftover `workspace.json.tmp` (the old fixed temp name,
     /// e.g. from a crash, or PLANTED as a symlink) neither blocks the next
     /// write nor is followed: the temp name is random and O_EXCL.
+    #[cfg(unix)]
     #[test]
     fn w5_a_stale_temp_from_a_crash_is_replaced_not_obeyed() {
         use std::os::unix::fs::symlink;
@@ -7093,6 +10124,30 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// issue #178: each unlinked-mention row carries ITS hit inside the trimmed pane text (UTF-16), so
+    /// row 2 of "Fooz one, then Fooz two" marks the 2nd Fooz and "[[Fooz]] and Fooz" marks the plain one
+    #[test]
+    fn unlinked_mention_rows_mark_their_own_occurrence() {
+        let root = tmp_vault("um178");
+        fs::write(root.join("Fooz.md"), "# f").unwrap();
+        fs::write(root.join("U1.md"), "[[Fooz]] and Fooz").unwrap();
+        fs::write(root.join("U2.md"), "   Fooz one, then Fooz two").unwrap();
+        fs::write(root.join("U3.md"), "äé fooz").unwrap();
+        let ix = Index::build(&root);
+        let mut got: Vec<_> = unlinked_in(&ix, "Fooz")
+            .into_iter()
+            .map(|m| {
+                let u: Vec<u16> = m.text.encode_utf16().collect();
+                let a = m.mcol.unwrap() as usize;
+                (m.note, m.mcol.unwrap(), String::from_utf16(&u[a..a + m.mlen as usize]).unwrap())
+            })
+            .collect();
+        got.sort();
+        let w = |n: &str, c: u32, s: &str| (n.to_string(), c, s.to_string());
+        assert_eq!(got, [w("U1", 13, "Fooz"), w("U2", 0, "Fooz"), w("U2", 15, "Fooz"), w("U3", 3, "fooz")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// perfhunt P7: the parallel read in Index::build (above its 256-note
     /// threshold) yields the same names, contents, links and backlinks as a
     /// serial read of the same files — including an unreadable note (empty).
@@ -7238,6 +10293,20 @@ mod tests {
     }
 
     #[test]
+    fn render_math_spans_for_the_math_renderer() {
+        // #185: the m185 stock fixture. $..$ -> span.math-inline, $$..$$ -> span.math-display (TeX
+        // escaped as text; ui/mathview.js typesets them); "$ a$", "\$5" and code stay text
+        let h = render_with("Inline $e^{i\\pi}+1=0$ and $ a$ and \\$5 and `$x$`.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac13\n$$\n", &[], &[], true);
+        assert!(h.contains(r#"<span class="math math-inline">e^{i\pi}+1=0</span>"#), "{h}");
+        assert!(h.contains(r#"<span class="math math-display">"#) && h.contains(r"\frac13"), "{h}");
+        assert!(h.contains("and $ a$ and $5 and <code>$x$</code>"), "{h}");
+        assert_eq!(h.matches("class=\"math ").count(), 2, "{h}");
+        // hostile TeX is escaped text inside the span, never markup
+        let x = render_with("$<img src=x onerror=alert(1)>$", &[], &[], true);
+        assert!(!x.contains("<img") && x.contains("&lt;img"), "{x}");
+    }
+
+    #[test]
     fn render_marks_unresolved() {
         let notes = vec!["Ideas".to_string(), "sub/Nested".to_string()];
         let h = render_md("[[Ideas]] [[Nested]] [[Nope]]", &notes);
@@ -7301,6 +10370,7 @@ mod tests {
     /// renderers resolve against, so anything wrongly in it is a URL the
     /// webview will ask for: hidden dirs, symlinks and non-image extensions
     /// must stay out, and the extension set must match the byte server's.
+    #[cfg(unix)]
     #[test]
     fn index_lists_vault_images_only() {
         use std::os::unix::fs::symlink;
@@ -7328,7 +10398,7 @@ mod tests {
         }
         symlink(outside.join("secret.png"), root.join("link.png")).unwrap();
         let ix = Index::build(&root);
-        assert_eq!(ix.images(), ["UP.JPG", "pic.png", "sub/nested.webp"], "{:?}", ix.images());
+        assert_eq!(ix.images(), ["UP.JPG", "doc.svg", "pic.png", "sub/nested.webp"], "{:?}", ix.images());
         assert_eq!(ix.names(), ["A"], "images must never become notes");
         let _ = fs::remove_dir_all(&outside);
     }
@@ -7349,7 +10419,7 @@ mod tests {
             let h = render_with(md, &[], ix.images(), true);
             let i = h.find("src=\"").unwrap_or_else(|| panic!("no img for {md}: {h}")) + 5;
             let url = h[i..].split('"').next().unwrap();
-            let target = url.strip_prefix(&format!("{IMG_SCHEME}://localhost/")).expect(url);
+            let target = url.strip_prefix(&custom_scheme_url(IMG_SCHEME, "")).expect(url);
             // exactly the path the protocol handler passes to serve_image
             let (mime, bytes) = serve_image(&root, target).unwrap_or_else(|| panic!("{md} -> {url} served nothing"));
             assert_eq!(bytes, png, "{md}");
@@ -7374,12 +10444,12 @@ mod tests {
         let rmd = |c: &str| render_with(c, &[], &imgs, false);
         // R29.2 relative path, alt preserved and escaped
         let h = rmd("![a pic](pic.png)");
-        assert_eq!(src(&h), format!("{IMG_SCHEME}://localhost/pic.png"), "{h}");
+        assert_eq!(src(&h), custom_scheme_url(IMG_SCHEME, "pic.png"), "{h}");
         assert!(h.contains(r#"alt="a pic""#), "{h}");
         // subfolder: full path AND bare basename resolve to the same file
         let full = rmd("![](sub/nested.png)");
         let bare = rmd("![](nested.png)");
-        assert_eq!(src(&full), format!("{IMG_SCHEME}://localhost/sub/nested.png"), "{full}");
+        assert_eq!(src(&full), custom_scheme_url(IMG_SCHEME, "sub/nested.png"), "{full}");
         assert_eq!(src(&bare), src(&full), "basename must resolve like the path");
         // R29.1: the wikilink embed form agrees with the markdown form, exactly
         assert_eq!(src(&rmd("![[pic.png]]")), src(&rmd("![](pic.png)")));
@@ -7387,7 +10457,7 @@ mod tests {
         assert!(!rmd("![[pic.png]]").contains('!'), "bang leaked as text");
         // R29.3: %20 resolves and comes back percent-ENCODED in the url
         let h = rmd("![](my%20pic.png)");
-        assert_eq!(src(&h), format!("{IMG_SCHEME}://localhost/my%20pic.png"), "{h}");
+        assert_eq!(src(&h), custom_scheme_url(IMG_SCHEME, "my%20pic.png"), "{h}");
         // R29.3 second half: a RAW space is not an image at all (pulldown), text
         let h = rmd("![](my pic.png)");
         assert!(!h.contains("<img") && h.contains("![](my pic.png)"), "{h}");
@@ -7510,11 +10580,100 @@ mod tests {
         let h = render_with(r#"https://e.example/"><script>"#, &[], &[], true);
         assert!(!h.contains("<script>"), "{h}");
     }
+    /* #144 toggle 3: "any new network feature must go through the same choke point", as a test.
+       (a) a network constructor appears ONLY in the three allow-listed functions; (b) each of
+       those is reached only through a caller that asks net_allowed first. */
+    #[test]
+    fn every_outbound_path_goes_through_the_choke_point() {
+        // production code only: drop every top-level `#[cfg(test)] mod x { … }` block (and `mod x;` lines)
+        fn code(s: &str) -> String {
+            let (mut out, mut skip, mut prev_test) = (String::new(), false, false);
+            for l in s.lines() {
+                if skip {
+                    if l == "}" {
+                        skip = false;
+                    }
+                } else if prev_test && (l.starts_with("mod ") || l.starts_with("pub mod ")) {
+                    skip = !l.trim_end().ends_with(';');
+                } else if l.trim() != "#[cfg(test)]" {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+                prev_test = l.trim() == "#[cfg(test)]";
+            }
+            out
+        }
+        fn body<'a>(s: &'a str, head: &str) -> &'a str {
+            let a = s.find(head).unwrap_or_else(|| panic!("{head} not found"));
+            let e = s[a..].find("\n}\n").map(|e| a + e).unwrap_or(s.len());
+            &s[a..e]
+        }
+        // WinHttpConnect: the Windows client (http_win.rs), reached only from plugin_store::http_get
+        let net = ["soup::Session::", "TcpStream::connect", "TcpListener::bind", "UdpSocket::", "WinHttpConnect("];
+        let allowed = [("plugin_store.rs", "pub fn http_get("), ("http_win.rs", "pub fn get("), ("desk_http.rs", "fn connect("), ("desk_net.rs", "fn listen(")];
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = 0;
+        for ent in fs::read_dir(dir).unwrap().flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            files += 1;
+            let c = code(&fs::read_to_string(ent.path()).unwrap());
+            // the byte ranges of the allow-listed function bodies in this file
+            let ok: Vec<(usize, usize)> = allowed
+                .iter()
+                .filter(|(f, _)| *f == name)
+                .flat_map(|(_, h)| c.match_indices(h).map(|(a, _)| (a, c[a..].find("\n}\n").map(|e| a + e).unwrap_or(c.len()))).collect::<Vec<_>>())
+                .collect();
+            let mut at = 0;
+            for l in c.lines() {
+                let t = l.trim_start();
+                let comment = t.starts_with("//") || t.starts_with('*') || t.starts_with("/*");
+                if !comment && net.iter().any(|n| l.contains(n)) {
+                    assert!(ok.iter().any(|(a, e)| (*a..*e).contains(&at)), "{name}: a network constructor outside the choke-point functions: {l}");
+                }
+                at += l.len() + 1;
+            }
+        }
+        assert!(files > 20, "the source scan found {files} files");
+        // plugin_store::http_get (every cfg variant) asks before it builds a session
+        let ps = code(include_str!("plugin_store.rs"));
+        assert!(ps.matches("pub fn http_get(").count() >= 1);
+        for (a, _) in ps.match_indices("pub fn http_get(") {
+            let b = &ps[a..a + ps[a..].find("\n}\n").unwrap()];
+            let chk = b.find("crate::net_allowed(what)?").expect("http_get without the choke point");
+            if let Some(s) = b.find("Session::new") {
+                assert!(chk < s, "http_get builds its session before the check");
+            }
+        }
+        // the other two are reached only from their commands, which ask first
+        let m = code(include_str!("main.rs"));
+        for (call, cmd) in [("desk_http::request(", "async fn desk_http_request("), ("desk_net::listen_trusted(", "fn desk_net_listen(")] {
+            let b = body(&m, cmd);
+            let at = b.find(call).unwrap_or_else(|| panic!("{cmd} does not call {call}"));
+            assert!(b[..at].contains("net_allowed("), "{cmd} calls {call} before net_allowed");
+            assert!(b[..at].contains("plugin_net_allowed("), "{cmd} calls {call} before plugin_net_allowed (#144 toggle 2)");
+            assert_eq!(m.matches(call).count(), 1, "{call} has another caller in main.rs");
+        }
+        for ent in fs::read_dir(dir).unwrap().flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.ends_with(".rs") && name != "main.rs" && name != "desk_http.rs" && name != "desk_net.rs" {
+                let c = code(&fs::read_to_string(ent.path()).unwrap());
+                assert!(!c.contains("desk_http::request(") && !c.contains("listen_trusted("), "{name} reaches a plugin network path directly");
+            }
+        }
+        // the browser: open_external confirms while offline, desk_shell refuses plugin URL opens
+        assert!(body(&m, "async fn open_external(").contains("net_allowed("));
+        let sh = body(&m, "async fn desk_shell(");
+        assert!(sh.find("net_allowed(").unwrap() < sh.find("shell_open(").unwrap());
+    }
+
     #[test]
     fn open_external_rejects_non_http() {
         for u in ["javascript:alert(1)", "file:///etc/passwd", "data:text/html,x", "vbscript:x", "../x", "#h", "", "ftp://a.b"] {
             assert!(check_external(u).is_err(), "accepted {u}");
-            assert!(open_external(u.to_string()).is_err(), "command accepted {u}");
+            assert!(open_external_now(u.to_string()).is_err(), "command accepted {u}");
         }
         for u in ["https://example.com", "http://a.b/c", "mailto:x@y.z", "HTTPS://A.B"] {
             assert!(check_external(u).is_ok(), "rejected {u}");
@@ -7554,8 +10713,8 @@ mod tests {
                 "reading={reading}: want R29.4's banner for each remote image: {h}"
             );
             assert!(
-                h.contains("\u{201c}remote image\u{201d} could not be found."),
-                "reading={reading}: the banner is not R29.4's wording: {h}"
+                h.contains("\u{201c}remote image\u{201d} was blocked.") && !h.contains("could not be found"),
+                "reading={reading}: a remote image is BLOCKED, not missing (PR #193 review): {h}"
             );
             // S4/extlink is NOT affected: the same url is still a working link.
             let l = render_with("[text](https://example.com/x.png)", &[], &[], reading);
@@ -7569,6 +10728,467 @@ mod tests {
         let f = render_with("![d](file:///etc/passwd)", &[], &[], true);
         assert!(!f.contains("imgmiss") && !f.contains("<img"), "file:// image changed shape: {f}");
         assert!(f.contains("![d](file:///etc/passwd)"), "file:// image is no longer literal text: {f}");
+    }
+
+    /// #144 toggle 1 (Load external resources), layer 1. Off (the default, every
+    /// test above): R29.10 unchanged plus the banner names the toggle. On: an https
+    /// target mints ONE element carrying the URL (img / audio / video by extension),
+    /// http:// stays a banner, and a link / a non-http scheme is unaffected.
+    #[test]
+    fn remote_media_toggle_mints_https_only_when_on() {
+        let md = "![a](https://example.com/x.png)\n\n![b](http://example.com/y.png)\n\n\
+                  ![c](https://example.com/s.mp3)\n\n![d](https://example.com/v.mp4?t=1)\n";
+        for reading in [true, false] {
+            let off = render_with(md, &[], &[], reading);
+            assert!(!off.contains("example.com"), "reading={reading}: off leaked the host: {off}");
+            assert_eq!(off.matches("data-sec=\"remoteMedia\"").count(), 4, "{off}");
+            assert!(off.contains("Load external resources is off"), "off banner does not name the toggle: {off}");
+            // PR #193 review: the target was refused on purpose — say so, never "could not be found"
+            assert_eq!(off.matches("\u{201c}remote image\u{201d} was blocked.").count(), 4, "{off}");
+            assert!(!off.contains("could not be found"), "off banner calls a blocked image missing: {off}");
+            let on = security::with_remote(true, || render_with(md, &[], &[], reading));
+            assert!(on.contains("\u{201c}remote image\u{201d} was blocked.") && !on.contains("could not be found"), "{on}");
+            assert!(on.contains(r#"<img class="rimg" src="https://example.com/x.png" alt="a" loading="lazy" referrerpolicy="no-referrer">"#), "{on}");
+            assert!(on.contains(r#"<audio class="rmedia" controls preload="none" src="https://example.com/s.mp3""#), "{on}");
+            assert!(on.contains(r#"<video class="rmedia" controls preload="none" src="https://example.com/v.mp4?t=1""#), "{on}");
+            assert!(!on.contains("http://example.com"), "http:// minted or leaked: {on}");
+            assert_eq!(on.matches("only https:// addresses load").count(), 1, "{on}");
+        }
+        // an attribute break-out in the URL is escaped, never a second attribute
+        let h = security::with_remote(true, || render_with("![x](https://e.x/a\"onerror=\"x.png)", &[], &[], true));
+        assert!(!h.contains("\"onerror="), "{h}");
+        // other schemes are S1's business either way
+        let f = security::with_remote(true, || render_with("![d](file:///etc/passwd)", &[], &[], true));
+        assert!(!f.contains("<img") && !f.contains("data-sec"), "{f}");
+    }
+
+    /// #144 toggle 4 (Render media). On (default, every test above): unchanged. Off: each
+    /// resolved image / PDF / audio embed — both syntaxes, both renderers — is ONE placeholder
+    /// naming the file and the toggle, with no opensidian-img: URL, no data-pdf, no audio span;
+    /// an unresolved target keeps R29.4's banner (off reveals nothing a typo would not).
+    /// And the backend refusals sit FIRST in media_read, pdf_info and the scheme handler.
+    #[test]
+    fn vault_media_toggle_paints_placeholders_and_refuses_first() {
+        let imgs = vec!["pic.png".to_string(), "sub/doc.pdf".to_string()];
+        let md = "![[pic.png]]\n\n![x](sub/doc.pdf#page=2)\n\n![[rec.mp3]]\n\n![](a%20b.webm)\n\n![[gone.png]]\n";
+        for reading in [true, false] {
+            let on = render_with(md, &[], &imgs, reading);
+            assert!(on.contains(&custom_scheme_url(IMG_SCHEME, "pic.png")) && on.contains("data-pdf=\"sub/doc.pdf\""), "{on}");
+            assert!(!on.contains("vaultMedia"), "{on}");
+            let off = security::with_media(false, || render_with(md, &[], &imgs, reading));
+            assert!(!off.contains(IMG_SCHEME) && !off.contains("data-pdf") && !off.contains("audio-embed"), "reading={reading}: {off}");
+            assert_eq!(off.matches("data-sec=\"vaultMedia\"").count(), 4, "{off}");
+            for n in ["pic.png \u{2014} ", "doc.pdf \u{2014} ", "rec.mp3 \u{2014} ", "a b.webm \u{2014} "] {
+                assert!(off.contains(n), "{n} missing: {off}");
+            }
+            assert!(!off.contains("sub/doc.pdf"), "the folder path reached the DOM: {off}");
+            assert_eq!(off.matches("media rendering is off").count(), 4, "{off}");
+            assert!(off.contains("(Settings › Security › Render media)"), "{off}");
+            assert!(off.contains("\u{201c}gone.png\u{201d} could not be found."), "{off}");
+        }
+        // a name is escaped, never markup
+        let h = security::with_media(false, || audio_html("<b>x.mp3", ""));
+        assert!(!h.contains("<b>") && h.contains("&lt;b&gt;x.mp3"), "{h}");
+        // refusal first: before the vault is resolved / a byte read / the worker queued
+        let src = include_str!("main.rs");
+        for (head, ask) in [
+            ("fn media_read(", "media_allowed(\"media_read\")?"),
+            ("async fn pdf_info(", "media_allowed(\"pdf_info\")?"),
+            (".register_asynchronous_uri_scheme_protocol(IMG_SCHEME", "media_allowed(IMG_SCHEME)"),
+        ] {
+            let a = src.find(head).unwrap_or_else(|| panic!("{head}"));
+            let b = &src[a..];
+            let q = b.find(ask).unwrap_or_else(|| panic!("{head} does not ask {ask}"));
+            for later in ["cur_vault(", "pdf::queue", "serve_image("] {
+                if let Some(l) = b.find(later) {
+                    assert!(q < l, "{head}: {later} runs before the toggle 4 check");
+                }
+            }
+        }
+    }
+
+    /// #281: the boot theme decision is on <html> before the first paint
+    #[test]
+    fn theme_init_js_puts_the_boot_theme_on_html() {
+        let d = theme_init_js(Some("dark"));
+        assert!(d.contains("var s=\"dark\";"), "{d}");
+        let l = theme_init_js(Some("light"));
+        assert!(l.contains("var s=\"light\";"), "{l}");
+        // no stored choice -> the system signal decides, exactly as bootTheme()/systemTheme()
+        let n = theme_init_js(None);
+        assert!(n.contains("var s=null;"), "{n}");
+        assert!(n.contains("matchMedia(\"(prefers-color-scheme: dark)\").matches?\"dark\":\"light\""), "{n}");
+        for js in [&d, &l, &n] {
+            assert!(js.contains("document.documentElement.setAttribute(\"data-theme\",t)"), "{js}");
+            assert!(js.starts_with("(function(){") && js.ends_with("})();"), "not one self-contained statement: {js}");
+            assert!(!js.contains("document.body"), "body does not exist at document start: {js}");
+        }
+    }
+
+    /// #281 negative: junk / hostile stored values never reach the script text (closed set)
+    #[test]
+    fn theme_init_js_ignores_non_mode_values() {
+        let none = theme_init_js(None);
+        for junk in ["", "Dark", "LIGHT", "system", "\"};alert(1);//", "</script><script>x()</script>", "light ", " dark"] {
+            let js = theme_init_js(Some(junk));
+            assert_eq!(js, none, "stored {junk:?} was not treated as 'no choice'");
+            // the equality above is the guarantee; this names a leak directly. Skip values that
+            // are already text of the no-choice script (" dark" is in "prefers-color-scheme: dark").
+            assert!(junk.is_empty() || none.contains(junk) || !js.contains(junk), "stored {junk:?} leaked into the init script");
+        }
+    }
+
+    /// #281 startup reveal, the wiring around reveal.rs (whose own tests prove the gate + timer):
+    /// a vault boot starts hidden AND arms the fail-open timer; the UI reveals after the tabs are
+    /// in and BEFORE the community plugins load, unawaited — so a hung plugin cannot hold it.
+    #[test]
+    fn boot_reveal_wiring_fails_open_and_precedes_plugins() {
+        let src = include_str!("main.rs");
+        let m = &src[src.find(concat!("} else if let Some(p) = ", "&init {")).expect("vault-boot branch")..];
+        let m = &m[..m.find("\n    }\n").expect("end")];
+        assert!(m.contains("wc.visible = false;") && m.contains("BOOT_GATE.arm();"), "a vault boot window is not created hidden + armed");
+        assert!(src.contains(concat!("reveal::arm_fallback(&BOOT_GATE, reveal::", "FALLBACK,")), "no fail-open timer armed in setup");
+        let wr = &src[src.find("fn winsize_restore(").expect("winsize_restore")..];
+        let wr = &wr[..wr.find("\n}\n").expect("end")];
+        assert!(!wr.contains(concat!("w.sh", "ow()")), "winsize_restore maps the window before the UI is in");
+        let ui = include_str!("../../ui/main.js");
+        let ev = &ui[ui.find("async function enterVault()").expect("enterVault")..];
+        let ev = &ev[..ev.find("\n}\n").expect("end")];
+        let r = ev.find(concat!("inv(\"boot_", "reveal\").catch(")).expect("enterVault never reveals (unawaited)");
+        assert!(!ev[..r].trim_end().ends_with("await"), "the reveal is awaited");
+        let tabs = ev.find("await wsApply(").expect("restore");
+        let plg = ev.find("__osPluginHost.boot(").expect("plugin boot");
+        assert!(tabs < r && r < plg, "reveal must come after the restored tabs and before plugins load");
+        assert!(!ev[..r].contains("__osPluginHost"), "plugin code runs before the reveal");
+        // the boot layout is measured while the window is hidden: a resize (the map at the real
+        // size) must re-measure the #rtoggle rect, or the census keeps the unmapped viewport's rect
+        let rs = &ui[ui.find(concat!("addEventListener(\"re", "size\", () => {")).expect("resize handler")..];
+        let rs = &rs[..rs.find("\n});\n").expect("end")];
+        assert!(rs.contains(concat!("placeRTo", "ggle();")), "resize does not re-measure #rtoggle after the hidden boot");
+    }
+
+    /// #281: page_window adds the theme init script at creation, from the stored choice
+    #[test]
+    fn page_window_adds_theme_init_before_build() {
+        let src = include_str!("main.rs");
+        let a = src.find("fn page_window(").expect("page_window");
+        let pw = &src[a..a + src[a..].find("\n}\n").expect("end")];
+        let init = pw.find(concat!("initialization_script(&theme_init_", "js(get_theme().as_deref()))")).expect("no theme init script at creation");
+        assert!(init < pw.find(".build()?").expect("build"), "the theme init script is added after the window is built");
+    }
+
+    /// #281: style.css paints the light palette in the BOOT state (html data-theme=light, no
+    /// body mode class yet) and keeps the explicit-class precedence (0,0,1)
+    #[test]
+    fn style_css_light_palette_covers_the_boot_state() {
+        let css = include_str!("../../ui/style.css");
+        let sel = "body:where(.theme-light, :root[data-theme=\"light\"] > :not(.theme-dark)) {";
+        assert_eq!(css.matches(sel).count(), 1, "the light palette block does not cover the boot state");
+        let blk = &css[css.find(sel).unwrap()..];
+        assert!(blk[..blk.find('}').unwrap()].contains("--background-primary: var(--color-base-00, #ffffff);"), "the boot branch is not on the light palette block");
+        // a stored DARK choice on a light desktop: html says dark -> the light branch cannot match
+        assert!(!sel.contains("data-theme=\"dark\""), "{sel}");
+    }
+
+    /// #144 toggle 6: canvas off at creation = an ALL-FRAMES init script added before the
+    /// window is built; each main-frame load records whether its document got the stubs; the
+    /// live half adds / removes only OUR script (never remove_all_scripts: Tauri's IPC init
+    /// lives there too); security_set applies it after the write; the CSP drops blob: workers
+    #[test]
+    fn canvas_stubs_reach_every_frame_before_any_script() {
+        let src = include_str!("main.rs");
+        let body = |head: &str| {
+            let a = src.find(head).unwrap_or_else(|| panic!("{head}"));
+            &src[a..a + src[a..].find("\n}\n").expect("end")]
+        };
+        let pw = body("fn page_window(");
+        let init = pw.find(concat!("initialization_script_for_all_frames(", "security::canvas_script())")).expect("no all-frames canvas script at creation");
+        assert!(init < pw.find(".build()?").expect("build"), "the canvas script is added after the window is built");
+        assert!(pw.contains(concat!("security::PAGE_CANVAS.", "store(cv")), "a page load does not record its canvas state");
+        let lv = body("fn sec_canvas<R: tauri::Runtime>(w:");
+        for k in ["UserContentInjectedFrames::AllFrames", "UserScriptInjectionTime::Start", "ucm.remove_script(&old)", "ucm.add_script(&us)"] {
+            assert!(lv.contains(k), "sec_canvas lacks {k}");
+        }
+        assert!(!lv.contains(concat!("remove_all", "_scripts")), "sec_canvas would drop Tauri's own init scripts");
+        let set = body("async fn security_set(");
+        let c = set.find(concat!("security::canvas_", "change(")).expect("security_set does not apply canvas live");
+        assert!(set.find("cfg_update(").expect("write") < c && set[c..].contains("sec_canvas(&w, add)"));
+        assert!(body("fn page_csp(").contains(concat!("security::csp_", "canvas(")), "no worker-src layer");
+    }
+
+    /// #144 toggle 5: the webview's enable-webgl is set at window creation from the effective
+    /// value, security_set re-applies it when the effective value moves, and the graph's
+    /// renderer preference names the toggle while it is off
+    #[test]
+    fn webgl_toggle_is_applied_at_creation_and_live() {
+        let src = include_str!("main.rs");
+        let build = src.find("audiorec::install(&w);").expect("page window");
+        let tail = &src[build..];
+        let ok = tail.find("Ok(())").expect("end of the page window fn");
+        assert!(tail[..ok].contains("sec_webgl(&w, security::effective(&cfg_value()).sec.webgl)"), "not set at creation");
+        let set = src.find("async fn security_set(").expect("security_set");
+        let body = &src[set..set + src[set..].find("\n}\n").expect("end")];
+        let w = body.find("security::webgl_change(").expect("security_set does not re-apply WebGL");
+        assert!(body.find("cfg_update(").expect("write") < w, "re-applied before the value is written");
+        assert!(body[w..].contains("sec_webgl(&w, gl)") && body[w..].contains("win.emit(\"security-webgl\", gl)"), "no live webview change / graph event");
+        let pref = src.find("fn graph_renderer_pref()").expect("pref");
+        let pb = &src[pref..pref + src[pref..].find("\n}\n").expect("end")];
+        assert!(pb.contains("security::webgl_off_text()") && pb.contains("Some(\"2d\".to_string())"), "{pb}");
+    }
+
+    /// #144 toggle 10: both plugin program-start commands ask the toggle after the restricted
+    /// check and BEFORE a consent slot is taken (no question queued, no dialog, no lookup)
+    #[test]
+    fn spawn_toggle_refuses_before_any_dialog() {
+        let src = include_str!("main.rs");
+        for (head, ask, admit) in [
+            ("async fn desk_proc_spawn(", "spawn_allowed(\"spawn\", plugin.as_deref())?", "consent::admit()"),
+            ("async fn desk_shell(", "spawn_allowed(&format!(\"shell {}\"", "desk_proc::shell_prepare("),
+        ] {
+            let a = src.find(head).unwrap_or_else(|| panic!("{head}"));
+            let b = &src[a..a + src[a..].find("\n}\n").expect("end")];
+            let q = b.find(ask).unwrap_or_else(|| panic!("{head} does not ask toggle 10"));
+            assert!(b.find("plugins::is_trusted(").expect("restricted check") < q, "{head}: toggle 10 before the restricted check");
+            for later in [admit, "consent::ask(", "net_allowed(", "consent::resolve("] {
+                if let Some(l) = b.find(later) {
+                    assert!(q < l, "{head}: {later} runs before the toggle 10 check");
+                }
+            }
+        }
+        assert_eq!(src.matches(concat!("security::", "spawn_check(")).count(), 1, "toggle 10 has one reader");
+    }
+
+    /// #295 (audit F-8): audio_rec_start decides natively before it builds the recorder webview —
+    /// token, then Microphone off refuses (before any dialog), then the native Kind::Mic consent,
+    /// then the grant (only after a yes), then start_check consumes it; the grant is minted
+    /// nowhere else; the indicator goes on with the recording and off in rec_close
+    #[test]
+    fn mic295_audio_rec_start_asks_natively_before_the_recorder_exists() {
+        let src = include_str!("main.rs");
+        let a = src.find("async fn audio_rec_start(").expect("audio_rec_start");
+        let b = &src[a..a + src[a..].find("\n}\n").expect("end")];
+        let at = |s: &str| b.find(s).unwrap_or_else(|| panic!("audio_rec_start lacks {s}"));
+        let order = [
+            "audiorec::authorized(&parent, &token)?",
+            "security::mic_check(security::mic_effective(&cfg_value())).inspect_err(",
+            "consent::admit()?",
+            concat!("consent::Kind::", "Mic, consent::mic_question(&vault)"),
+            "return Err(audiorec::NO_GRANT.into())",
+            concat!("audiorec::", "grant(&parent,"),
+            "audiorec::start_check(&parent, &token,",
+            "rec_close(&app, &parent);",
+            "tauri::WebviewWindowBuilder::new(",
+            "rec_indicator(&win, true)",
+        ];
+        for w in order.windows(2) {
+            assert!(at(w[0]) < at(w[1]), "audio_rec_start: {} must come before {}", w[0], w[1]);
+        }
+        assert_eq!(src.matches(concat!("audiorec::", "grant(")).count(), 1, "a grant is minted only after the native consent");
+        assert_eq!(src.matches(concat!("consent::Kind::", "Mic")).count(), 1, "one mic question");
+        let rc = src.find("fn rec_close(").expect("rec_close");
+        assert!(src[rc..rc + src[rc..].find("\n}\n").expect("end")].contains("rec_indicator(&w, false)"), "the indicator outlives the recording");
+        assert!(src[src.find("generate_handler![").unwrap()..].contains("security_mic_set,"), "not registered");
+        let ms = src.find("async fn security_mic_set(").expect("security_mic_set");
+        let mb = &src[ms..ms + src[ms..].find("\n}\n").expect("end")];
+        let (w, c) = (mb.find("security::mic_weakens(").expect("weakens"), mb.find(concat!("cfgstore::Op::", "SecurityMic(")).expect("write"));
+        assert!(w < c && mb[w..c].contains("consent::Kind::Security"), "off -> ask written without the native confirm");
+        assert_eq!(src.matches(concat!("cfgstore::Op::", "SecurityMic(")).count(), 1, "one writer of the microphone");
+    }
+
+    /// #295 follow-up, Microphone = always allow: it skips ONLY the per-start question. The token
+    /// check and the off/lockdown refusal come before the branch, the grant / start_check (token +
+    /// setting again) / recorder / indicator after it, outside it: an always-allow start still
+    /// needs the token and still turns the native indicator on. The setting is written only by
+    /// security_mic_set, behind mic_decide (a weakening change needs the native confirm's yes).
+    #[test]
+    fn mic295_always_allow_skips_only_the_question() {
+        let src = include_str!("main.rs");
+        let a = src.find("async fn audio_rec_start(").expect("audio_rec_start");
+        let b = &src[a..a + src[a..].find("\n}\n").expect("end")];
+        let at = |s: &str| b.find(s).unwrap_or_else(|| panic!("audio_rec_start lacks {s}"));
+        let branch = at(concat!("if security::mic_", "asks(security::mic_effective(&cfg_value())) {"));
+        let other = at("} else {\n        eprintln!(\"[audiorec] start: Microphone = always allow");
+        let join = branch + b[branch..].find("\n    }\n").expect("branch end");
+        assert!(at("audiorec::authorized(&parent, &token)?") < branch, "the token check must come before the always branch");
+        assert!(at("security::mic_check(security::mic_effective(&cfg_value())).inspect_err(") < branch, "off / lockdown must refuse before the always branch");
+        assert!(branch < at(concat!("consent::Kind::", "Mic,")) && at(concat!("consent::Kind::", "Mic,")) < other, "the question sits in the ask branch");
+        assert!(other < join, "branch shape");
+        for after in [concat!("audiorec::", "grant(&parent,"), "audiorec::start_check(&parent, &token,", "tauri::WebviewWindowBuilder::new(", "rec_indicator(&win, true)"] {
+            assert!(at(after) > join, "{after} must run for EVERY start (after the always branch), not inside it");
+        }
+        assert!(!b[branch..join].contains("rec_indicator") && !b[branch..join].contains("audiorec::start_check"), "the branch must not hold the token / indicator steps");
+        assert_eq!(b.matches("rec_indicator(&win, true)").count(), 1, "one indicator-on, for every recording");
+        let ms = src.find("async fn security_mic_set(").expect("security_mic_set");
+        let mb = &src[ms..ms + src[ms..].find("\n}\n").expect("end")];
+        let (d, c) = (mb.find("security::mic_decide(stored, m, confirmed)").expect("decide"), mb.find(concat!("cfgstore::Op::", "SecurityMic(")).expect("write"));
+        assert!(d < c && mb[..d].contains("confirmed = consent::ask(") && mb[d..c].contains("else {") && mb[d..c].contains("return Ok("), "the write is not behind mic_decide + the native confirm");
+        assert!(mb.contains("let mut confirmed = false;"), "confirmed must default to NO");
+    }
+
+    /// devaccess: the app page's getUserMedia rejector (ui/main.js) forwards ONLY a rebuilt
+    /// { video } request to the native gate (devperm::decide); anything carrying audio, or with no
+    /// video, is still refused in the page. The audio key is never copied into the forwarded object.
+    #[test]
+    fn devacc_page_forwards_only_video_to_the_native_gate() {
+        let ui = include_str!("../../ui/main.js");
+        let a = ui.find("const deny = function getUserMedia(c) {").expect("rejector");
+        let body = &ui[a..a + ui[a..].find("\n  };").expect("rejector end")];
+        assert!(body.contains("!c.audio) v = c.video;"), "audio must exclude the forward: {body}");
+        assert!(body.contains("const ask = { video: (typeof v === \"object\" ? v : true) }; return gum(ask);"), "forward must be a rebuilt video-only object");
+        assert_eq!(body.matches("gum(").count(), 1, "one forward only");
+        assert!(!body.contains("gum(c"), "the caller's constraints object must never reach WebKit");
+        assert!(!body.contains("audio:"), "no audio key in the forwarded request");
+        assert!(body.contains("reserved for the Audio recorder core plugin.\", \"NotAllowedError\""), "everything else refused");
+        // both bindings still the rejector, non-writable
+        assert!(ui.contains("Object.defineProperty(md, \"getUserMedia\", { value: deny, writable: false, configurable: false"));
+        assert!(ui.contains("Object.defineProperty(MediaDevices.prototype, \"getUserMedia\", { value: deny, writable: false, configurable: false"));
+    }
+
+    /// devaccess: a Device access row is written only by security_dev_set, behind dev_decide and
+    /// the native Security confirm (confirmed defaults to NO); the setter takes only (field, value),
+    /// nothing page-reported (no plugin id / vault / origin) enters it; one writer of Op::SecurityDev
+    #[test]
+    fn devacc_row_written_only_behind_the_native_confirm() {
+        let src = include_str!("main.rs");
+        assert!(src[src.find("generate_handler![").unwrap()..].contains("security_dev_set,"), "not registered");
+        let ms = src.find("async fn security_dev_set(").expect("security_dev_set");
+        let mb = &src[ms..ms + src[ms..].find("\n}\n").expect("end")];
+        assert!(mb.starts_with("async fn security_dev_set(win: tauri::Window, field: String, value: String) ->"), "the setter must take only the row and the value");
+        let at = |s: &str| mb.find(s).unwrap_or_else(|| panic!("security_dev_set lacks {s}"));
+        assert!(at("security::dev_validate(&field, &value)?") < at("security::mic_weakens(stored, m)"));
+        assert!(at("security::mic_weakens(stored, m)") < at("consent::Kind::Security, consent::security_dev_question(f, m)"));
+        let (d, c) = (at("security::dev_decide(stored, m, confirmed)"), at(concat!("cfgstore::Op::", "SecurityDev(")));
+        assert!(d < c && mb[d..c].contains("else {") && mb[d..c].contains("return Ok("), "the write is not behind dev_decide");
+        assert!(mb.contains("let mut confirmed = false;"), "confirmed must default to NO");
+        for page in ["plugin", "vault", "origin"] {
+            assert!(!mb.contains(page), "security_dev_set must not be keyed by page-reported {page}");
+        }
+        assert_eq!(src.matches(concat!("cfgstore::Op::", "SecurityDev(")).count(), 1, "one writer of the Device access rows");
+    }
+
+    /// #144 toggle 7: the JIT env is applied in main() right after the boot latch, BEFORE the
+    /// spawner starts (it would inherit the old env), the sandbox closes and the Builder makes
+    /// the first webview; one reader of the plan
+    #[test]
+    fn jit_env_is_applied_before_any_child_or_webview() {
+        let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let m = src.find("\nfn main() {").expect("main");
+        let mb = &src[m..m + src[m..].find("\n}\n").expect("end")];
+        let boot = mb.find("security::boot(&sec_cfg)").expect("boot latch");
+        let jit = mb.find("sec_jit_env(security::effective(&sec_cfg).sec.jit)").expect("jit env in main");
+        assert!(boot < jit, "the JIT env follows the latch");
+        for later in ["spawner::start()", "sandbox::enforce(", "tauri::Builder::default()"] {
+            assert!(jit < mb.find(later).unwrap_or_else(|| panic!("{later}")), "{later} runs before the JIT env");
+        }
+        assert_eq!(src.matches(concat!("security::", "jit_plan(")).count(), 1, "toggle 7 has one reader");
+    }
+
+    /// #144 toggle 11: the engine gate sits in the app scheme's resource hook, right after the
+    /// vfs route and BEFORE the served answer can leave (page_csp / devui), with one reader;
+    /// the loaders name the toggle and check it before window.<lib> is touched
+    #[test]
+    fn engine_switches_gate_the_resource_hook_and_the_loaders() {
+        let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let w = src.find("fn page_window(").expect("page_window");
+        let wb = &src[w..w + src[w..].find("\n}\n").expect("end")];
+        let hook = wb.find("on_web_resource_request(").expect("resource hook");
+        let gate = wb.find(concat!("security::", "engine_refusal(")).expect("engine gate in the hook");
+        assert!(hook < gate && gate < wb.find("page_csp(&h, res)").expect("page_csp"), "gate before the answer leaves");
+        assert!(wb[gate..].find("engine_off_response(").expect("403") < wb[gate..].find("} else {").expect("else"));
+        assert_eq!(src.matches(concat!("security::", "engine_refusal(")).count(), 1, "toggle 11 has one reader");
+        let js = include_str!("../../ui/plugins/api-functions.js");
+        for (load, f, lib) in [("function loadMathJax()", "mathjax", "window.MathJax ="), ("function loadPrism()", "prism", "window.Prism =")] {
+            let b = &js[js.find(load).expect(load)..];
+            let ask = b.find(&format!("engineOff(\"{f}\")")).unwrap_or_else(|| panic!("{load} does not ask its switch"));
+            assert!(ask < b.find(lib).expect(lib), "{load}: the switch is asked before {lib}");
+        }
+        // #187 (3477e8b, #232) replaced the "not bundled" stub `loadMermaid: () => engineOff("mermaid") || ...`
+        // with the vendored loader: it must still name its switch FIRST, before any fetch, global or
+        // config, and every Mermaid entry (plugin API, __osLibs, the app's renderMermaid) is that one loader
+        let m = js.find("function loadMermaid() {").expect("loadMermaid");
+        let mb = &js[m..m + js[m..].find("\n    }\n").expect("loadMermaid end")];
+        let ask = mb.find("const off = engineOff(\"mermaid\"); if (off) return off;").expect("loadMermaid names its switch when off");
+        for later in ["loadOnce(", "mermaidReady()", "loadScript(\"mermaid/mermaid.min.js\"", "window.mermaid", "configureMermaid("] {
+            assert!(ask < mb.find(later).unwrap_or_else(|| panic!("loadMermaid: {later}")), "loadMermaid: {later} runs before the switch");
+        }
+        assert_eq!(js.matches("loadScript(\"mermaid/").count(), 1, "Mermaid is fetched only inside the gated loader");
+        assert_eq!(js.matches("function loadMermaid(").count(), 1, "one Mermaid loader");
+        let r = js.find("function renderMermaid(").expect("renderMermaid");
+        let rb = &js[r..r + js[r..].find("\n    }\n").expect("renderMermaid end")];
+        assert!(rb.contains("return loadMermaid().then(") && !rb.contains("window.mermaid"), "renderMermaid reaches Mermaid only through the gated loader");
+        let g = js.find("const GATED = {").expect("GATED");
+        let gb = &js[g..g + js[g..].find("};").expect("GATED end")];
+        assert!(gb.contains("\n      loadMermaid,\n") && !gb.contains("loadMermaid:"), "the plugin API exports the gated loader itself");
+        assert!(js.contains("Object.freeze({ loadPrism, loadMermaid, renderMermaid })"), "__osLibs hands out the gated loader");
+        let set = src.find("async fn security_set(").expect("security_set");
+        let sb = &src[set..set + src[set..].find("\n}\n").expect("end")];
+        assert!(sb.contains("win.emit(\"security-changed\", field)"), "security_set tells the page whoever called it");
+        let ui = include_str!("../../ui/security.js");
+        assert!(ui.contains("T.event.listen(\"security-changed\"") && ui.contains("if (engineStale().length) cspAgree();"), "an engine that went off is unloaded");
+    }
+
+    /// #144 toggles 8 + 9: every clip_* command asks the gate before any GTK call; the plugin
+    /// scheme handler taints the realm before the body leaves; only a main-frame page load
+    /// (not page_csp, which iframes reach too) clears it; the native gate is wired with the window
+    #[test]
+    fn clipboard_toggles_gate_every_command_and_the_realm_taint() {
+        let clip = include_str!("clip.rs");
+        for (head, ask) in [
+            ("pub async fn clip_text(", "crate::clip_allowed(\"clip_text\")?"),
+            ("pub async fn clip_has_text(", "crate::clip_allowed(\"clip_has_text\")?"),
+            ("pub fn clip_set_text(", "crate::clip_allowed(\"clip_set_text\")?"),
+        ] {
+            let a = clip.find(head).unwrap_or_else(|| panic!("{head}"));
+            let b = &clip[a..a + clip[a..].find("\n}\n").expect("end")];
+            let q = b.find(ask).unwrap_or_else(|| panic!("{head} does not ask toggles 8 + 9"));
+            for later in ["read(", "board()", "MAX_CLIP_TEXT"] {
+                if let Some(l) = b.find(later) {
+                    assert!(q < l, "{head}: {later} runs before the clipboard gate");
+                }
+            }
+        }
+        assert_eq!(clip.matches("#[tauri::command]").count(), 3, "a new clip command must be gated too");
+        let src = include_str!("main.rs");
+        let h = src.find("register_uri_scheme_protocol(plugins::SCHEME").expect("plugin scheme");
+        let hb = &src[h..h + src[h..].find(".invoke_handler(").expect("end")];
+        let taint = hb.find(concat!("REALM_PLUGIN", ".swap(true")).expect("served plugin code taints the realm");
+        assert!(taint < hb.find("text/javascript").expect("body"), "taint before the body leaves");
+        let c = src.find("fn page_csp(").expect("page_csp");
+        let cb = &src[c..c + src[c..].find("\n}\n").expect("end")];
+        assert!(!cb.contains("REALM_PLUGIN"), "page_csp runs for iframes too: it must not clear the taint");
+        let w = src.find("fn page_window(").expect("page_window");
+        let wb = &src[w..w + src[w..].find("\n}\n").expect("end")];
+        let started = wb.find("PageLoadEvent::Started").expect("page load hook");
+        assert!(wb[started..].contains(concat!("REALM_PLUGIN", ".store(false")), "main-frame load clears the taint");
+        assert!(wb.contains("sec_clip_gate(&w)") && wb.contains("sec_clip(&w, security::effective"), "native gate wired at creation");
+        assert_eq!(src.matches(concat!("security::", "clip_check(")).count(), 1, "toggles 8 + 9 have one reader");
+    }
+
+    /// #144 toggle 12: lockdown's pieces outside the overlay are wired — every trust check reads
+    /// restricted (is_trusted_key asks first), a trust-ON is refused, the page CSP drops wasm,
+    /// "Restart now" is registered, refused while nothing waits for a restart, and only a
+    /// restart token lets the child past the lock probe / wait for the old window's lock
+    #[test]
+    fn lockdown_is_wired_through_trust_csp_and_restart() {
+        let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let body = |head: &str| -> String {
+            let a = src.find(head).unwrap_or_else(|| panic!("{head}"));
+            src[a..a + src[a..].find("\n}\n").expect("end")].to_string()
+        };
+        let pl = include_str!("plugins.rs");
+        let k = pl.find("pub fn is_trusted_key(").expect("is_trusted_key");
+        let kb = &pl[k..k + pl[k..].find("\n}\n").expect("end")];
+        assert!(kb.find("crate::security::trust_blocked()").expect("no lockdown check") < kb.find("TRUST_KEY").expect("flag read"), "lockdown after the flag");
+        let ps = body("async fn plugins_set(");
+        assert!(ps.find("security::trust_blocked()").expect("trust-ON not refused") < ps.find("consent::admit()").expect("admit"));
+        assert!(body("fn page_csp(").contains("eff.lockdown,"), "page CSP ignores lockdown");
+        let rs = body("async fn security_restart(");
+        assert!(rs.find("restartPending").expect("pending gate") < rs.find(concat!("spawn::restart_", "token()")).expect("token"));
+        assert!(src[src.find("generate_handler![").unwrap()..].contains("security_set, security_restart,"), "not registered");
+        assert!(body("fn spawn_checked(").contains("spawn::restart_of(&s.token)).is_some_and(spawn::alive)"));
+        let m = body("\nfn main() {");
+        assert!(m.contains("bind_vault_boot_after(&vault, p, &vaultlock::env_lock_dir(), restart)"), "boot does not wait for a restart");
+        assert_eq!(src.matches(concat!("spawn::restart_", "token()")).count(), 1, "restart tokens are minted by security_restart only");
     }
 
     #[test]
@@ -7696,6 +11316,24 @@ mod tests {
         let g = graph_of(&docs);
         assert_eq!(g.nodes.iter().map(|n| (n.name.as_str(), n.resolved)).collect::<Vec<_>>(), vec![("A", true), ("sub/C", true), ("Nope.md", false)]);
         assert_eq!(g.edges, vec![(0, 1), (0, 2)]);
+    }
+
+    #[test]
+    fn search_property_query_hits_the_key_line() {
+        let docs = vec![
+            ("A".to_string(), "---\ntitle: t\nstatus: done\n---\nstatus in the body\n".to_string()),
+            ("B".to_string(), "---\nstatus: open\n---\n".to_string()),
+            ("C".to_string(), "status: not frontmatter\n".to_string()),
+        ];
+        let h = search_docs(docs_ref(&docs), "[status]");
+        assert_eq!(h.iter().map(|x| (x.note.as_str(), x.line, x.snippet.as_str())).collect::<Vec<_>>(),
+                   vec![("A", 2, "status: done"), ("B", 1, "status: open")]);
+        assert_eq!(h[0].offset, 13, "the offset is the key line's start in the file (4 + 9 bytes)");
+        let h = search_docs(docs_ref(&docs), "[status:OPEN]");
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].note, "B");
+        // not a bracket term: the plain text search as before
+        assert_eq!(search_docs(docs_ref(&docs), "status").len(), 4);
     }
 
     #[test]
@@ -8153,11 +11791,12 @@ mod tests {
         )
         .unwrap();
         let t = read_bm_tree(&root);
-        // the pane paints ONLY what we model...
-        assert_eq!(bm_rows_of(&t).iter().map(|r| r.name.clone()).collect::<Vec<_>>(), vec!["Plain"]);
-        // ...row 0 is "Plain" even though two opaque entries precede it on
+        // the pane paints ONLY what we model — issue #31: a canvas path is modelled now
+        // (D3, painted by its basename), the search entry still is not...
+        assert_eq!(bm_rows_of(&t).iter().map(|r| r.name.clone()).collect::<Vec<_>>(), vec!["Diagram.canvas", "Plain"]);
+        // ...row 1 is "Plain" even though an opaque entry precedes the canvas on
         // disk: rows never number an opaque, paths stay raw child indices
-        assert_eq!(bm_path_of(&t, 0), Some(vec![2]));
+        assert_eq!(bm_path_of(&t, 1), Some(vec![2]));
         // ...and an edit does not cost the vault the other two entries
         let mut t = t;
         bm_toggle_in(&mut t, "Plain"); // remove the only modelled entry
@@ -8169,6 +11808,198 @@ mod tests {
         assert_eq!(items[0]["ctime"], serde_json::json!(1789851600000u64), "ctime included");
         assert_eq!(items[1]["path"], "Diagram.canvas");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// issue #44: a `.pdf` file bookmark (stock writes them) is a painted row
+    /// flagged `pdf`, named by its full vault path; it is no note name, and a
+    /// write gives it back byte-for-byte in stock's key order.
+    #[test]
+    fn issue44_pdf_bookmark_is_painted_and_rides_through() {
+        let body = r#"{"items": [
+                {"type": "file", "ctime": 7, "path": "docs/Paper.PDF"},
+                {"type": "file", "ctime": 8, "path": "Spec.pdf", "title": "The spec"},
+                {"type": "file", "ctime": 9, "path": ".pdf"},
+                {"type": "file", "ctime": 10, "path": "Plain.md"}
+            ]}"#;
+        let t = parse_bm_tree(body);
+        let rows = bm_rows_of(&t);
+        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["docs/Paper.PDF", "Spec.pdf", "Plain"]);
+        assert_eq!(rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), vec!["Paper.PDF", "The spec", "Plain"]);
+        assert_eq!(rows.iter().map(|r| r.pdf).collect::<Vec<_>>(), vec![true, true, false]);
+        assert_eq!(bm_path_of(&t, 2), Some(vec![3]), "the bare .pdf stays opaque");
+        let mut names = Vec::new();
+        bm_names(&t, &mut names);
+        assert_eq!(names, vec!["Plain"]);
+        let v: serde_json::Value = serde_json::from_str(&bm_emit(&t, &[])).unwrap();
+        assert_eq!(v["items"][0], serde_json::json!({"type": "file", "ctime": 7, "path": "docs/Paper.PDF"}));
+        assert_eq!(v["items"][1], serde_json::json!({"type": "file", "ctime": 8, "path": "Spec.pdf", "title": "The spec"}));
+        assert_eq!(v["items"][3]["path"], "Plain.md");
+    }
+
+    /// issue #31 (docs/recon-bm31 D1-D3): stock's graph item, our local-graph item and a canvas
+    /// / base file item are PAINTED rows, and a write gives every one back byte-for-byte per item
+    /// (stock layout, key order, unknown keys); search + folder stay opaque and unpainted.
+    #[test]
+    fn issue31_graph_canvas_items_paint_and_round_trip() {
+        let body = r#"{"items": [
+                {"type": "graph", "ctime": 1, "title": "Untitled Graph", "options": {"search": "path:F", "repelStrength": 13, "zz": [1]}},
+                {"type": "graph", "ctime": 2, "title": "B (local)", "options": {"search": ""}, "local": {"file": "B.md", "localJumps": 2}},
+                {"type": "file", "ctime": 3, "path": "Board.canvas"},
+                {"type": "file", "ctime": 4, "path": "Notes.base"},
+                {"type": "search", "ctime": 5, "query": "alpha"},
+                {"type": "folder", "ctime": 6, "path": "F"},
+                {"type": "graph", "ctime": 7, "title": 3},
+                {"type": "file", "ctime": 8, "path": "P.md"}
+            ]}"#;
+        let t = parse_bm_tree(body);
+        let rows = bm_rows_of(&t);
+        assert_eq!(rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+                   vec!["Untitled Graph", "B (local)", "Board.canvas", "Notes.base", "P"]);
+        assert_eq!(rows[0].graph.as_ref().unwrap()["options"]["repelStrength"], 13);
+        assert_eq!(rows[0].graph.as_ref().unwrap()["local"], serde_json::Value::Null);
+        assert_eq!(rows[1].graph.as_ref().unwrap()["local"]["file"], "B.md");
+        assert_eq!(rows.iter().map(|r| (r.path, r.pdf)).collect::<Vec<_>>(),
+                   vec![(false, false), (false, false), (true, false), (true, false), (false, false)]);
+        let mut names = Vec::new();
+        bm_names(&t, &mut names);
+        assert_eq!(names, vec!["P"], "a graph / canvas row is no note name");
+        let src: serde_json::Value = serde_json::from_str(body).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&bm_emit(&t, &[])).unwrap();
+        for i in 0..8 {
+            assert_eq!(serde_json::to_string(&out["items"][i]).unwrap(), serde_json::to_string(&src["items"][i]).unwrap(), "item {i}");
+        }
+    }
+
+    /// issue #118: a bookmark-opened graph's edits land in THAT item only — options merged in
+    /// place (unknown keys, title, ctime, key order, position kept), the four local keys in
+    /// `local`; a renamed / deleted / ambiguous item refuses, nothing is ever created.
+    #[test]
+    fn issue118_graph_bookmark_write_back() {
+        let body = r#"{"items": [
+                {"type": "file", "ctime": 1, "path": "Home.md"},
+                {"type": "group", "ctime": 2, "items": [
+                    {"type": "graph", "ctime": 3, "title": "Untitled Graph", "options": {"search": "q", "repelStrength": 13, "zz": [1]}, "mine": 1}
+                ], "title": "G"},
+                {"type": "graph", "ctime": 4, "title": "B (local)", "options": {"search": ""}, "local": {"file": "B.md", "localJumps": 1, "localBacklinks": true}},
+                {"type": "graph", "ctime": 5, "title": "Dup"},
+                {"type": "graph", "ctime": 5, "title": "Dup"}
+            ]}"#;
+        let m = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let none = serde_json::Map::new();
+        let n = |c: u64| serde_json::Number::from(c);
+        let mut t = parse_bm_tree(body);
+        let rows = bm_rows_of(&t);
+        let gs = rows.iter().find(|r| r.label == "Untitled Graph").unwrap().graph.clone().unwrap();
+        assert_eq!((gs["ctime"].clone(), gs["title"].clone()), (serde_json::json!(3), serde_json::json!("Untitled Graph")), "the row carries its key");
+        bm_graph_patch_in(&mut t, Some(&n(3)), Some("Untitled Graph"), false,
+                          &m(serde_json::json!({"repelStrength": 7.5, "showOrphans": false})), &none).unwrap();
+        bm_graph_patch_in(&mut t, Some(&n(4)), Some("B (local)"), true,
+                          &m(serde_json::json!({"search": "x"})), &m(serde_json::json!({"localJumps": 3}))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&bm_emit(&t, &[])).unwrap();
+        let g = &v["items"][1]["items"][0];
+        assert_eq!(g, &serde_json::json!({"type": "graph", "ctime": 3, "title": "Untitled Graph",
+            "options": {"search": "q", "repelStrength": 7.5, "zz": [1], "showOrphans": false}, "mine": 1}));
+        assert_eq!(g["options"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["search", "repelStrength", "zz", "showOrphans"]);
+        assert_eq!(v["items"][2]["local"], serde_json::json!({"file": "B.md", "localJumps": 3, "localBacklinks": true}));
+        assert_eq!(v["items"][2]["options"], serde_json::json!({"search": "x"}));
+        let before = bm_emit(&t, &[]);
+        for (c, ti, lg) in [(3, "Renamed", false), (9, "Untitled Graph", false), (3, "Untitled Graph", true), (5, "Dup", false)] {
+            assert!(bm_graph_patch_in(&mut t, Some(&n(c)), Some(ti), lg, &m(serde_json::json!({"scale": 2})), &none).is_err(), "{c} {ti} {lg}");
+        }
+        assert!(bm_graph_patch_in(&mut t, Some(&n(4)), Some("B (local)"), true, &m(serde_json::json!({"localJumps": 2})), &none).is_err(), "local key in options");
+        assert!(bm_graph_patch_in(&mut t, Some(&n(4)), Some("B (local)"), true, &none, &m(serde_json::json!({"file": "Z.md"}))).is_err(), "centre is not patched");
+        assert!(bm_graph_patch_in(&mut t, Some(&n(3)), Some("Untitled Graph"), false, &none, &m(serde_json::json!({"localJumps": 2}))).is_err());
+        assert_eq!(bm_emit(&t, &[]), before, "a refused write-back changes nothing");
+    }
+
+    /// issue #31: a view node is built in stock's key order with a minted ctime and stock's default
+    /// graph title; a dragged file item already bookmarked is refused, a second graph never is.
+    #[test]
+    fn issue31_add_view_order_title_and_dup_rules() {
+        let mut t = parse_bm_tree(r#"{"items": [{"type": "file", "ctime": 1, "path": "Home.md"}]}"#);
+        let g = serde_json::json!({"type": "graph", "options": {"search": "q"}});
+        bm_add_view_at_in(&mut t, None, 1, &g).unwrap();
+        bm_add_view_at_in(&mut t, None, 1, &g).unwrap();
+        let c = serde_json::json!({"type": "file", "path": "Board.canvas"});
+        bm_add_view_at_in(&mut t, None, 1, &c).unwrap();
+        assert!(bm_add_view_at_in(&mut t, None, 0, &c).is_err(), "canvas dup refused");
+        assert!(bm_add_view_at_in(&mut t, None, 0, &serde_json::json!({"type": "file", "path": "Home.md"})).is_err());
+        assert!(bm_add_view_at_in(&mut t, None, 0, &serde_json::json!({"type": "search", "query": "x"})).is_err());
+        assert!(bm_add_view_at_in(&mut t, None, 0, &serde_json::json!({"type": "graph", "options": 3})).is_err());
+        bm_add_view_in(&mut t, None, &serde_json::json!({"type": "graph", "title": "B (local)", "options": {}, "local": {"file": "B.md"}}), Some("")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&bm_emit(&t, &[])).unwrap();
+        let it = v["items"].as_array().unwrap();
+        assert_eq!(it.len(), 5);
+        assert_eq!(it[1]["path"], "Board.canvas");
+        let keys = |o: &serde_json::Value| o.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&it[2]), vec!["type", "ctime", "title", "options"]);
+        assert_eq!(it[2]["title"], "Untitled Graph");
+        assert_eq!(keys(&it[4]), vec!["type", "ctime", "title", "options", "local"]);
+        assert_eq!(it[4]["title"], "B (local)");
+        let mut t2 = parse_bm_tree(r#"{"items": []}"#);
+        bm_add_view_in(&mut t2, None, &g, Some("Mine")).unwrap();
+        assert_eq!(bm_rows_of(&t2)[0].label, "Mine", "a typed title wins");
+        assert!(bm_toggle_path_in(&mut t2, "Board.canvas").is_ok());
+        assert_eq!(bm_rows_of(&t2)[1].name, "Board.canvas");
+        assert!(bm_toggle_path_in(&mut t2, "Board.canvas").is_ok());
+        assert_eq!(bm_rows_of(&t2).len(), 1, "toggled off");
+        assert!(bm_toggle_path_in(&mut t2, "noext").is_err());
+        bm_group_new_in(&mut t2, None).unwrap();
+        assert!(bm_remove_in(&mut t2, 1).is_err(), "a group is not removed by row");
+        bm_remove_in(&mut t2, 0).unwrap();
+        assert_eq!(bm_rows_of(&t2).iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(), vec!["g"]);
+    }
+
+    /// issue #31 (D2/D3): every local-graph bookmark follows its renamed centre (none dropped),
+    /// a canvas bookmark follows the canvas path, and nothing else is touched.
+    #[test]
+    fn issue31_rename_follows_local_centre_and_canvas() {
+        let mut t = parse_bm_tree(r#"{"items": [
+                {"type": "graph", "ctime": 1, "title": "B (local)", "options": {}, "local": {"file": "B.md", "localJumps": 2}},
+                {"type": "group", "ctime": 2, "title": "G", "items": [{"type": "graph", "ctime": 3, "title": "B (local)", "local": {"file": "B.md"}}]},
+                {"type": "graph", "ctime": 4, "title": "Untitled Graph", "options": {"search": "B.md"}},
+                {"type": "file", "ctime": 5, "path": "Board.canvas"}
+            ]}"#);
+        assert!(bm_rename_walk(&mut t, "B", "B2"));
+        assert!(!bm_rename_walk(&mut t, "Q", "Q2"), "nothing to follow");
+        assert!(bm_rename_path_walk(&mut t, "Board.canvas", "sub/Board2.canvas"));
+        assert!(!bm_rename_path_walk(&mut t, "Other.canvas", "x.canvas"));
+        let v: serde_json::Value = serde_json::from_str(&bm_emit(&t, &[])).unwrap();
+        assert_eq!(v["items"][0]["local"], serde_json::json!({"file": "B2.md", "localJumps": 2}));
+        assert_eq!(v["items"][1]["items"][0]["local"]["file"], "B2.md");
+        assert_eq!(v["items"][2]["options"]["search"], "B.md", "a global graph's options are not a centre");
+        assert_eq!(v["items"][3]["path"], "sub/Board2.canvas");
+    }
+
+    /// PR #57 review: stock's `"title": ""` paints the basename (not a blank row), and the PDF row's
+    /// "Remove" (toggle by its path) drops THAT Pdf node — at any depth, nothing appended, the note
+    /// bookmarks around it untouched; a note bookmark of the same name still wins.
+    #[test]
+    fn issue44_pdf_bookmark_empty_title_and_remove() {
+        let body = r#"{"items": [
+                {"type": "file", "ctime": 7, "path": "Paper.pdf", "title": ""},
+                {"type": "group", "ctime": 8, "title": "G", "items": [{"type": "file", "ctime": 9, "path": "sub/In.pdf"}]},
+                {"type": "file", "ctime": 10, "path": "Alpha.md"}
+            ]}"#;
+        let mut t = parse_bm_tree(body);
+        let rows = bm_rows_of(&t);
+        assert_eq!(rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), vec!["Paper.pdf", "G", "In.pdf", "Alpha"]);
+        bm_toggle_in(&mut t, "Paper.pdf");
+        bm_toggle_in(&mut t, "sub/In.pdf");
+        let v: serde_json::Value = serde_json::from_str(&bm_emit(&t, &[])).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 2, "{v}");
+        assert_eq!(v["items"][0]["title"], "G");
+        assert_eq!(v["items"][0]["items"].as_array().unwrap().len(), 0);
+        assert_eq!(v["items"][1]["path"], "Alpha.md");
+        let mut t2 = parse_bm_tree(r#"{"items": [{"type": "file", "path": "x.pdf"}, {"type": "file", "path": "x.pdf.md"}]}"#);
+        bm_toggle_in(&mut t2, "x.pdf");
+        let v2: serde_json::Value = serde_json::from_str(&bm_emit(&t2, &[])).unwrap();
+        assert_eq!(v2["items"], serde_json::json!([{"type": "file", "path": "x.pdf"}]), "the note bookmark x.pdf wins");
+        // the PDF row's explicit remove (toggle_bookmark pdf:true) drops the Pdf node, never the note
+        let mut t3 = parse_bm_tree(r#"{"items": [{"type": "file", "path": "x.pdf"}, {"type": "file", "path": "x.pdf.md"}]}"#);
+        assert!(bm_drop_first_path(&mut t3, "x.pdf"));
+        let v3: serde_json::Value = serde_json::from_str(&bm_emit(&t3, &[])).unwrap();
+        assert_eq!(v3["items"], serde_json::json!([{"type": "file", "path": "x.pdf.md"}]), "only the pdf entry leaves");
     }
 
     /// R4X.17 — the painted LABEL follows Obsidian's measured rule
@@ -8535,6 +12366,16 @@ mod tests {
         bm_group_rename_in(&mut t, 2, "Work").unwrap();
         assert_eq!(bm_rows_of(&t)[2].name, "Work");
         assert!(bm_group_rename_in(&mut t, 0, "nope").is_err(), "a file row is not a group");
+        // issue #101: a FILE row's Rename sets its display title, in place; the name (the file) is untouched
+        bm_title_in(&mut t, 0, "  Alpha X ").unwrap();
+        assert_eq!((bm_rows_of(&t)[0].name.as_str(), bm_rows_of(&t)[0].label.as_str()), ("A", "Alpha X"));
+        assert_eq!(bm_value_of(&t[0])["title"], "Alpha X");
+        assert_eq!(bm_value_of(&t[0])["path"], "A.md");
+        bm_title_in(&mut t, 0, "   ").unwrap();
+        assert_eq!(bm_rows_of(&t)[0].label, "A", "a blank title clears it: the basename paints again");
+        assert!(bm_value_of(&t[0]).get("title").is_none(), "a cleared title writes no key");
+        assert!(bm_title_in(&mut t, 2, "x").is_err(), "a group row is bm_group_rename's");
+        assert!(bm_title_in(&mut t, 99, "x").is_err());
         // move a file IN, then back OUT to the top level (the superset route)
         bm_move_in_tree(&mut t, 0, Some(2)).unwrap();
         assert_eq!(
@@ -9130,6 +12971,27 @@ mod tests {
         assert_eq!(v["alwaysUpdateLinks"], serde_json::Value::Bool(true));
     }
 
+    /// issue #119: "Properties in document" lives in app.json, default visible, written by
+    /// merge; an unknown mode and an unparsable app.json are refused (the file is untouched)
+    #[test]
+    fn props_mode_round_trips_in_app_json() {
+        let root = r34_vault("propsmode");
+        assert_eq!(props_mode_in(&root), "visible", "Obsidian default is Visible");
+        fs::create_dir_all(root.join(".obsidian")).unwrap();
+        fs::write(root.join(".obsidian/app.json"), r#"{"alwaysUpdateLinks":true}"#).unwrap();
+        set_props_mode_in(&root, "hidden").unwrap();
+        assert_eq!(props_mode_in(&root), "hidden");
+        assert!(link_consent_in(&root), "the other key survived");
+        set_props_mode_in(&root, "source").unwrap();
+        assert_eq!(props_mode_in(&root), "source");
+        assert!(set_props_mode_in(&root, "bogus").is_err());
+        assert_eq!(props_mode_in(&root), "source");
+        fs::write(root.join(".obsidian/app.json"), "{nope").unwrap();
+        assert!(set_props_mode_in(&root, "visible").is_err());
+        assert_eq!(fs::read_to_string(root.join(".obsidian/app.json")).unwrap(), "{nope", "never overwritten");
+        assert_eq!(props_mode_in(&root), "visible");
+    }
+
     /// goal/minimalmargin: readableLineLength defaults ON (absent key, absent or
     /// unparsable app.json) and follows an explicit bool either way
     #[test]
@@ -9183,6 +13045,7 @@ mod tests {
 
     /// audit #1: the consented link rewrite writes fd-relative and skips a
     /// note that became a symlink after the index saw it
+    #[cfg(unix)]
     #[test]
     fn vaultfs_link_rewrite_skips_a_note_swapped_for_a_symlink() {
         use std::os::unix::fs::symlink;
@@ -9212,6 +13075,7 @@ mod tests {
 
     /// audit #2/#4 at the command core: save + new note never follow a planted
     /// temp symlink or a symlinked parent
+    #[cfg(unix)]
     #[test]
     fn vaultfs_note_save_and_create_refuse_symlinks() {
         use std::os::unix::fs::symlink;
@@ -9241,6 +13105,7 @@ mod tests {
     /// out of the vault, EVERY config writer refuses — app.json, the layout,
     /// bookmarks, appearance.json and the built-in theme seed — and nothing
     /// is created or changed behind the link
+    #[cfg(unix)]
     #[test]
     fn vaultfs_symlinked_obsidian_refuses_every_config_write() {
         use std::os::unix::fs::symlink;
@@ -9265,6 +13130,7 @@ mod tests {
 
     /// audit #6: delete-to-trash, move, mkdir and attachment drop refuse a
     /// symlinked directory in the vault and create NOTHING behind it.
+    #[cfg(unix)]
     #[test]
     fn vaultfs_trash_move_mkdir_drop_refuse_symlinked_dirs() {
         use std::os::unix::fs::symlink;
@@ -9301,6 +13167,7 @@ mod tests {
     }
 
     /// audit #9: the sidebar folder walk never descends a symlinked dir
+    #[cfg(unix)]
     #[test]
     fn vaultfs_list_folders_skips_symlinked_dirs_and_cycles() {
         use std::os::unix::fs::symlink;
@@ -9322,6 +13189,7 @@ mod tests {
     /// audit #6, the race: the trash dir (and a move's target dir) is swapped
     /// for a symlink AFTER it was resolved. The rename goes through the held
     /// dir fd, so the note lands in the moved real dir — never outside.
+    #[cfg(unix)]
     #[test]
     fn vaultfs_dir_swapped_mid_trash_and_move_never_leaves_the_vault() {
         use std::os::unix::fs::symlink;
@@ -9360,6 +13228,7 @@ mod tests {
 
     /// S2: symlinked dir + file inside the vault are invisible: not indexed,
     /// not snapshotted, not readable, not writable, not creatable-through
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_not_part_of_the_vault() {
         use std::os::unix::fs::symlink;
@@ -9399,6 +13268,147 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    /// SVG is served on one condition (IMG_TYPES): it is only ever shown as an
+    /// image. Pinned here: the embed is an <img>, nothing else; and the policy the
+    /// response carries runs no script, opens no connection and sandboxes it.
+    #[test]
+    fn svg_embeds_are_images_and_their_response_policy_is_inert() {
+        let root = tmp_vault("svg-embed");
+        fs::write(root.join("logo.svg"), "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>").unwrap();
+        let ix = Index::build(&root);
+        assert_eq!(ix.images(), ["logo.svg"]);
+        let h = image_html(ix.images(), "logo.svg", "");
+        assert!(h.starts_with("<img ") && h.contains(&format!("src=\"{}\"", custom_scheme_url(IMG_SCHEME, "logo.svg"))), "{h}");
+        for tag in ["<object", "<iframe", "<embed", "<svg", "<script"] {
+            assert!(!h.contains(tag), "{tag} in {h}");
+        }
+        let d: Vec<&str> = SVG_CSP.split(';').map(str::trim).collect();
+        assert!(d.contains(&"default-src 'none'") && d.contains(&"sandbox"), "{SVG_CSP}");
+        assert!(!SVG_CSP.contains("script-src") && !SVG_CSP.contains("connect-src") && !SVG_CSP.contains("http"), "{SVG_CSP}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #276: both stock embed syntaxes of a vault SVG render as ONE <img> on our
+    /// scheme, in reading view and in the editing render, and the URL round-trips
+    /// to the SVG bytes with Content-Type image/svg+xml. Case of the extension
+    /// does not matter (as for png); a sizing suffix keeps it an <img>.
+    #[test]
+    fn svg_embeds_render_as_img_in_both_syntaxes_and_round_trip() {
+        let root = tmp_vault("svg276");
+        fs::create_dir_all(root.join("art")).unwrap();
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'><rect width='100' height='100' fill='#1971c2'/></svg>";
+        for p in ["logo.svg", "art/UP.SVG"] {
+            fs::write(root.join(p), svg).unwrap();
+        }
+        let ix = Index::build(&root);
+        assert_eq!(ix.images(), ["art/UP.SVG", "logo.svg"], "{:?}", ix.images());
+        for reading in [true, false] {
+            for md in ["![[logo.svg]]", "![](logo.svg)", "![[logo.svg|120]]", "![[UP.SVG]]", "![](art/UP.SVG)"] {
+                let h = render_with(md, &[], ix.images(), reading);
+                assert_eq!(h.matches("<img ").count(), 1, "{md} reading={reading}: {h}");
+                assert!(!h.contains("could not be found"), "{md}: {h}");
+                for tag in ["<svg", "<object", "<iframe", "<embed", "<script"] {
+                    assert!(!h.contains(tag), "{md}: {tag} in {h}");
+                }
+                let i = h.find("src=\"").unwrap() + 5;
+                let url = h[i..].split('"').next().unwrap();
+                let target = url.strip_prefix(&custom_scheme_url(IMG_SCHEME, "")).expect(url);
+                let (mime, bytes) = serve_image(&root, target).unwrap_or_else(|| panic!("{md} -> {url} served nothing"));
+                assert_eq!((mime, bytes.as_slice()), ("image/svg+xml", &svg[..]), "{md}");
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #276 negative half: an SVG is served only as a vault member. A missing
+    /// one is R29.4's banner (no URL); traversal, a symlink out of the vault and
+    /// look-alike extensions (svgz, svg.html, a note named x.svg.md) serve nothing.
+    #[test]
+    #[cfg(unix)] // symlinks, FIFOs or mode bits
+    fn svg_serving_stays_vault_confined_and_exact() {
+        use std::os::unix::fs::symlink;
+        let root = tmp_vault("svg276neg");
+        let outside = std::env::temp_dir().join(format!("opensidian-svgout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.svg"), b"<svg/>").unwrap();
+        symlink(outside.join("secret.svg"), root.join("link.svg")).unwrap();
+        for p in ["z.svgz", "page.svg.html", "n.svg.md"] {
+            fs::write(root.join(p), b"<svg/>").unwrap();
+        }
+        let ix = Index::build(&root);
+        assert!(ix.images().is_empty(), "{:?}", ix.images());
+        let h = image_html(ix.images(), "missing.svg", "");
+        assert!(h.contains("could not be found") && !h.contains(IMG_SCHEME), "{h}");
+        for t in ["link.svg", "z.svgz", "page.svg.html", "n.svg.md", "../secret.svg", "%2e%2e/secret.svg", "missing.svg"] {
+            assert!(serve_image(&root, t).is_none(), "{t} was served");
+        }
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// #276: the response headers. Every image gets its exact type + nosniff +
+    /// no-store; an SVG additionally gets SVG_CSP (no script, no network, sandbox).
+    /// Raster types keep exactly the three headers they had.
+    #[test]
+    fn img_headers_make_svg_inert_and_leave_raster_unchanged() {
+        let svg = img_headers("image/svg+xml");
+        assert!(svg.contains(&("Content-Type", "image/svg+xml")) && svg.contains(&("X-Content-Type-Options", "nosniff")), "{svg:?}");
+        assert!(svg.contains(&("Content-Security-Policy", SVG_CSP)), "{svg:?}");
+        for (_, mime) in IMG_TYPES.iter().filter(|(e, _)| *e != "svg") {
+            assert_eq!(
+                img_headers(mime),
+                vec![("Content-Type", *mime), ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")]
+            );
+        }
+        let d: Vec<&str> = SVG_CSP.split(';').map(str::trim).collect();
+        for need in ["default-src 'none'", "sandbox"] {
+            assert!(d.contains(&need), "{need} missing: {SVG_CSP}");
+        }
+        for bad in ["script", "connect", "http", "*", "'self'", "unsafe-eval", "frame", "object"] {
+            assert!(!SVG_CSP.contains(bad), "{bad} in {SVG_CSP}");
+        }
+    }
+
+    /// #276 root cause guard: live preview (ui/editor.js Ed.IMG_EXTS) and the
+    /// reading view / byte server (index::IMG_EXTS) must name the SAME image set,
+    /// or one view draws an embed the other calls missing.
+    #[test]
+    fn live_preview_image_exts_match_the_index() {
+        let js = include_str!("../../ui/editor.js");
+        let line = js.lines().find(|l| l.trim_start().starts_with("IMG_EXTS: [")).expect("Ed.IMG_EXTS");
+        let inner = line.split('[').nth(1).and_then(|s| s.split(']').next()).expect(line);
+        let exts: Vec<&str> = inner.split(',').map(|s| s.trim().trim_matches('"')).filter(|s| !s.is_empty()).collect();
+        assert_eq!(exts, index::IMG_EXTS.to_vec(), "ui/editor.js Ed.IMG_EXTS vs index::IMG_EXTS");
+        assert!(exts.contains(&"svg"));
+    }
+
+    /// CodeAnt #262 (ui/editor.js:478): `![[https://host/logo.svg]]` is a REMOTE
+    /// image in reading view (image_html checks url_scheme before any vault
+    /// lookup), so it is the remote banner, never "<url> could not be found" —
+    /// for svg exactly as for png. Live preview must take the same decision: its
+    /// wikilink image branch hands imgEl the remote flag (as the `![](…)` branch
+    /// does), and imgEl mirrors image_html's other-scheme banner. Phase svgrender
+    /// pins the painted result in both views on the box.
+    #[test]
+    fn remote_wikilink_image_embed_is_the_remote_banner_in_both_views() {
+        for t in ["https://host/logo.svg", "https://host/logo.png", "HTTPS://HOST/LOGO.SVG", "http://host/logo.svg"] {
+            for reading in [true, false] {
+                let h = render_with(&format!("![[{t}]]"), &[], &["logo.svg".into(), "logo.png".into()], reading);
+                assert!(h.contains("data-sec=\"remoteMedia\"") && h.contains("\u{201c}remote image\u{201d} was blocked."), "{t} reading={reading}: {h}");
+                assert!(!h.contains("could not be found") && !h.contains("<img") && !h.contains("host/"), "{t} reading={reading}: {h}");
+            }
+        }
+        let h = render_with("![[ftp://host/logo.svg]]", &[], &["logo.svg".into()], true);
+        assert!(h.contains("\u{201c}remote image\u{201d} could not be found.") && !h.contains("<img"), "{h}");
+        let js = include_str!("../../ui/editor.js");
+        let wl = js.lines().find(|l| l.contains("eadd(Ed.imgEl(target,")).expect("live preview wikilink image branch");
+        assert!(wl.contains("/^https?:/i.test(target)"), "live preview ![[url]] does not pass image_html's remote decision: {wl}");
+        let body = js.split("  imgEl(target, alt, remote) {").nth(1).and_then(|s| s.split("\n  },").next()).expect("Ed.imgEl");
+        let (sch, src) = (body.find("/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(target)"), body.find("Ed.imgSrc(target)"));
+        assert!(sch.is_some() && sch < src, "Ed.imgEl looks a scheme target up in the vault before image_html's banner");
+    }
+
     /// R29 images, POSITIVE half: the shapes that MUST serve bytes. Kept next
     /// to the traversal test because a containment check that refuses
     /// everything also passes the negative one.
@@ -9419,8 +13429,9 @@ mod tests {
         assert_eq!(serve_image(&root, "UPPER.PNG").unwrap().0, "image/png");
         assert_eq!(serve_image(&root, "sub/nested.jpeg").unwrap().0, "image/jpeg");
         assert_eq!(serve_image(&root, "pic.png").unwrap().1, px.to_vec());
-        // R29.8: svg is NOT in v1 (scriptable, no sanitizer here); non-images never
-        assert_eq!(img_path_in(&root, "vec.svg"), None);
+        // R29.8: svg is served, as svg (IMG_TYPES says why that is safe); non-images never
+        assert_eq!(img_path_in(&root, "vec.svg"), Some(croot.join("vec.svg")));
+        assert_eq!(serve_image(&root, "vec.svg").unwrap().0, "image/svg+xml");
         assert_eq!(img_path_in(&root, "doc.md"), None);
         assert_eq!(img_path_in(&root, "pic"), None);
         // R29.4: a missing file serves nothing — same None as an escape, no leak
@@ -9440,6 +13451,7 @@ mod tests {
     /// The positive control (a genuinely SYMLINKED VAULT still serves) is in
     /// the same test on purpose: canonicalizing only one side passes one half
     /// and fails the other, which is the likely failure mode.
+    #[cfg(unix)]
     #[test]
     fn img_traversal_and_symlink_escapes_serve_no_bytes() {
         use std::os::unix::fs::symlink;
@@ -9530,9 +13542,9 @@ mod tests {
     fn media_rename_refuses_an_extension_change_or_non_media() {
         let (root, outside) = media_vault("mren-ext");
         fs::write(root.join("n.md"), b"#").unwrap();
-        fs::write(root.join("v.svg"), b"<svg/>").unwrap();
+        fs::write(root.join("v.html"), b"<html/>").unwrap();
         fs::write(root.join("pic.png"), b"png").unwrap();
-        for (a, b) in [("tone.mp3", "tone.wav"), ("tone.mp3", "tone.md"), ("tone.mp3", "tone"), ("n.md", "n.mp3"), ("n.md", "m.md"), ("pic.png", "pic.jpg"), ("v.svg", "w.svg")] {
+        for (a, b) in [("tone.mp3", "tone.wav"), ("tone.mp3", "tone.md"), ("tone.mp3", "tone"), ("n.md", "n.mp3"), ("n.md", "m.md"), ("pic.png", "pic.jpg"), ("v.html", "w.html"), ("pic.png", "pic.svg")] {
             assert!(media_rename_in(&root, a, b).is_err(), "{a} -> {b}");
         }
         assert!(root.join("tone.mp3").is_file() && root.join("n.md").is_file());
@@ -9571,6 +13583,7 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn media_rename_refuses_symlinks() {
         use std::os::unix::fs::symlink;
@@ -9635,6 +13648,7 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn media_read_refuses_non_whitelisted_types() {
         let (root, outside) = media_vault("mread-ext");
@@ -9643,7 +13657,7 @@ mod tests {
             fs::write(root.join(p), b).unwrap();
             assert!(media_read_in(&root, p, 0).is_err(), "{p} was read");
         }
-        for (e, m) in [("mp3", "audio/mpeg"), ("MP4", "video/mp4"), ("wav", "audio/wav"), ("webm", "video/webm"), ("opus", "audio/ogg")] {
+        for (e, m) in [("mp3", "audio/mpeg"), ("MP4", "video/mp4"), ("wav", "audio/wav"), ("webm", "video/webm"), ("opus", "audio/ogg"), ("3gp", "audio/3gpp")] {
             assert_eq!(media_mime(e), Some(m));
         }
         // a directory or a FIFO named like media is not a regular file (and must not hang)
@@ -9657,6 +13671,7 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[cfg(unix)]
     #[test]
     fn media_read_refuses_every_symlink_component() {
         use std::os::unix::fs::symlink;
@@ -9703,6 +13718,26 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    /// Windows: tauri.windows.conf.json is merged over tauri.conf.json on Windows only, and
+    /// the one thing it changes is the CSP. A boundary kept in two files drifts unless something
+    /// ties them: the Windows policy is the base policy with each custom scheme followed by the
+    /// origin WebView2 serves it from (http://<scheme>.localhost), and nothing else. So Linux and
+    /// macOS keep the exact string above, and Windows widens by those two origins only.
+    #[test]
+    fn windows_csp_is_the_base_csp_plus_the_two_webview2_origins() {
+        let csp = |c: &str| serde_json::from_str::<serde_json::Value>(c).unwrap()["app"]["security"]["csp"].as_str().unwrap().to_string();
+        let base = csp(include_str!("../tauri.conf.json"));
+        let win = csp(include_str!("../tauri.windows.conf.json"));
+        let want = base
+            .replace(&format!("{}: ", plugins::SCHEME), &format!("{s}: http://{s}.localhost ", s = plugins::SCHEME))
+            .replace(&format!("{IMG_SCHEME}:;"), &format!("{IMG_SCHEME}: http://{IMG_SCHEME}.localhost;"));
+        assert_eq!(want.matches(".localhost").count(), base.matches(".localhost").count() + 2, "the base CSP no longer names both schemes: {base}");
+        assert_eq!(win, want);
+        // and the Windows file overrides nothing else
+        let v: serde_json::Value = serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        assert_eq!(v, serde_json::json!({ "app": { "security": { "csp": win } } }));
+    }
+
     /// R29 + S1: the CSP is a security boundary, so it is asserted as an EXACT
     /// string. A future widening (`img-src *`, an http origin, a stray
     /// 'unsafe-inline' in script-src) then fails a test instead of shipping
@@ -9722,7 +13757,7 @@ mod tests {
             "the CSP changed — if that was deliberate, say why in the commit message"
         );
         // af-fix 1a: the config (= a restricted page) names no media-src: media is default-src 'self',
-        // and blob: appears nowhere (a trusted page gains media-src 'self' blob:, csp_by_trust)
+        // and blob: appears nowhere (csp_by_trust adds media-src 'self' blob: per page: trusted af-fix 1a, restricted #139)
         assert!(!csp.contains("media-src"), "media-src in the config CSP: {csp}");
         assert!(!csp.contains("blob:"), "blob: in the config (restricted) CSP: {csp}");
         // R29: the image widening is ONE scheme token, and it is ours
@@ -9747,8 +13782,8 @@ mod tests {
         assert!(!script.contains("unsafe-inline") && !script.contains("data:") && !script.contains('*'), "{script}");
     }
 
-    /// cp-unrestricted: restricted = the config CSP unchanged (no eval, no
-    /// blob:); trusted = eval + blob: scripts and workers, nothing else widened
+    /// cp-unrestricted: restricted = the config CSP + media-src 'self' blob: ONLY (#139 click-to-play
+    /// audio: no eval, no blob: script / worker); trusted = eval + blob: scripts and workers + blob: media
     #[test]
     fn csp_by_trust_widens_only_a_trusted_vaults_scripts_and_workers() {
         const CONF: &str = include_str!("../tauri.conf.json");
@@ -9756,14 +13791,35 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(csp_by_trust(&base, false), base);
-        // restricted (af-fix 1a): no eval, no blob: anywhere — media-src included
-        assert!(!csp_by_trust(&base, false).split_whitespace().any(|t| t == "'unsafe-eval'"));
-        assert!(!csp_by_trust(&base, false).split_whitespace().any(|t| t.starts_with("blob:")));
+        let r = csp_by_trust(&base, false);
+        // restricted (#139, operator 2026-11-16): EXACTLY the config CSP plus "; media-src 'self' blob:"
+        assert_eq!(r, format!("{base}; media-src 'self' blob:"));
+        assert_eq!(
+            r,
+            "default-src 'self'; script-src 'self' opensidian-plugin: 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data: opensidian-img:; font-src 'self'; connect-src ipc: http://ipc.localhost; media-src 'self' blob:"
+        );
+        // no 'unsafe-eval' anywhere; blob: ONLY in media-src (never script-src / worker-src / anything else)
+        assert!(!r.split_whitespace().any(|t| t == "'unsafe-eval'"), "{r}");
+        for d in r.split("; ") {
+            if !d.starts_with("media-src") {
+                assert!(!d.split_whitespace().any(|t| t.starts_with("blob:")), "blob: outside media-src in {d}");
+            }
+        }
+        assert!(!r.split("; ").any(|d| d.starts_with("worker-src")), "restricted names a worker-src: {r}");
+        let ms = |c: &str| c.split("; ").find(|d| d.starts_with("media-src")).map(str::to_owned);
+        assert_eq!(ms(&r).as_deref(), Some("media-src 'self' blob:"));
+        // every directive other than media-src is byte-identical to the config's
+        let nm = |c: &str| c.split("; ").filter(|d| !d.starts_with("media-src")).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(nm(&r), nm(&base));
+        // an existing restricted media-src gains blob: once (not duplicated); scripts / workers untouched
+        assert_eq!(
+            csp_by_trust("script-src 'self' 'sha256-abc'; worker-src 'self'; media-src 'self'", false),
+            "script-src 'self' 'sha256-abc'; worker-src 'self'; media-src 'self' blob:"
+        );
+        assert_eq!(csp_by_trust("media-src 'self' blob:", false), "media-src 'self' blob:");
         // trusted: media-src 'self' blob: (the canvas media card Blob, cvf-mediasrv) — self + blob: only,
         // no wildcard, no remote origin, no data:, no scheme
-        let ms = |c: &str| c.split("; ").find(|d| d.starts_with("media-src")).map(str::to_owned);
-        assert_eq!(ms(&csp_by_trust(&base, false)), None);
         assert_eq!(ms(&csp_by_trust(&base, true)).as_deref(), Some("media-src 'self' blob:"));
         let t = csp_by_trust(&base, true);
         assert_eq!(
@@ -9780,8 +13836,26 @@ mod tests {
         assert_eq!(w, "script-src 'self' 'sha256-abc' 'unsafe-eval' blob:; worker-src 'self' blob:; media-src 'self' blob:");
     }
 
+    /// #144 toggle 2: page fetch / XHR / WebSocket to a remote host are refused by connect-src,
+    /// whatever toggle 2 says — no trust state and no toggle-1 value ever adds a remote / ws origin
+    #[test]
+    fn connect_src_never_names_a_remote_origin() {
+        const CONF: &str = include_str!("../tauri.conf.json");
+        let base = serde_json::from_str::<serde_json::Value>(CONF).unwrap()["app"]["security"]["csp"].as_str().unwrap().to_string();
+        for trusted in [false, true] {
+            for remote in [false, true] {
+                let c = security::csp_remote(&csp_by_trust(&base, trusted), remote);
+                let cs = c.split("; ").find(|d| d.starts_with("connect-src")).expect("connect-src").to_string();
+                for tok in cs.split_whitespace().skip(1) {
+                    assert!(matches!(tok, "ipc:" | "http://ipc.localhost" | "'self'"), "connect-src gained {tok} (trusted={trusted} remote={remote}): {cs}");
+                }
+            }
+        }
+    }
+
     /// S4: picker commands refuse system trees and dot-components, keep the
     /// roots the folder picker offers
+    #[cfg(unix)]
     #[test]
     fn picker_denies_system_paths_allows_user_roots() {
         for p in ["/etc", "/proc", "/etc/ssh", "/proc/self", "/sys", "/dev", "/usr/bin", "/boot", "/root", "/var/log",
@@ -9794,6 +13868,19 @@ mod tests {
         assert_eq!(list_dirs("/etc".into()), Vec::<String>::new());
         assert_eq!(list_dirs("/proc".into()), Vec::<String>::new());
         assert!(list_dirs("/".into()).iter().any(|d| d == "tmp"));
+    }
+
+    /// Windows twin of the picker test: the system trees are the Windows ones (case-insensitive, with or
+    /// without canonicalize's `\\?\` form), the user's own folders and other drives stay browsable.
+    #[cfg(windows)]
+    #[test]
+    fn picker_denies_windows_system_paths_allows_user_roots() {
+        for p in [r"C:\Windows", r"c:\windows\system32", r"C:\Program Files\App", r"C:\Program Files (x86)", r"C:\ProgramData", r"\\?\C:\Windows\System32", r"C:\Users\u\.ssh", r"C:\Users\u\..\..\Windows", r"relative", ""] {
+            assert!(!picker_allows(Path::new(p)), "{p} must be denied");
+        }
+        for p in [r"C:\", r"D:\vaults", r"D:\Code\notes", r"\\?\D:\vault", r"C:\Users\u\Documents\notes"] {
+            assert!(picker_allows(Path::new(p)), "{p} must be allowed");
+        }
     }
 
     /// vaultarg README §1: flags skipped, first non-flag is the candidate,
@@ -9812,6 +13899,7 @@ mod tests {
 
     /// vaultarg README §3-§5: canonical dir ok (incl. spaces+unicode and `..`);
     /// missing / file / denied / empty / non-UTF-8 rejected and NOTHING created
+    #[cfg(unix)]
     #[test]
     fn vaultarg_resolve_rules() {
         let root = tmp_vault("vaultarg");
@@ -9837,6 +13925,39 @@ mod tests {
             assert_eq!(resolve_vault_arg(bad), Err("not valid UTF-8".into()));
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Windows: an argv vault (open in new window, switch) is the canonical directory in its
+    /// plain form, the form the picker records, so one vault is one recent entry; every key that
+    /// canonicalizes on its own (trust, window record) is the same for both forms
+    #[cfg(windows)]
+    #[test]
+    fn vaultarg_on_windows_is_canonical_without_the_verbatim_prefix() {
+        let root = tmp_vault("vaultarg-win");
+        let sp = root.join("my vault ünï");
+        fs::create_dir_all(&sp).unwrap();
+        let canon = fs::canonicalize(&sp).unwrap();
+        assert!(canon.to_string_lossy().starts_with(r"\\?\"), "canonicalize is verbatim here: {}", canon.display());
+        let got = resolve_vault_arg(sp.join("..").join("my vault ünï").as_os_str()).unwrap();
+        assert!(!got.to_string_lossy().starts_with(r"\\?\"), "{}", got.display());
+        assert_eq!(fs::canonicalize(&got).unwrap(), canon, "the same directory");
+        assert_eq!(winsize_key(&got), winsize_key(&canon));
+        assert_eq!(plugins::trust_key(&got).path, plugins::trust_key(&canon).path);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// the recent list as shown: a vault an older build recorded in both forms is shown once,
+    /// plain, at its newest place; other entries keep their order
+    #[test]
+    fn recent_list_shows_each_vault_once() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        #[cfg(windows)]
+        assert_eq!(
+            recent_shown(l(&[r"\\?\D:\notes", r"C:\Users\me\v", r"D:\notes", r"\\?\UNC\h\s\v"])),
+            l(&[r"D:\notes", r"C:\Users\me\v", r"\\h\s\v"])
+        );
+        assert_eq!(recent_shown(l(&["/a", "/b", "/a"])), l(&["/a", "/b"]));
+        assert_eq!(recent_shown(l(&["/a", "/b"])), l(&["/a", "/b"]), "an ordinary list is unchanged");
     }
 
     /// S5: a 33 MiB sparse note is skipped by the walk and unreadable
@@ -9885,6 +14006,7 @@ mod tests {
     /// worked and the edit was gone. A refused write must reach the caller.
     /// Read-only vault dir = a real refusal (write_atomic must create a
     /// sibling temp in it), not a deleted file, which is a different path.
+    #[cfg(unix)]
     #[test]
     fn lw_link_mention_surfaces_a_refused_write() {
         use std::os::unix::fs::PermissionsExt;
@@ -9930,6 +14052,7 @@ mod tests {
     /// sibling-temp + fsync + rename, not a truncating open. rename(2)
     /// installs a NEW inode over the name; a truncating write keeps the old
     /// one — that identity IS the window where a crash leaves a short file.
+    #[cfg(unix)]
     #[test]
     fn f3_note_write_is_sibling_temp_rename_not_a_truncating_open() {
         use std::os::unix::fs::MetadataExt;
@@ -10257,7 +14380,7 @@ mod tests {
 
     /* ---- R31 drop-to-attach (feedback #18) -----------------------------
        These hammer `attach_drop`, the ONE function the drop handler wraps.
-       The wry/GTK -> WindowEvent::DragDrop transport is NOT unit-testable (it
+       The GTK -> xdnd.rs transport is NOT unit-testable (its decision, xdnd::claim, is: it
        needs a display and a second X client); the release-mandatory gate phase
        `osdrop` drags a real file from a real XDND source with real pointer
        input. Faking a DOM drag event here would test a path production lacks. */
@@ -10299,6 +14422,105 @@ mod tests {
         let _ = fs::remove_dir_all(&srcd);
     }
 
+    /// the vault's entries (names), sorted: "the attachment folder is unchanged"
+    fn vault_names(root: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    }
+
+    /// #280: attach_files no longer takes a path. A path the page names (no drop registered
+    /// it) is refused: nothing lands in the vault and the source (an image, which a drop
+    /// would MOVE) and a PDF (which a drop would copy) both stay exactly where they were.
+    #[test]
+    fn attach_ticket_refuses_a_raw_path_and_touches_nothing() {
+        let (root, srcd) = drop_vault("tk-raw");
+        let img = src_file(&srcd, "secret.png", b"\x89PNG\r\n\x1a\nSECRET");
+        let pdf = src_file(&srcd, "secret.pdf", b"%PDF-1.4\nSECRET");
+        let before = vault_names(&root);
+        for raw in [img.to_string_lossy().to_string(), format!("file://{}", img.display()), pdf.to_string_lossy().to_string(), String::new()] {
+            let e = attach_ticket(&root, "Note", "main", &raw).unwrap_err();
+            assert!(e.contains("not a path"), "{raw:?} -> {e}");
+        }
+        assert_eq!(fs::read(&img).unwrap(), b"\x89PNG\r\n\x1a\nSECRET", "the image source must stay in place");
+        assert_eq!(fs::read(&pdf).unwrap(), b"%PDF-1.4\nSECRET", "the pdf source must stay in place");
+        assert_eq!(vault_names(&root), before, "the attachment folder (vault root) must be unchanged");
+        assert_eq!(fs::read_to_string(root.join("Note.md")).unwrap(), "# Note\n\nEND\n");
+        // an id-shaped string nobody minted is refused the same way
+        let e = attach_ticket(&root, "Note", "main", &"0".repeat(32)).unwrap_err();
+        assert!(e.contains("unknown"), "{e}");
+        assert!(img.exists() && pdf.exists());
+        assert_eq!(vault_names(&root), before);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&srcd);
+    }
+
+    /// #280: a REAL drop (what xdnd mints) still imports exactly as before — the image is
+    /// MOVED, the pdf COPIED — and the same ticket is refused on its second use
+    #[test]
+    fn a_dropped_ticket_imports_once_and_is_refused_on_reuse() {
+        let (root, srcd) = drop_vault("tk-real");
+        let img = src_file(&srcd, "cat.png", b"\x89PNG\r\n\x1a\nCAT");
+        let pdf = src_file(&srcd, "doc.pdf", b"%PDF-1.4\nDOC");
+        let o = xdnd::offer("main", &[img.clone(), pdf.clone()]).expect("urandom");
+        assert_eq!(o.names, vec!["cat.png", "doc.pdf"]);
+        let a = attach_ticket(&root, "Note", "main", &o.ticket).unwrap();
+        assert_eq!(a.text, "![[cat.png]]\n![[doc.pdf]]");
+        assert_eq!(a.copied, vec!["cat.png".to_string(), "doc.pdf".to_string()]);
+        assert!(!img.exists(), "osdrop: a dropped image is still MOVED");
+        assert_eq!(fs::read(&pdf).unwrap(), b"%PDF-1.4\nDOC", "pdfdrop: a dropped pdf is still COPIED");
+        assert_eq!(fs::read(root.join("cat.png")).unwrap(), b"\x89PNG\r\n\x1a\nCAT");
+        // reuse: refused, nothing new in the vault, the (re-seeded) source untouched
+        let img2 = src_file(&srcd, "cat.png", b"\x89PNG\r\n\x1a\nCAT2");
+        let before = vault_names(&root);
+        let e = attach_ticket(&root, "Note", "main", &o.ticket).unwrap_err();
+        assert!(e.contains("already used"), "{e}");
+        assert_eq!(vault_names(&root), before);
+        assert_eq!(fs::read(&img2).unwrap(), b"\x89PNG\r\n\x1a\nCAT2");
+        // another window cannot spend this window's drop
+        let o2 = xdnd::offer("main", std::slice::from_ref(&img2)).expect("urandom");
+        assert!(attach_ticket(&root, "Note", "other", &o2.ticket).unwrap_err().contains("another window"));
+        assert!(img2.exists());
+        assert_eq!(vault_names(&root), before);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&srcd);
+    }
+
+    /// #280: an expired ticket is refused and moves nothing (the table's own clock is
+    /// unit-tested in dropticket.rs; here the refusal is checked end to end through
+    /// attach_ticket with a ticket minted TTL ago)
+    #[test]
+    fn an_expired_ticket_is_refused_end_to_end() {
+        let (root, srcd) = drop_vault("tk-exp");
+        let img = src_file(&srcd, "old.png", b"\x89PNG\r\n\x1a\nOLD");
+        let then = std::time::Instant::now().checked_sub(dropticket::TTL + std::time::Duration::from_secs(1));
+        let Some(then) = then else { return }; // a monotonic clock younger than the TTL: nothing to test
+        let k = dropticket::mint_at_for_test("main", std::slice::from_ref(&img), then);
+        let before = vault_names(&root);
+        let e = attach_ticket(&root, "Note", "main", &k).unwrap_err();
+        assert!(e.contains("expired"), "{e}");
+        assert_eq!(fs::read(&img).unwrap(), b"\x89PNG\r\n\x1a\nOLD");
+        assert_eq!(vault_names(&root), before);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&srcd);
+    }
+
+    /// #280: the typed "Insert attachment" path asks natively first; the question names the
+    /// path and the move, and its title is the one the harness finds the dialog by
+    #[test]
+    fn the_typed_attach_question_names_the_path_and_the_move() {
+        let t = consent::attach_text("/home/u/Pictures/a.png", "Note");
+        assert!(t.contains("\"/home/u/Pictures/a.png\""), "{t}");
+        assert!(t.contains("MOVED"), "{t}");
+        assert_eq!(consent::ATTACH_TITLE, "opensidian: attach file?");
+        let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let i = src.find("async fn attach_typed(").expect("attach_typed");
+        let body = &src[i..i + src[i..].find("\n}\n").unwrap()];
+        let ask = body.find("consent::ask(").expect("attach_typed must ask natively");
+        let att = body.find("attach_drop(").expect("attach_typed attaches");
+        assert!(ask < att, "the question comes BEFORE the attach");
+    }
+
     /// R31.4 + S5: three drops of the SAME name give `cat.png`, `cat 1.png`,
     /// `cat 2.png` (Obsidian's convention, verified against 1.13.7), and the
     /// earlier files are BYTE-IDENTICAL afterwards. A drop that overwrites a
@@ -10326,6 +14548,7 @@ mod tests {
     /// S1: a file manager can hand us anything. A symlink is REFUSED, not
     /// followed (following it is how a drop reads /etc/shadow into the vault),
     /// and so is a directory, a fifo and a path that is simply gone.
+    #[cfg(unix)]
     #[test]
     fn drop_refuses_symlink_dir_fifo_and_missing_sources() {
         use std::os::unix::fs::symlink;
@@ -10369,11 +14592,12 @@ mod tests {
     /// never content-sniffed. svg included: Obsidian renders it after sanitizing,
     /// we have no sanitizer (R29.8). pdfdrop: .pdf IS attachable now, but only
     /// when the bytes start with %PDF- — this png-bodied doc.pdf is a mismatch.
+    #[cfg(unix)]
     #[test]
     fn drop_refuses_everything_outside_img_types() {
         let (root, srcd) = drop_vault("drop-ext");
         let mut paths = Vec::new();
-        for n in ["doc.pdf", "arch.zip", "vec.svg", "pic.bmp", "note.md", "noext", "script.png.sh"] {
+        for n in ["doc.pdf", "arch.zip", "page.html", "pic.bmp", "note.md", "noext", "script.png.sh"] {
             paths.push(src_file(&srcd, n, b"\x89PNGdisguised-as-an-image"));
         }
         let a = attach_drop(&root, "Note", &paths).unwrap();
@@ -10466,6 +14690,7 @@ mod tests {
     /// Threat: vault/attachments -> /home/user, and every drop writes there.
     /// The positive control (a real subfolder works, and the link is still the
     /// BASENAME, which resolves by suffix) is in the same test on purpose.
+    #[cfg(unix)]
     #[test]
     fn drop_refuses_a_destination_that_leaves_the_vault() {
         use std::os::unix::fs::symlink;
@@ -10518,6 +14743,7 @@ mod tests {
         v.sort();
         v
     }
+    #[cfg(unix)]
     fn dev_of(p: &Path) -> u64 {
         use std::os::unix::fs::MetadataExt;
         fs::metadata(p).unwrap().dev()
@@ -10532,6 +14758,7 @@ mod tests {
 
     /// the two roads, each proven by WHICH road it took, not just by the result
     #[test]
+    #[cfg(target_os = "linux")] // the second filesystem is /dev/shm (tmpfs)
     fn osdrop_import_moves_by_link_on_one_fs_and_by_verified_copy_across() {
         let (root, srcd) = drop_vault("osd-roads");
         assert_eq!(dev_of(&root), dev_of(&srcd), "fixture: vault and source dir must share a filesystem");
@@ -10558,6 +14785,7 @@ mod tests {
 
     /// THE crash-safety criterion: a fault before the final rename, on both roads
     #[test]
+    #[cfg(target_os = "linux")] // the second filesystem is /dev/shm (tmpfs)
     fn osdrop_injected_failure_before_commit_leaves_source_intact_and_no_partial_file() {
         let shm = shm_src("osd-crash");
         // (road, fault point, source dir is another fs?, force the copy road on one fs?)
@@ -10624,6 +14852,7 @@ mod tests {
     /// a refused type is never touched, and a collision on the cross-fs road
     /// gets a new name without overwriting
     #[test]
+    #[cfg(target_os = "linux")] // the second filesystem is /dev/shm (tmpfs)
     fn osdrop_refused_untouched_and_crossfs_collision_renames() {
         let (root, _srcd) = drop_vault("osd-ref");
         let shm = shm_src("osd-ref");
@@ -10650,6 +14879,7 @@ mod tests {
     /// same type; collisions take `stem N.pdf` (stock: `recon-a 1.pdf`) and never
     /// overwrite.
     #[test]
+    #[cfg(target_os = "linux")] // the second filesystem is /dev/shm (tmpfs)
     fn pdfdrop_copies_a_pdf_on_both_filesystems_and_indexes_it() {
         let (root, srcd) = drop_vault("pdfd-ok");
         let body = pdf::tests::mini_pdf(2);
@@ -10700,6 +14930,7 @@ mod tests {
     /// vault gains nothing (no temp either). A file shorter than the magic is a
     /// mismatch, not a read error.
     #[test]
+    #[cfg(target_os = "linux")] // the second filesystem is /dev/shm (tmpfs)
     fn pdfdrop_refuses_a_pdf_whose_bytes_are_not_pdf() {
         let (root, srcd) = drop_vault("pdfd-magic");
         let shm = shm_src("pdfd-magic");
@@ -10798,6 +15029,26 @@ mod tests {
         assert_eq!(pdf_frag("page=9999999"), (1, None));
     }
 
+    /// #116: `![[x.webm]]` / `![](x.mp3)` -> ONE empty audio-embed span (the target escaped, never a
+    /// minted path: ui/editor.js resolves it against the media list); anchors, plain links, remote
+    /// URLs and non-audio extensions stay what they were.
+    #[test]
+    fn audio_embeds_render_one_empty_span_both_syntaxes() {
+        let imgs: Vec<String> = ["pic.png"].iter().map(|s| s.to_string()).collect();
+        let r = |md: &str| render_with(md, &[], &imgs, true);
+        let span = |t: &str, alt: &str| format!(
+            "<span class=\"internal-embed media-embed audio-embed\" data-target=\"{t}\" data-alt=\"{alt}\"></span>");
+        assert!(r("![[Recording 20261115074400.webm]]").contains(&span("Recording 20261115074400.webm", "Recording 20261115074400.webm")), "{}", r("![[Recording 20261115074400.webm]]"));
+        assert!(r("![[sub/a.MP3|my alias]]").contains(&span("sub/a.MP3", "my alias")));
+        assert!(r("![](a.ogg)").contains(&span("a.ogg", "")));
+        assert_eq!(audio_html("\"><img src=x>.flac", "a&b"), span("&quot;&gt;&lt;img src=x&gt;.flac", "a&amp;b"));
+        for md in ["[[a.webm]]", "![[a.webm#t=3]]", "![](https://x.test/a.mp3)", "![[a.mp4]]", "![[.webm]]"] {
+            assert!(!r(md).contains("audio-embed"), "{md}: {}", r(md));
+        }
+        assert!(r("![[pic.png]]").contains("<img class=\"vimg\""));
+        assert!(is_audio_target("x.WAV") && is_audio_target("r.3gp") && !is_audio_target("x.webm.md"));
+    }
+
     #[test]
     fn drop_handles_multi_file_empty_and_noteless_drops() {
         let (root, srcd) = drop_vault("drop-multi");
@@ -10852,36 +15103,42 @@ mod tests {
         assert_eq!(ix.images(), ["abe.png", "zed.png"], "sorted, deduped");
         assert_eq!(ix.images(), Index::build(&root).images(), "== a fresh walk");
         // and the resolver the renderers use finds it
-        assert!(image_html(ix.images(), "zed.png", "").contains("opensidian-img://localhost/zed.png"));
+        assert!(image_html(ix.images(), "zed.png", "").contains(&custom_scheme_url(IMG_SCHEME, "zed.png")));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&srcd);
     }
 
     /// R31.1 THE WIRING IS A STRING, and a string drifts. Rust emits
-    /// DROP_EVENT from the WindowEvent::DragDrop handler; ui/main.js listens
-    /// for that exact name and calls `attach_files`. Rename either end and the
-    /// feature dies in total silence — the build is still green, the tests are
+    /// DROP_EVENT from the window's drop transport (xdnd.rs since #51); ui/main.js
+    /// listens for that exact name and calls `attach_files`. Rename either end and
+    /// the feature dies in total silence — the build is still green, the tests are
     /// still green, and a drop simply does nothing. Nothing else in this repo
     /// would notice, because ui/ is not a cargo input (docs/features.md trap).
     ///
-    /// It also pins the handler as a PASS-THROUGH, which is the structural
+    /// It also pins the transport as a PASS-THROUGH, which is the structural
     /// claim the whole design rests on: the unit tests reach the behaviour
-    /// (`attach_drop`) directly, and the transport is the gate phase osdrop's,
-    /// so a handler with behaviour would be behaviour no unit test reaches.
-    /// A handler that grows a body fails this test at 9 lines.
+    /// (`attach_drop`, `xdnd::claim`) directly, and the transport is the gate
+    /// phases' (osdrop, droplink), so no file I/O or policy may live in it.
+    /// And #51: Tauri's own handler must stay OFF (it swallowed every link drag),
+    /// so WindowEvent::DragDrop is not handled at all any more.
     #[test]
     fn the_drop_handler_is_a_pass_through_and_the_ui_listens_for_the_same_name() {
         let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let xd = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/xdnd.rs")).unwrap();
         let ui = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../ui/main.js")).unwrap();
         let lines: Vec<&str> = src.lines().collect();
-        let i = lines.iter().position(|l| l.contains(".on_window_event(")).expect("no OS drop is wired at all");
+        let i = lines.iter().position(|l| l.contains("fn page_window(")).expect("no app window builder");
+        let j = i + lines[i..].iter().position(|l| l == &"}").expect("unterminated page_window");
+        let pw = &lines[i..=j];
+        assert!(pw.iter().any(|l| l.contains(".disable_drag_drop_handler()")), "#51: Tauri's drop handler must be off for the app window");
+        assert!(pw.iter().any(|l| l.contains("xdnd::attach(&w)")), "the app window must get the xdnd transport");
+        let i = lines.iter().position(|l| l.contains(".on_window_event(")).expect("no window event handler");
         let j = i + lines[i..].iter().position(|l| l.trim() == "})").expect("unterminated handler");
-        let body = &lines[i..=j];
-        assert!(body.len() <= 8, "the drop handler is {} lines: it is meant to be a pass-through", body.len());
-        assert!(body.iter().any(|l| l.contains("WindowEvent::DragDrop")), "the handler must be the REAL OS drop event");
-        assert!(body.iter().any(|l| l.contains("emit(DROP_EVENT")), "the handler must forward under the shared name");
-        for forbidden in ["fs::", "copy", "canonicalize", "if !", "unwrap()"] {
-            assert!(!body.iter().any(|l| l.contains(forbidden)), "policy or I/O ({forbidden}) leaked into the drop handler");
+        assert!(!lines[i..=j].iter().any(|l| l.contains("DragDrop")), "#51: a WindowEvent::DragDrop handler is dead code (Tauri's handler is off)");
+        let code: Vec<&str> = xd.split("#[cfg(test)]").next().unwrap().lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        assert!(code.iter().any(|l| l.contains("emit(crate::DROP_EVENT")), "the transport must forward under the shared name");
+        for forbidden in ["fs::", "File::", "copy(", "canonicalize", "invoke"] {
+            assert!(!code.iter().any(|l| l.contains(forbidden)), "policy or I/O ({forbidden}) leaked into the drop transport");
         }
         assert_eq!(DROP_EVENT, "drop-files");
         assert!(ui.contains(&format!("listen(\"{DROP_EVENT}\"")), "ui/main.js must listen for the name Rust emits");
@@ -10920,6 +15177,17 @@ mod tests {
         assert_eq!(y + h, 750.0, "the south edge never moved");
         let c = gesture_rect("se", r, -5000.0, -5000.0).unwrap();
         assert_eq!(c, (100.0, 50.0, WIN_MIN_W, WIN_MIN_H), "an SE clamp leaves the origin alone");
+    }
+
+    /// macOS and Windows hand EVERY press to the system (Snap, Snap Layouts, drag-to-top
+    /// maximise on Windows), whatever the Linux probe's defaults would pick there;
+    /// Linux keeps exactly the measured path.
+    #[test]
+    fn macos_and_windows_hand_every_drag_to_the_system() {
+        for measured in ["none", "wm", "wayland"] {
+            let want = if cfg!(any(target_os = "macos", windows)) { "wm" } else { measured };
+            assert_eq!(drag_path_here(measured), want, "measured {measured}");
+        }
     }
 
     /// R33.6b THE PATH CHOICE, as a pure function so it is testable without a
@@ -11200,6 +15468,81 @@ fn psg_probe() -> bool {
     std::env::var("OPENSIDIAN_PSGPROBE").as_deref() == Ok("1")
 }
 
+/// #293 (audit F-7): no bind without the fail-closed decision — SOURCE SHAPE, since the
+/// refusal itself (a kernel that cannot enforce) is not reachable from a unit test
+#[cfg(test)]
+mod ll293_tests {
+    /// main.rs without its #[cfg(test)] modules: what ships
+    fn prod_src() -> String {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")).unwrap();
+        let mut out = String::new();
+        let mut rest = src.as_str();
+        while let Some(i) = rest.find("#[cfg(test)]\nmod ") {
+            let eol = i + rest[i + 13..].find('\n').expect("line end") + 13;
+            if !rest[i..eol].ends_with('{') {
+                // `mod x;` — a file module, nothing inline to cut
+                out.push_str(&rest[..eol]);
+                rest = &rest[eol..];
+                continue;
+            }
+            out.push_str(&rest[..i]);
+            let end = rest[i..].find("\n}\n").expect("test module end");
+            rest = &rest[i + end + 3..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let i = src.find(sig).unwrap_or_else(|| panic!("{sig}"));
+        &src[i..i + src[i..].find("\n}\n").expect("end")]
+    }
+
+    const DECIDE: &str = "sandbox::boot_may_bind(sandbox::landlock_enabled(), sandbox::outcome())";
+
+    #[test]
+    fn ll293_main_consults_the_decision_between_enforce_and_the_boot_bind() {
+        let src = prod_src();
+        let m = body(&src, "\nfn main() {");
+        let enforce = m.find("sandbox::record(sandbox::enforce(p))").expect("enforce's answer is recorded");
+        let decide = m.find(DECIDE).expect("main consults boot_may_bind");
+        let refuse = m.find("sandbox::refuse_and_exit(&why, p)").expect("a refusal exits");
+        let bind = m.find("bind_vault_boot_after(&vault, p, &vaultlock::env_lock_dir(), restart)").expect("boot bind");
+        assert!(enforce < decide && decide < refuse && refuse < bind, "enforce -> decide -> refuse -> bind");
+        assert_eq!(m.matches("bind_vault_boot_after(").count(), 1, "one boot bind");
+        assert_eq!(m.matches("sandbox::enforce(").count(), 1, "one enforce, its answer recorded");
+    }
+
+    #[test]
+    fn ll293_every_bind_goes_through_claim_vault_which_decides_first() {
+        let src = prod_src();
+        let c = body(&src, "\nfn claim_vault(");
+        let decide = c.find(DECIDE).expect("claim_vault consults boot_may_bind");
+        for later in ["vaultlock::acquire_in(", "v.root.set(", "builtins::seed_and_record(", "ensure_app_json("] {
+            assert!(decide < c.find(later).unwrap_or_else(|| panic!("{later}")), "{later} before the sandbox decision");
+        }
+        let first = c.lines().skip(2).map(str::trim).find(|t| !t.is_empty() && !t.starts_with("//")).expect("a statement");
+        assert!(first.starts_with("if let sandbox::BootBind::Refuse(why) = sandbox::boot_may_bind("), "the decision is the first statement: {first}");
+        // the root is assigned in claim_vault only, and claim_vault is called by the two binders only
+        assert_eq!(src.matches(".root.set(").count(), 1, "one place assigns a vault root");
+        assert_eq!(src.matches("claim_vault(").count(), 3, "definition + bind_vault_locked + bind_vault_boot");
+        assert!(body(&src, "\nfn bind_vault_locked(").contains("claim_vault(v, p, lock_dir)?;"));
+        assert!(body(&src, "\nfn bind_vault_boot(").contains("claim_vault(v, p, lock_dir)?;"));
+        // and nothing else in main.rs consults or skips it
+        assert_eq!(src.matches("boot_may_bind(").count(), 2, "main() and claim_vault");
+        for f in ["sandbox.rs", "spawn.rs", "spawner.rs", "security.rs"] {
+            let s = std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            assert!(!s.contains(".root.set("), "{f} assigns a vault root");
+        }
+    }
+
+    #[test]
+    fn ll293_security_get_reports_the_sandbox_state() {
+        let src = prod_src();
+        assert!(body(&src, "\nfn security_get(").contains("r[\"sandbox\"] = sandbox::state_json();"));
+    }
+}
+
 /* vaultbleed (operator 2026-10-03, SEVERE): "i see tags from another vault in
    my sidebar that has been opened before". These tests land a vault switch at
    the exact instant a root+index critical path is between "I read the root"
@@ -11222,7 +15565,7 @@ mod vaultbleed_tests {
         root
     }
     fn vault_at(p: &Path) -> Arc<Vault> {
-        let v = Arc::new(Vault { root: OnceLock::new(), index: Mutex::new(Index::default()), lock: OnceLock::new(), seed: Mutex::new(None) });
+        let v = Arc::new(Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) });
         bind_vault(&v, p).unwrap();
         v
     }
@@ -11280,6 +15623,7 @@ mod vaultbleed_tests {
 
     /* census C4: a fresh vault gets `.obsidian/app.json` = `{}`; an existing
        one (or a symlink in its place) is never rewritten or followed. */
+    #[cfg(unix)]
     #[test]
     fn vault_init_creates_app_json_only_when_absent() {
         let a = mk("appjson-fresh", &[("n", "x\n")]);
@@ -11307,9 +15651,9 @@ mod vaultbleed_tests {
         // an index; a second spelling of the path keys the same lock.
         let a = mk("dup-a", &[("onlyA-note", "seed #onlyA\n")]);
         let locks = std::env::temp_dir().join(format!("opensidian-vb-locks-{}", std::process::id()));
-        let v1 = Vault { root: OnceLock::new(), index: Mutex::new(Index::default()), lock: OnceLock::new(), seed: Mutex::new(None) };
+        let v1 = Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) };
         bind_vault_locked(&v1, &a, &locks).expect("first backend binds");
-        let v2 = Vault { root: OnceLock::new(), index: Mutex::new(Index::default()), lock: OnceLock::new(), seed: Mutex::new(None) };
+        let v2 = Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) };
         let alias = a.join("..").join(a.file_name().unwrap());
         match bind_vault_locked(&v2, &alias, &locks) {
             Err(BindErr::Lock(vaultlock::LockErr::Busy(_))) => {}
@@ -11337,6 +15681,54 @@ mod vaultbleed_tests {
             }
         }
         assert!(cur_vault(&v2).is_some(), "the second backend owns the vault once the first is gone");
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&locks));
+    }
+
+    #[test]
+    fn boot_bind_builds_the_index_off_the_main_thread_with_the_same_answers() {
+        // issue #106: bind_vault_boot hands the walk + index to a worker that
+        // holds the index and seed locks before the bind returns, so a reader
+        // right after it blocks until the build is in — never an empty or
+        // partial index — and gets exactly what the synchronous bind builds.
+        // 600 notes: above read_parse_all's 256-note threshold (parallel path).
+        let files: Vec<(String, String)> = (0..600)
+            .map(|i| (format!("n{i:03}"), format!("# n{i:03}\nsee [[n{:03}]] #t{}\n", (i + 1) % 600, i % 7)))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let a = mk("boot-a", &refs);
+        let locks = std::env::temp_dir().join(format!("opensidian-vb-bootlocks-{}", std::process::id()));
+        let sync = Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) };
+        bind_vault_locked(&sync, &a, &locks).expect("sync bind");
+        let want_notes = cur_notes(&sync);
+        let want_bl = sync.index.lock().unwrap().backlinks("n005");
+        let want_seed = sync.seed.lock().unwrap().clone().expect("sync seed");
+        drop(sync); // free the vault's flock for the boot bind
+        let boot = Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) };
+        let t0 = std::time::Instant::now();
+        loop {
+            match bind_vault_boot(&boot, &a, &locks) {
+                Err(BindErr::Lock(vaultlock::LockErr::Busy(_))) if t0.elapsed().as_secs() < 3 => {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                r => {
+                    r.expect("boot bind");
+                    break;
+                }
+            }
+        }
+        assert_eq!(cur_vault(&boot).as_deref(), Some(a.as_path()), "the root is claimed synchronously");
+        assert_eq!(want_notes.len(), 600);
+        assert_eq!(cur_notes(&boot), want_notes, "the first reader sees the whole index");
+        assert_eq!(boot.index.lock().unwrap().backlinks("n005"), want_bl);
+        assert_eq!(boot.seed.lock().unwrap().clone().expect("boot seed"), want_seed, "the watcher baseline is set too");
+        // the claim stays synchronous: a second backend is still refused at bind time
+        let other = Vault { root: OnceLock::new(), index: Arc::new(Mutex::new(Index::default())), lock: OnceLock::new(), seed: Arc::new(Mutex::new(None)) };
+        match bind_vault_boot(&other, &a, &locks) {
+            Err(BindErr::Lock(vaultlock::LockErr::Busy(_))) => {}
+            r => panic!("second boot bind on an open vault must be Busy, got {r:?}"),
+        }
+        assert!(cur_vault(&other).is_none());
+        drop(boot);
         let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&locks));
     }
 
@@ -11475,5 +15867,654 @@ mod devui_guard {
     #[test]
     fn devui_guard_default_build_has_no_devui() {
         assert!(!cfg!(feature = "devui"));
+    }
+}
+
+/// #59 slice 1: Obsidian callouts in the reading render. Only `render_md` /
+/// `render_with` / `block_lines_of` are used, so this module compiles on a tree
+/// WITHOUT callouts too and fails there by assertion (RESULT.md: red on develop,
+/// green on feat/59-callouts).
+#[cfg(test)]
+mod callout_render_tests {
+    use super::*;
+
+    fn has(h: &str, s: &str) {
+        assert!(h.contains(s), "missing {s:?} in: {h}");
+    }
+    fn hasnt(h: &str, s: &str) {
+        assert!(!h.contains(s), "unexpected {s:?} in: {h}");
+    }
+
+    #[test]
+    fn callout_basic_dom_matches_obsidian() {
+        let h = render_md("> [!note] A note callout\n> Callouts render as styled boxes.\n", &[]);
+        has(&h, "data-callout=\"note\"");
+        has(&h, "data-callout-fold=\"\"");
+        has(&h, "class=\"callout\"");
+        has(&h, "<div class=\"callout-title\" dir=\"auto\"><div class=\"callout-icon\"><svg");
+        has(&h, "lucide-pencil");
+        has(&h, "<div class=\"callout-title-inner\">A note callout</div></div>");
+        has(&h, "<div class=\"callout-content\"><p>Callouts render as styled boxes.</p>");
+        hasnt(&h, "<blockquote");
+        hasnt(&h, "[!note]");
+    }
+
+    #[test]
+    fn callout_types_aliases_and_case() {
+        // (written type, data-callout, default title, icon) — Obsidian's built-in set
+        let cases = [
+            ("note", "note", "Note", "pencil"),
+            ("abstract", "abstract", "Abstract", "clipboard-list"),
+            ("summary", "summary", "Summary", "clipboard-list"),
+            ("TLDR", "tldr", "Tldr", "clipboard-list"),
+            ("info", "info", "Info", "info"),
+            ("todo", "todo", "Todo", "check-circle-2"),
+            ("tip", "tip", "Tip", "flame"),
+            ("hint", "hint", "Hint", "flame"),
+            ("important", "important", "Important", "flame"),
+            ("success", "success", "Success", "check"),
+            ("check", "check", "Check", "check"),
+            ("done", "done", "Done", "check"),
+            ("question", "question", "Question", "help-circle"),
+            ("help", "help", "Help", "help-circle"),
+            ("FAQ", "faq", "Faq", "help-circle"),
+            ("Warning", "warning", "Warning", "alert-triangle"),
+            ("caution", "caution", "Caution", "alert-triangle"),
+            ("attention", "attention", "Attention", "alert-triangle"),
+            ("failure", "failure", "Failure", "x"),
+            ("fail", "fail", "Fail", "x"),
+            ("missing", "missing", "Missing", "x"),
+            ("danger", "danger", "Danger", "zap"),
+            ("ERROR", "error", "Error", "zap"),
+            ("bug", "bug", "Bug", "bug"),
+            ("example", "example", "Example", "list"),
+            ("quote", "quote", "Quote", "quote"),
+            ("cite", "cite", "Cite", "quote"),
+        ];
+        for (w, dc, title, icon) in cases {
+            let h = render_md(&format!("> [!{w}]\n> body\n"), &[]);
+            has(&h, &format!("data-callout=\"{dc}\""));
+            has(&h, &format!("<div class=\"callout-title-inner\">{title}</div>"));
+            has(&h, &format!("lucide-{icon}\""));
+            hasnt(&h, "markdown-alert"); // not pulldown's GFM alert
+        }
+    }
+
+    #[test]
+    fn callout_bare_gfm_types_are_callouts_not_alerts() {
+        // with ENABLE_GFM pulldown ate a bare `> [!NOTE]` into blockquote.markdown-alert-note
+        for t in ["NOTE", "tip", "Important", "warning", "CAUTION"] {
+            let h = render_md(&format!("> [!{t}]\n> text\n"), &[]);
+            has(&h, &format!("data-callout=\"{}\"", t.to_lowercase()));
+            hasnt(&h, "markdown-alert");
+            hasnt(&h, "<blockquote");
+        }
+    }
+
+    #[test]
+    fn callout_fold_markers() {
+        let h = render_md("> [!faq]- Are callouts foldable?\n> Yes.\n", &[]);
+        has(&h, "data-callout-fold=\"-\"");
+        has(&h, "class=\"callout is-collapsible is-collapsed\"");
+        has(&h, "<div class=\"callout-title-inner\">Are callouts foldable?</div><div class=\"callout-fold is-collapsed\"><svg");
+        has(&h, "lucide-chevron-down");
+        let h = render_md("> [!tip]+ Open by default\n> body\n", &[]);
+        has(&h, "data-callout-fold=\"+\"");
+        has(&h, "class=\"callout is-collapsible\"");
+        has(&h, "<div class=\"callout-fold\"><svg");
+        hasnt(&h, "is-collapsed");
+        let h = render_md("> [!tip] plain\n> body\n", &[]);
+        hasnt(&h, "callout-fold\"");
+        hasnt(&h, "is-collapsible");
+    }
+
+    #[test]
+    fn callout_nested() {
+        let h = render_md("> [!note] Outer\n> outer body\n> > [!warning] Inner\n> > inner body\n", &[]);
+        assert_eq!(h.matches("class=\"callout\"").count(), 2, "{h}");
+        let outer = h.find("data-callout=\"note\"").expect("outer");
+        let content = h.find("callout-content").expect("outer content");
+        let inner = h.find("data-callout=\"warning\"").expect("inner");
+        assert!(outer < content && content < inner, "inner callout must sit in the outer's content: {h}");
+        has(&h, "<div class=\"callout-title-inner\">Inner</div>");
+        has(&h, "<p>inner body</p>");
+        hasnt(&h, "<blockquote");
+        // a plain quote inside a callout stays a blockquote
+        let h = render_md("> [!info]\n> > just a quote\n", &[]);
+        has(&h, "data-callout=\"info\"");
+        has(&h, "<blockquote>");
+    }
+
+    #[test]
+    fn callout_custom_type_keeps_its_name() {
+        let h = render_md("> [!my-Custom] Hello\n> x\n", &[]);
+        has(&h, "data-callout=\"my-custom\"");
+        has(&h, "lucide-pencil"); // unknown -> note's icon (and note's colour via CSS)
+        has(&h, "<div class=\"callout-title-inner\">Hello</div>");
+        let h = render_md("> [!kanban|wide] T\n> x\n", &[]);
+        has(&h, "data-callout=\"kanban\"");
+        has(&h, "data-callout-metadata=\"wide\"");
+    }
+
+    #[test]
+    fn callout_title_only_and_inline_markdown() {
+        let h = render_md("> [!info] Only a title\n", &[]);
+        has(&h, "<div class=\"callout-title-inner\">Only a title</div>");
+        hasnt(&h, "callout-content");
+        let h = render_md("> [!tip] **Bold** and [[Plan]]\n> body\n", &["Plan".to_string()]);
+        has(&h, "<strong>Bold</strong>");
+        has(&h, "data-note=\"Plan\"");
+        let title = &h[h.find("callout-title-inner").unwrap()..h.find("callout-content").unwrap()];
+        assert!(title.contains("Bold") && !title.contains("body"), "title is the first line only: {title}");
+    }
+
+    #[test]
+    fn callout_xss_title_body_type_and_meta_stay_inert() {
+        let h = render_md("> [!note] <img src=x onerror=alert(1)>\n> <script>alert(2)</script>\n", &[]);
+        has(&h, "data-callout=\"note\"");
+        hasnt(&h, "<img");
+        hasnt(&h, "<script");
+        has(&h, "&lt;img src=x onerror=alert(1)&gt;");
+        // a hostile type / metadata can only ever land in an escaped attribute value
+        let h = render_md("> [!x\"onmouseover=\"alert(1)|<b>m</b>] t\n> b\n", &[]);
+        hasnt(&h, "\"onmouseover=\"");
+        hasnt(&h, "<b>");
+        has(&h, "data-callout=\"x&quot;onmouseover=&quot;alert(1)\"");
+        // javascript: links in a title stay text (S1 unchanged inside callouts)
+        let h = render_md("> [!note] [x](javascript:alert(1))\n", &[]);
+        hasnt(&h, "href=\"javascript");
+    }
+
+    #[test]
+    fn callout_not_a_callout() {
+        for src in ["> plain quote\n", "> \\[!note] escaped\n", "> [!note]x glued\n", "> [!] empty\n", "> [! note] spaced\n", "[!note] not quoted\n"] {
+            let h = render_md(src, &[]);
+            hasnt(&h, "class=\"callout");
+        }
+        has(&render_md("> plain quote\n", &[]), "<blockquote>");
+    }
+
+    #[test]
+    fn callout_is_one_top_level_block_and_keeps_task_lines() {
+        let md = "> [!todo] Tasks\n> - [ ] one\n> - [x] two\n\npara\n";
+        assert_eq!(block_lines_of(md), vec![1, 5]);
+        let h = render_with(md, &[], &[], true);
+        assert!(h.starts_with("<div data-callout-metadata=\"\" data-callout-fold=\"\" data-callout=\"todo\""), "{h}");
+        // reading-view task boxes inside a callout still carry their FILE line (rvtask)
+        has(&h, "data-line=\"1\"");
+        has(&h, "data-line=\"2\"");
+    }
+
+    /// #348: `==x==` renders as a bare <mark> in the reading view (stock DOM), with the
+    /// live-preview scanner's rules (ui/editor.js): opener before a non-space, closer the
+    /// first later `==` after a non-space, never empty; pairs nest well-formed.
+    #[test]
+    fn i348_reading_highlight_is_mark() {
+        let r = |s: &str| render_with(s, &[], &[], true);
+        assert_eq!(r("==hi=="), "<p><mark>hi</mark></p>\n");
+        assert_eq!(r("a ==b c== d"), "<p>a <mark>b c</mark> d</p>\n");
+        assert_eq!(r("==a== and ==b=="), "<p><mark>a</mark> and <mark>b</mark></p>\n");
+        // inline markup inside the highlight
+        assert_eq!(r("==a **b** c=="), "<p><mark>a <strong>b</strong> c</mark></p>\n");
+        assert_eq!(r("**==b==**"), "<p><strong><mark>b</mark></strong></p>\n");
+        assert!(r("==a `c` d==").contains("<mark>a <code>c</code> d</mark>"));
+        // headings, list items, table cells
+        assert!(r("# ==h==").contains("<mark>h</mark></h1>"));
+        assert!(r("- ==li==").contains("<li><mark>li</mark></li>"));
+        assert!(r("| a |\n|---|\n| ==c== |").contains("<mark>c</mark>"));
+        // a tag / an external link inside the highlight stay whole
+        let t = r("==x #tag==");
+        assert!(t.contains("<mark>x <a href=\"#\" class=\"tag\" data-tag=\"tag\">#tag</a></mark>"), "{t}");
+        let l = r("==[x](https://e.com)==");
+        assert!(l.starts_with("<p><mark><a href=\"https://e.com\"") && l.contains("x</a></mark>"), "{l}");
+        // `===a===`: same as live preview (first `==` opens, content "=a")
+        assert_eq!(r("===a==="), "<p><mark>=a</mark>=</p>\n");
+        // H1 still holds inside a highlight: raw html is escaped text
+        let h = r("==<b>x</b>==");
+        assert!(h.contains("<mark>&lt;b&gt;x&lt;/b&gt;</mark>") && !h.contains("<b>"), "{h}");
+    }
+
+    #[test]
+    fn i348_negative_no_mark_in_code_or_unmatched() {
+        let r = |s: &str| render_with(s, &[], &[], true);
+        for s in [
+            "`==c==`",                // code span
+            "```\n==x==\n```",        // fenced code block
+            "    ==x==",              // indented code block
+            "---\nk: ==v==\n---\nbody", // frontmatter
+            "a == b",                 // lone ==
+            "==a",                    // unclosed
+            "a==",                    // closer only
+            "== a ==",                // space after opener
+            "==a ==",                 // space before closer
+            "====",                   // empty
+            "==a\n\nb==",             // across paragraphs
+            "**==a** b==",            // would cross the strong
+            "[[n==m]]",               // inside a wikilink target/label
+            "> [!note] ==a\n> b==",   // callout title -> body seam
+        ] {
+            let h = r(s);
+            assert!(!h.contains("<mark>"), "`{s}` must not highlight: {h}");
+        }
+        assert!(r("`==c==`").contains("<code>==c==</code>"));
+        assert!(r("```\n==x==\n```").contains("==x=="));
+        assert!(r("a == b").contains("a == b"));
+        assert!(r("====").contains("===="));
+    }
+}
+
+/* #250: every READ of a vault path is fd-based and never follows a symlink
+   (vaultfs::Vault::open_read / read). These tests plant, per call-site class,
+   the hostile leaves the audit names (F-3 F-9 F-10 F-27 F-46 F-47): a symlink
+   to a file outside the temp vault, a symlink to /dev/zero, a FIFO, a regular
+   file one byte over the cap, a symlinked directory component, and a leaf
+   swapped for a symlink between the check and the read (the vaultfs hook
+   seam "open_read:checked"). Each reader must return its default / refuse,
+   within a time bound, and still read a normal file. */
+#[cfg(all(test, unix))] // symlinks to /dev/zero, FIFOs
+mod read250_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    const SECRET: &str = "LEAKED-SECRET-250";
+
+    fn vault(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("opensidian-r250-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (root, out) = (base.join("vault"), base.join("outside"));
+        fs::create_dir_all(root.join(".obsidian/snippets")).unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        (root, out)
+    }
+
+    fn fifo(p: &Path) {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo {}", p.display());
+    }
+
+    /// `f` on a worker, Err unless it returns within 5 s (a read that followed
+    /// a FIFO blocks, one that followed /dev/zero runs until OOM)
+    fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_else(|_| panic!("{what}: did not return within 5 s"))
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Plant {
+        Outside,
+        DevZero,
+        Fifo,
+        OverCap,
+        DirLink,
+    }
+    const PLANTS: [Plant; 5] = [Plant::Outside, Plant::DevZero, Plant::Fifo, Plant::OverCap, Plant::DirLink];
+
+    /// the .obsidian files the config readers read, each with a body that
+    /// would change the reader's answer (and carries SECRET) if it were read
+    fn cfg_files() -> Vec<(&'static str, String)> {
+        vec![
+            ("app.json", format!(r#"{{"attachmentFolderPath":"{SECRET}","useMarkdownLinks":true,"readableLineLength":false,"strictLineBreaks":true,"propertiesInDocument":"hidden"}}"#)),
+            ("graph.json", format!(r#"{{"search":"{SECRET}","auths":{{"token":"{SECRET}"}}}}"#)),
+            ("templates.json", format!(r#"{{"dateFormat":"{SECRET}"}}"#)),
+            ("bookmarks.json", format!(r#"{{"items":[{{"type":"file","ctime":1,"path":"{SECRET}.md"}}]}}"#)),
+            ("types.json", format!(r#"{{"types":{{"{SECRET}":"text"}}}}"#)),
+            ("appearance.json", format!(r#"{{"cssTheme":"{SECRET}"}}"#)),
+            ("workspace.json", format!(r#"{{"main":{{"id":"{SECRET}"}}}}"#)),
+            ("canvas.json", format!(r#"{{"snapToGrid":false,"x":"{SECRET}"}}"#)),
+            ("community-plugins.json", r#"["leakedplugin"]"#.to_string()),
+        ]
+    }
+
+    /// plant `how` at every cfg file of `root` (the outside copies live in `out`)
+    fn plant_cfg(root: &Path, out: &Path, how: Plant) {
+        let obs = root.join(".obsidian");
+        if let Plant::DirLink = how {
+            fs::remove_dir_all(&obs).unwrap();
+            for (f, body) in cfg_files() {
+                fs::write(out.join(f), body).unwrap();
+            }
+            symlink(out, &obs).unwrap();
+            return;
+        }
+        for (f, body) in cfg_files() {
+            let p = obs.join(f);
+            let o = out.join(f);
+            fs::write(&o, &body).unwrap();
+            match how {
+                Plant::Outside => symlink(&o, &p).unwrap(),
+                Plant::DevZero => symlink("/dev/zero", &p).unwrap(),
+                Plant::Fifo => fifo(&p),
+                // a VALID document one byte over the largest config cap (trailing JSON whitespace)
+                Plant::OverCap => {
+                    let mut b = body.into_bytes();
+                    b.resize(vaultfs::CFG_MAX as usize + 1, b' ');
+                    fs::write(&p, b).unwrap();
+                }
+                Plant::DirLink => unreachable!(),
+            }
+        }
+    }
+
+    /// every config reader's answer, as one string (Debug of each result)
+    fn cfg_answers(root: &Path) -> Vec<(&'static str, String)> {
+        let vc = settings::VaultCfg { file: "canvas".into(), patch: None };
+        vec![
+            ("app_bool_in", format!("{:?}", app_bool_in(root, "strictLineBreaks"))),
+            ("readable_line_length_in", format!("{:?}", readable_line_length_in(root))),
+            ("app_value_in", format!("{:?}", app_value_in(root, "propertiesInDocument"))),
+            ("attach_dir", format!("{:?}", attach_dir(root).ok().map(|d| d.0 == root.canonicalize().unwrap()))),
+            ("graph_settings_in", format!("{:?}", graph_settings_in(root))),
+            ("templates_format", format!("{:?}", templates_format(root, "dateFormat"))),
+            ("read_bm_tree", bm_emit(&read_bm_tree(root), &[])),
+            ("bm_top_extra", format!("{:?}", bm_top_extra(root))),
+            ("read_workspace", format!("{:?}", vcfg_read(root, ".obsidian/workspace.json"))),
+            ("pasteimg::app_cfg", format!("{:?}", pasteimg::app_cfg(root))),
+            ("props::types_in", format!("{:?}", props::types_in(root))),
+            ("themefs::read_appearance", format!("{:?}", themefs::read_appearance(root).ok())),
+            ("settings::vcfg_in", format!("{:?}", settings::vcfg_in(root, &vc).ok())),
+            ("plugins::enabled_ids", format!("{:?}", plugins::enabled_ids(root))),
+        ]
+    }
+
+    /// F-3 / F-27: every .obsidian config reader returns its default for every
+    /// hostile leaf, in bounded time, and nothing of the outside file reaches it
+    #[test]
+    fn read250_config_readers_return_defaults_for_hostile_leaves() {
+        let (clean, _o) = vault("cfg-clean");
+        let want = cfg_answers(&clean);
+        for how in PLANTS {
+            let (root, out) = vault(&format!("cfg-{how:?}"));
+            plant_cfg(&root, &out, how);
+            let r = root.clone();
+            let got = bounded(&format!("{how:?}"), move || cfg_answers(&r));
+            for ((name, g), (_, w)) in got.iter().zip(&want) {
+                assert!(!g.contains(SECRET) && !g.contains("leakedplugin"), "{how:?} {name}: outside content reached the reader: {g}");
+                // the readers whose caller WRITES the file back (appearance, the vcfg
+                // merge) refuse (Err -> None) rather than default: an unreadable file is
+                // never written over. Every other reader returns its default.
+                let refuses = matches!(*name, "themefs::read_appearance" | "settings::vcfg_in") && g == "None";
+                assert!(g == w || refuses, "{how:?} {name}: not the default (nor a refusal): {g} vs {w}");
+            }
+            // a read-MODIFY-write refuses rather than overwrite what it could not read
+            assert!(set_app_bool_in(&root, "alwaysUpdateLinks", true).is_err(), "{how:?}: app.json merge");
+            assert!(set_graph_settings_in(&root, &serde_json::json!({"scale": 2})).is_err(), "{how:?}: graph.json merge");
+            if !matches!(how, Plant::DirLink) {
+                assert_eq!(fs::read_to_string(out.join("graph.json")).unwrap(), cfg_files()[1].1, "{how:?}: outside file untouched");
+            }
+        }
+        // POSITIVE control: the same bodies as regular files are read
+        let (root, out) = vault("cfg-regular");
+        for (f, body) in cfg_files() {
+            fs::write(root.join(".obsidian").join(f), body).unwrap();
+        }
+        let _ = out;
+        assert!(app_bool_in(&root, "strictLineBreaks"));
+        assert!(!readable_line_length_in(&root));
+        assert_eq!(templates_format(&root, "dateFormat").as_deref(), Some(SECRET));
+        assert_eq!(graph_settings_in(&root)["search"], SECRET);
+        assert_eq!(pasteimg::app_cfg(&root), (SECRET.to_string(), true));
+        assert_eq!(plugins::enabled_ids(&root), vec!["leakedplugin".to_string()]);
+        assert!(set_app_bool_in(&root, "alwaysUpdateLinks", true).is_ok());
+    }
+
+    /// F-3 B: a graph bookmark keeps only graph option keys
+    #[test]
+    fn read250_bm_view_node_keeps_only_graph_option_keys() {
+        let item = serde_json::json!({"type": "graph",
+            "options": {"auths": {"token": SECRET}, "scale": 2, "search": "q", "repelStrength": 3, "showTags": true, "colorGroups": []},
+            "local": {"file": "B.md", "localJumps": 2, "secret": SECRET}});
+        let n = bm_view_node(&item, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&bm_emit(&[n], &[])).unwrap();
+        let g = &v["items"][0];
+        assert_eq!(g["options"], serde_json::json!({"scale": 2, "search": "q", "repelStrength": 3, "showTags": true, "colorGroups": []}));
+        assert_eq!(g["local"], serde_json::json!({"file": "B.md", "localJumps": 2}));
+        assert!(!v.to_string().contains(SECRET), "{v}");
+    }
+
+    /// arm the vaultfs seam: when `leaf` (an absolute path) has just passed the
+    /// leaf check, replace it with a symlink to `target` (once)
+    fn swap_at_check(leaf: PathBuf, target: PathBuf) {
+        let mut done = false;
+        vaultfs::set_hook(Some(Box::new(move |at| {
+            if at == "open_read:checked" && !done && fs::symlink_metadata(&leaf).is_ok_and(|m| m.is_file()) {
+                done = true;
+                fs::remove_file(&leaf).unwrap();
+                symlink(&target, &leaf).unwrap();
+            }
+        })));
+    }
+
+    /// F-46: read_note's core (read_capped_in) for every hostile leaf + the swap
+    #[test]
+    fn read250_read_note_refuses_hostile_leaves_and_the_swap() {
+        let (root, out) = vault("note");
+        fs::write(out.join("id_ed25519"), SECRET).unwrap();
+        fs::write(root.join("A.md"), "mine").unwrap();
+        assert_eq!(read_capped_in(&root, Path::new("A.md")).as_deref(), Some("mine"));
+        symlink(out.join("id_ed25519"), root.join("L.md")).unwrap();
+        symlink("/dev/zero", root.join("Z.md")).unwrap();
+        fifo(&root.join("F.md"));
+        fs::File::create(root.join("Big.md")).unwrap().set_len(index::MAX_NOTE_BYTES + 1).unwrap();
+        fs::write(out.join("n.md"), SECRET).unwrap();
+        symlink(&out, root.join("dirlink")).unwrap();
+        let r = root.clone();
+        let got = bounded("read_note", move || {
+            ["L.md", "Z.md", "F.md", "Big.md", "dirlink/n.md"].map(|n| read_capped_in(&r, Path::new(n)))
+        });
+        assert_eq!(got, [None, None, None, None, None]);
+        // swapped for a symlink between the check and the open
+        swap_at_check(root.join("A.md"), out.join("id_ed25519"));
+        let r = read_capped_in(&root, Path::new("A.md"));
+        vaultfs::set_hook(None);
+        assert_eq!(r, None, "the swapped note must not be read");
+    }
+
+    /// F-9: the image server, for every hostile leaf + the swap; the PDF worker
+    /// reads the inode that was checked, however the path changes while queued
+    #[test]
+    fn read250_image_server_and_pdf_worker_read_the_checked_fd() {
+        let (root, out) = vault("img");
+        let png = b"\x89PNG\r\n\x1a\nmine".to_vec();
+        fs::write(out.join("secret.png"), SECRET).unwrap();
+        fs::write(root.join("pic.png"), &png).unwrap();
+        symlink(out.join("secret.png"), root.join("l.png")).unwrap();
+        symlink("/dev/zero", root.join("z.png")).unwrap();
+        fifo(&root.join("f.png"));
+        fs::File::create(root.join("big.png")).unwrap().set_len(MAX_IMG_BYTES + 1).unwrap();
+        fs::write(out.join("n.png"), SECRET).unwrap();
+        symlink(&out, root.join("dl")).unwrap();
+        let r = root.clone();
+        let got = bounded("serve_image", move || ["l.png", "z.png", "f.png", "big.png", "dl/n.png"].map(|t| serve_image(&r, t).is_none()));
+        assert_eq!(got, [true; 5]);
+        assert_eq!(serve_image(&root, "pic.png").unwrap().1, png);
+        swap_at_check(root.join("pic.png"), out.join("secret.png"));
+        let s = serve_image(&root, "pic.png");
+        vaultfs::set_hook(None);
+        assert!(s.is_none(), "served the swapped leaf");
+        // PDF: open (= check) now, swap the path for a link to another PDF, then queue
+        fs::write(root.join("d.pdf"), pdf::tests::mini_pdf(2)).unwrap();
+        fs::write(out.join("other.pdf"), pdf::tests::mini_pdf(3)).unwrap();
+        let f = pdf_open_in(&root, "d.pdf").expect("a regular PDF opens");
+        fs::remove_file(root.join("d.pdf")).unwrap();
+        symlink(out.join("other.pdf"), root.join("d.pdf")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        pdf::queue_info_file(f, Box::new(move |i| tx.send(i.map(|i| i.pages)).unwrap()));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap(), Some(2), "the queued job read the checked inode");
+        assert!(pdf_open_in(&root, "d.pdf").is_none(), "the symlinked PDF itself is refused");
+    }
+
+    /// F-10: the index build and the watcher read through the fd primitive
+    #[test]
+    fn read250_index_build_and_watcher_never_read_a_swapped_note() {
+        let (root, out) = vault("ix");
+        fs::write(out.join("key"), SECRET).unwrap();
+        fs::write(root.join("n.md"), "old").unwrap();
+        fs::write(root.join("sub/m.md"), "m").unwrap();
+        swap_at_check(root.join("n.md"), out.join("key"));
+        let ix = Index::build(&root);
+        vaultfs::set_hook(None);
+        assert!(!ix.content("n").unwrap_or("").contains(SECRET), "the index read the swapped note");
+        assert_eq!(ix.content("sub/m"), Some("m"));
+        // the watcher: n.md changes on disk, then is swapped right at the read
+        fs::remove_file(root.join("n.md")).unwrap();
+        fs::write(root.join("n.md"), "old").unwrap();
+        let mut ix = Index::build(&root);
+        let before = watcher::snapshot(&root);
+        fs::write(root.join("n.md"), "changed, longer").unwrap();
+        let d = watcher::diff(&before, &watcher::snapshot(&root));
+        assert_eq!(d.modified, vec!["n".to_string()]);
+        swap_at_check(root.join("n.md"), out.join("key"));
+        watcher::reconcile(&root, &d, &mut ix);
+        vaultfs::set_hook(None);
+        assert_eq!(ix.content("n"), Some("old"), "the watcher read the swapped note");
+        // a FIFO note never hangs the build
+        fifo(&root.join("p.md"));
+        let r = root.clone();
+        let names = bounded("Index::build with a FIFO", move || Index::build(&r).names().to_vec());
+        assert!(!names.contains(&"p".to_string()));
+    }
+
+    /// F-47: plugin files are read from the checked fd (main.js / data.json /
+    /// styles.css swapped between plugin_file_in and the read is refused)
+    #[test]
+    fn read250_plugin_files_refuse_the_swap() {
+        let (root, out) = vault("plug");
+        let pd = root.join(".obsidian/plugins/p");
+        fs::create_dir_all(&pd).unwrap();
+        fs::write(out.join("evil.js"), SECRET).unwrap();
+        for f in ["main.js", "data.json", "styles.css", "manifest.json"] {
+            fs::write(pd.join(f), if f.ends_with("json") { "{\"id\":\"p\",\"name\":\"p\"}" } else { "x" }).unwrap();
+        }
+        for f in ["main.js", "data.json", "styles.css", "manifest.json"] {
+            assert!(plugins::plugin_read_in(&root, "p", f, 1 << 20).unwrap().is_some(), "{f}");
+            swap_at_check(pd.join(f), out.join("evil.js"));
+            let r = plugins::plugin_read_in(&root, "p", f, 1 << 20);
+            vaultfs::set_hook(None);
+            assert!(r.is_err(), "{f}: read the swapped file: {r:?}");
+            fs::remove_file(pd.join(f)).unwrap();
+            fs::write(pd.join(f), "{}").unwrap();
+        }
+        swap_at_check(pd.join("data.json"), out.join("evil.js"));
+        let r = plugins::read_data(&root, "p");
+        vaultfs::set_hook(None);
+        assert!(r.is_err() || r.as_ref().is_ok_and(|v| !v.to_string().contains(SECRET)), "{r:?}");
+    }
+
+    /// F-27: a symlinked / FIFO / oversized snippet or theme is not listed / not loaded
+    #[test]
+    fn read250_snippets_and_themes_refuse_hostile_leaves() {
+        let (root, out) = vault("css");
+        let sn = root.join(".obsidian/snippets");
+        fs::write(out.join("s.css"), format!("body{{color:red}} /* {SECRET} */")).unwrap();
+        fs::write(sn.join("ok.css"), "body{color:blue}").unwrap();
+        symlink(out.join("s.css"), sn.join("link.css")).unwrap();
+        symlink("/dev/zero", sn.join("zero.css")).unwrap();
+        fifo(&sn.join("fifo.css"));
+        fs::File::create(sn.join("big.css")).unwrap().set_len(vaultfs::CSS_MAX + 1).unwrap();
+        let r = root.clone();
+        let (listed, loads) = bounded("snippets", move || {
+            (themefs::list_snippets(&r), ["link", "zero", "fifo", "big"].map(|l| themefs::load_snippet(&r, l).is_err()))
+        });
+        assert_eq!(listed, vec!["big".to_string(), "ok".to_string()], "only regular files are listed");
+        assert_eq!(loads, [true; 4]);
+        assert!(themefs::load_snippet(&root, "ok").unwrap().0.contains("blue"));
+        // a theme whose theme.css is a symlink out of the vault
+        let td = root.join(".obsidian/themes/T");
+        fs::create_dir_all(&td).unwrap();
+        fs::write(td.join("manifest.json"), "{\"name\":\"T\"}").unwrap();
+        symlink(out.join("s.css"), td.join("theme.css")).unwrap();
+        let e = themefs::load_theme(&root, "T").unwrap_err();
+        assert!(!e.contains(SECRET), "{e}");
+        // a theme DIR that is a symlink is not a candidate
+        fs::create_dir_all(out.join("U")).unwrap();
+        fs::write(out.join("U/manifest.json"), "{\"name\":\"U\"}").unwrap();
+        fs::write(out.join("U/theme.css"), "body{}").unwrap();
+        symlink(out.join("U"), root.join(".obsidian/themes/U")).unwrap();
+        let s = themefs::themes_scan(&root);
+        assert!(!s.listed.contains(&"U".to_string()), "{:?}", s.listed);
+        assert!(themefs::load_theme(&root, "U").is_err());
+    }
+
+    /// THE GUARD (#250), like every_outbound_path_goes_through_the_choke_point:
+    /// outside vaultfs.rs, production code may not open, read or list a file by
+    /// PATH (fs::read / read_to_string / File::open / read_dir / OpenOptions
+    /// .read(true)), because a path re-resolves every symlink at the moment of
+    /// use. Vault reads go through vaultfs (Vault::open_read / read / read_fd,
+    /// walk_tree, p_list). The only exceptions are paths that are NOT in a vault,
+    /// each listed with its reason; a stale entry fails too.
+    #[test]
+    fn vault_reads_go_through_vaultfs() {
+        // production code only: drop every top-level `#[cfg(test)] mod x { … }` block
+        fn code(s: &str) -> Vec<(usize, String)> {
+            let (mut out, mut skip, mut prev_test) = (Vec::new(), false, false);
+            for (i, l) in s.lines().enumerate() {
+                let bare = l.split("//").next().unwrap_or("").trim_end();
+                if skip {
+                    if l == "}" {
+                        skip = false;
+                    }
+                } else if prev_test && (bare.starts_with("mod ") || bare.starts_with("pub mod ") || bare.starts_with("pub(crate) mod ")) {
+                    skip = !bare.ends_with(';');
+                } else {
+                    out.push((i + 1, l.to_string()));
+                }
+                // a platform-gated test module (#[cfg(all(test, unix))], ...) is test code too
+                prev_test = l.trim() == "#[cfg(test)]" || l.trim().starts_with("#[cfg(all(test,");
+            }
+            out
+        }
+        let reads = ["fs::read(", "read_to_string(", "File::open(", "read_dir("];
+        // (the kernel CSPRNG reads of audiorec.rs, main.rs and dropticket.rs go through
+        // vaultfs::os_random on this branch: /dev/urandom on unix, the system RNG on Windows)
+        let allowed: [(&str, &str, &str); 16] = [
+            ("cfgstore.rs", ".open(lock_file(lock_dir, cfg))", "~/.opensidian.json lock file (user config dir)"),
+            ("cfgstore.rs", "fs::read_to_string(cfg)", "~/.opensidian.json (user config)"),
+            ("cfgstore.rs", "File::open(dir).and_then(|d| d.sync_all())", "fsync of the user config dir"),
+            ("cfgstore.rs", "fs::read_to_string(&t)", "~/.opensidian.json (user config)"),
+            ("vaultlock.rs", "fs::read_to_string(lock_file(dir, canon))", "vault lock files in the user config dir"),
+            ("desk_proc.rs", "File::open(format!(\"/proc/self/fd/", "own process fd via /proc"),
+            ("spawn.rs", "read_to_string(format!(\"/proc/{pid}/stat\"))", "/proc process status"),
+            ("devui.rs", "std::fs::read(&f)", "DEV-ONLY UI hot reload from the source tree, never in a release build"),
+            ("devui.rs", "std::fs::read_dir(&d)", "DEV-ONLY UI hot reload from the source tree"),
+            ("i18n.rs", "std::fs::read_to_string(&p)", "UI translation override dir, not a vault"),
+            ("main.rs", "std::fs::read_to_string(&path).ok()", "smoke_css: an operator-chosen absolute path from an env var (test rig)"),
+            ("main.rs", "fs::read_dir(path)", "the vault picker lists folders BEFORE a vault exists (S4 picker_allows)"),
+            ("main.rs", "std::fs::read_dir(&dir)", "vb_probe: test-rig probe of an env-named dir"),
+            ("migrate.rs", "fs::read_dir(from)", "per-user config/data dir migration (home), not a vault"),
+            ("plugin_store.rs", "s.read_to_string(&mut e)", "a child process's stderr pipe"),
+            ("plugins.rs", ".custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(canon)", "Windows: a DIRECTORY handle for its file id (identity check), no content read"),
+        ];
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let (mut files, mut bad, mut used) = (0, Vec::new(), vec![0usize; allowed.len()]);
+        for ent in fs::read_dir(dir).unwrap().flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || name == "vaultfs.rs" {
+                continue;
+            }
+            files += 1;
+            for (n, l) in code(&fs::read_to_string(ent.path()).unwrap()) {
+                let t = l.trim_start();
+                if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") || l.contains("vaultfs::") {
+                    continue;
+                }
+                let hit = reads.iter().any(|r| l.contains(r)) || (l.contains("OpenOptions::new()") && l.contains(".read(true)"));
+                if !hit {
+                    continue;
+                }
+                match allowed.iter().position(|(f, needle, _)| *f == name && l.contains(needle)) {
+                    Some(i) => used[i] += 1,
+                    None => bad.push(format!("{name}:{n}: {}", l.trim())),
+                }
+            }
+        }
+        assert!(files > 30, "scanned {files} files");
+        assert!(bad.is_empty(), "path-based reads outside vaultfs (route them through vaultfs::Vault::read / open_read, or allow-list a NON-vault path with a reason):\n{}", bad.join("\n"));
+        for (i, (f, needle, why)) in allowed.iter().enumerate() {
+            assert!(used[i] > 0, "stale allow-list entry {f}: {needle:?} ({why})");
+        }
     }
 }
